@@ -9,6 +9,7 @@ in CellTextVertexOut {
     flat vec4 bg_color;
     vec2 tex_coord;
     vec2 screen_pos;  // For clipping during scroll
+    flat uvec2 grid_pos_out;
     flat uint is_in_scroll_region; // Only clip cells that are part of the scroll region
 } in_data;
 
@@ -26,27 +27,22 @@ void main() {
     // CRITICAL: Only apply clipping to cells that are actually part of the scroll region!
     // Cells outside (header/footer) should be drawn normally.
     if (tui_scroll_offset_y != 0.0 && in_data.is_in_scroll_region != 0u) {
-        // Adjust bounds by pixel_scroll_offset_y to match screen_pos coordinate space
-        // screen_pos has pixel_scroll_offset_y subtracted in vertex shader
-        float top_y = float(scroll_region_top) * cell_size.y - pixel_scroll_offset_y;
-
-        uint eff_bot = scroll_region_bot;
         uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
-        if (eff_bot == 0u) {
-            eff_bot = grid_size.y;
-        }
-        float bot_y = float(eff_bot) * cell_size.y - pixel_scroll_offset_y;
+        uint eff_bot = scroll_region_bot == 0u ? grid_size.y : scroll_region_bot;
+        uint eff_right = scroll_region_right == 0u ? grid_size.x : scroll_region_right;
 
-        uint eff_right = scroll_region_right;
-        if (eff_right == 0u) {
-            eff_right = grid_size.x;
-        }
+        float cell_top = float(in_data.grid_pos_out.y) * cell_size.y + tui_scroll_offset_y;
+        float cell_bottom = cell_top + cell_size.y;
+        float top_y = float(scroll_region_top) * cell_size.y;
+        float bot_y = float(eff_bot) * cell_size.y;
+
+        float cell_left = float(in_data.grid_pos_out.x) * cell_size.x;
+        float cell_right = cell_left + cell_size.x;
         float left_x = float(scroll_region_left) * cell_size.x;
         float right_x = float(eff_right) * cell_size.x;
 
-        // Assume screen_pos increases down/right (top-left origin)
-        if (in_data.screen_pos.y < top_y || in_data.screen_pos.y >= bot_y ||
-            in_data.screen_pos.x < left_x || in_data.screen_pos.x >= right_x) {
+        if (cell_bottom <= top_y || cell_top >= bot_y ||
+            cell_right <= left_x || cell_left >= right_x) {
             discard;
         }
     }

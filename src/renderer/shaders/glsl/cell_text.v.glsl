@@ -36,6 +36,7 @@ out CellTextVertexOut {
     flat vec4 bg_color;
     vec2 tex_coord;
     vec2 screen_pos;  // For clipping during scroll
+    flat uvec2 grid_pos_out;
     flat uint is_in_scroll_region; // Only clip cells that are part of the scroll region
 } out_data;
 
@@ -59,6 +60,7 @@ void main() {
                       grid_pos.x >= scroll_region_left && grid_pos.x < effective_scroll_right) ||
                      ((glyph_bools & IS_SCROLL_GLYPH) != 0u);
     out_data.is_in_scroll_region = in_scroll ? 1u : 0u;
+    out_data.grid_pos_out = grid_pos;
 
     // Convert the grid x, y into world space x, y by accounting for cell size
     vec2 cell_pos = cell_size * vec2(grid_pos);

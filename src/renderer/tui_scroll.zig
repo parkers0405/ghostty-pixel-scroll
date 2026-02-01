@@ -451,13 +451,11 @@ pub const TuiScrollback = struct {
         const scroll_right = self.scroll_region_right;
         const full_width = scroll_left == 0 and scroll_right == self.grid_columns;
 
-        // Calculate extended range to cover content sliding in from edges
-        const start_i: isize = @min(0, -scroll_offset_lines);
-        const end_i: isize = @max(@as(isize, @intCast(inner_size)), @as(isize, @intCast(inner_size)) - scroll_offset_lines);
+        // Render one extra line like Neovide (inner_size + 1).
+        const end_i: usize = inner_size + 1;
 
-        // Iterate over the extended range
-        for (0..@intCast(end_i - start_i)) |k| {
-            const i = start_i + @as(isize, @intCast(k));
+        for (0..end_i) |i_usize| {
+            const i: isize = @intCast(i_usize);
 
             // Buffer index = offset + screen_row (relative to top of scroll region)
             const buffer_index = scroll_offset_lines + i;
@@ -466,9 +464,8 @@ pub const TuiScrollback = struct {
             // Determine target logical grid row (visual position)
             const grid_row_signed = @as(isize, @intCast(self.scroll_region_top)) + i;
 
-            // Is this an "extra" row (outside the normal scroll region)?
-            // i.e., sliding in from header or footer area
-            const is_extra = i < 0 or i >= inner_size;
+            // Is this an "extra" row (the extra +1 line)?
+            const is_extra = i == @as(isize, @intCast(inner_size));
 
             if (!is_extra) {
                 // Determine actual row index in cells buffer
@@ -521,67 +518,24 @@ pub const TuiScrollback = struct {
                     }
                 }
             } else {
-                // For EXTRA rows (ghost rows), we inject them into the nearest valid scrollable row list.
-                // We do NOT touch the background or clear the list, so header/footer stays intact.
-                // We rely on IS_SCROLL_GLYPH + vertex shader to shift them, and fragment shader to clip.
-
-                // Clamp destination row to stay inside the scroll region.
-                var dest_row_idx = grid_row_signed;
-                const scroll_top: isize = @intCast(self.scroll_region_top);
+                // Extra line just below the scroll region.
                 const scroll_bot: isize = @intCast(self.scroll_region_bot);
-                if (dest_row_idx < scroll_top) {
-                    dest_row_idx = scroll_top;
-                } else if (dest_row_idx >= scroll_bot) {
-                    dest_row_idx = scroll_bot - 1;
-                }
+                const dest_row_idx = scroll_bot - 1;
 
                 if (dest_row_idx < 0 or dest_row_idx >= self.grid_rows) continue;
                 const fg_row_index = @as(usize, @intCast(dest_row_idx)) + 1;
 
                 if (fg_row_index < cells.fg_rows.lists.len) {
                     const dest_list = &cells.fg_rows.lists[fg_row_index];
-                    // Append to existing content
 
                     for (scrollback_row.fg_cells.items) |cell_text| {
                         if (!full_width and (cell_text.grid_pos[0] < scroll_left or cell_text.grid_pos[0] >= scroll_right)) {
                             continue;
                         }
                         var adjusted = cell_text;
-                        // Use REAL logical position (e.g. inside header) so shift calculation is correct relative to start
-                        // But wait, if grid_pos is outside region, in_scroll check fails unless we set flag.
-                        // We assume grid_row_signed is correct logic position.
-                        // However, grid_pos is u16. If grid_row_signed is negative, we can't represent it!
-
-                        // If row -1, we can't set grid_pos.y = -1.
-                        // Vertex shader uses grid_pos to compute cell_pos.
-                        // If we can't represent -1, we can't place it correctly.
-
-                        // Trick: Set grid_pos to NEAREST valid, and rely on shader offset?
-                        // No, shader offset is uniform `tui_scroll_offset_y`.
-
-                        // We need to render at `header - shift`.
-                        // If we can't express `header - 1`, we have a problem.
-
-                        // Wait, if scrolling UP (content moves DOWN).
-                        // Ghost row is at `header`. Shifted DOWN into view.
-                        // `grid_row` = header (0). Valid u16!
-                        // Shift = +offset.
-                        // Result: 0 + offset. Visible.
-
-                        // If scrolling DOWN (content moves UP).
-                        // Ghost row is at `footer`. Shifted UP into view.
-                        // `grid_row` = footer. Valid u16!
-                        // Shift = -offset.
-                        // Result: footer - offset. Visible.
-
-                        // So grid_row IS always valid u16, because it's the SOURCE position.
-                        // The "ghost" comes from the header row or footer row.
-
-                        if (dest_row_idx >= 0 and dest_row_idx < self.grid_rows) {
-                            adjusted.grid_pos[1] = @intCast(dest_row_idx);
-                            adjusted.bools.is_scroll_glyph = true;
-                            try dest_list.append(self.alloc, adjusted);
-                        }
+                        adjusted.grid_pos[1] = @intCast(dest_row_idx);
+                        adjusted.bools.is_scroll_glyph = true;
+                        try dest_list.append(self.alloc, adjusted);
                     }
                 }
             }

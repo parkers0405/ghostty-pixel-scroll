@@ -1369,6 +1369,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 tui_scroll_left: u32,
                 tui_scroll_right: u32,
                 tui_scroll_active: bool,
+                tui_in_alternate: bool,
             };
 
             // Update all our data as tightly as possible within the mutex.
@@ -1469,6 +1470,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const tui_left = state.terminal.tui_scroll_left;
                 const tui_right = state.terminal.tui_scroll_right;
                 const tui_active = state.terminal.tui_scroll_active;
+                const tui_in_alternate = state.terminal.screens.active_key == .alternate;
                 if (tui_delta != 0) {
                     @as(*Terminal, @constCast(state.terminal)).tui_scroll_delta = 0;
                 }
@@ -1485,6 +1487,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .tui_scroll_left = tui_left,
                     .tui_scroll_right = tui_right,
                     .tui_scroll_active = tui_active,
+                    .tui_in_alternate = tui_in_alternate,
                 };
             };
 
@@ -1626,8 +1629,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         self.tui_scroll_bot -= 1;
                     }
                 }
-                if (critical.tui_scroll_active) {
+                if (critical.tui_scroll_active and critical.tui_in_alternate) {
                     self.tui_scroll_active = true;
+                } else if (!critical.tui_in_alternate) {
+                    self.tui_scroll_active = false;
+                    self.tui_scroll_delta = 0;
+                    if (self.tui_scrollback) |*scrollback| {
+                        scrollback.is_animating = false;
+                        scrollback.scroll_animation.reset();
+                        scrollback.pending_scroll_delta = 0;
+                    }
                 }
 
                 // Update scroll region uniforms for shaders
@@ -1742,8 +1753,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Terminal scrollback (mouse/trackpad): uses scroll_pixel_offset for sub-cell positioning
             // This keeps an extra row hidden above viewport for smooth scrolling.
-            // For TUI smooth scrolling, we don't want the hidden-row offset.
-            const base_offset: f32 = if (self.tui_scroll_active) 0 else cell_h - self.scroll_pixel_offset;
+            const base_offset: f32 = cell_h - self.scroll_pixel_offset;
             self.uniforms.pixel_scroll_offset_y = base_offset;
 
             // TUI scroll animation (Neovide-style per-cell offset)

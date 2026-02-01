@@ -525,17 +525,14 @@ pub const TuiScrollback = struct {
                 // We do NOT touch the background or clear the list, so header/footer stays intact.
                 // We rely on IS_SCROLL_GLYPH + vertex shader to shift them, and fragment shader to clip.
 
-                // Clamp destination row to be inside scroll region
-                // This ensures restoreCells() will clean them up later
+                // Clamp destination row to stay inside the scroll region.
                 var dest_row_idx = grid_row_signed;
-                if (dest_row_idx < @as(isize, @intCast(self.scroll_region_top))) {
-                    dest_row_idx = @as(isize, @intCast(self.scroll_region_top));
-                } else if (dest_row_idx >= @as(isize, @intCast(self.scroll_region_bot))) {
-                    if (self.scroll_region_bot > 0) {
-                        dest_row_idx = @as(isize, @intCast(self.scroll_region_bot)) - 1;
-                    } else {
-                        dest_row_idx = @as(isize, @intCast(self.grid_rows)) - 1;
-                    }
+                const scroll_top: isize = @intCast(self.scroll_region_top);
+                const scroll_bot: isize = @intCast(self.scroll_region_bot);
+                if (dest_row_idx < scroll_top) {
+                    dest_row_idx = scroll_top;
+                } else if (dest_row_idx >= scroll_bot) {
+                    dest_row_idx = scroll_bot - 1;
                 }
 
                 if (dest_row_idx < 0 or dest_row_idx >= self.grid_rows) continue;
@@ -580,8 +577,8 @@ pub const TuiScrollback = struct {
                         // So grid_row IS always valid u16, because it's the SOURCE position.
                         // The "ghost" comes from the header row or footer row.
 
-                        if (grid_row_signed >= 0 and grid_row_signed < 65535) {
-                            adjusted.grid_pos[1] = @intCast(grid_row_signed);
+                        if (dest_row_idx >= 0 and dest_row_idx < self.grid_rows) {
+                            adjusted.grid_pos[1] = @intCast(dest_row_idx);
                             adjusted.bools.is_scroll_glyph = true;
                             try dest_list.append(self.alloc, adjusted);
                         }

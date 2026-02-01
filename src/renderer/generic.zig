@@ -1619,9 +1619,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.tui_scroll_bot = critical.tui_scroll_bot;
                     self.tui_scroll_left = critical.tui_scroll_left;
                     self.tui_scroll_right = critical.tui_scroll_right;
-                }
-                if (critical.tui_scroll_active) {
-                    self.tui_scroll_active = true;
+
+                    // If the scroll region reaches the last row and we have a top margin,
+                    // keep the bottom line fixed (prevents statusline from sliding).
+                    if (self.tui_scroll_bot == self.cells.size.rows and self.tui_scroll_top > 0 and self.tui_scroll_bot > 0) {
+                        self.tui_scroll_bot -= 1;
+                    }
                 }
                 if (critical.tui_scroll_active) {
                     self.tui_scroll_active = true;

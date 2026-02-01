@@ -1354,8 +1354,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Acquire the draw mutex for all remaining state updates.
             {
+                
                 self.draw_mutex.lock();
                 defer self.draw_mutex.unlock();
+
+                
+                
+                
+                
+                
+                
+                
+
 
                 // Build our GPU cells
                 self.rebuildCells(
@@ -1458,13 +1468,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.draw_mutex.lock();
             defer self.draw_mutex.unlock();
 
+            // Unified timing
+            const now = std.time.Instant.now() catch return;
+            const last = self.last_frame_time orelse now;
+            const dt_ns: f32 = @floatFromInt(now.since(last));
+            const dt: f32 = @min(dt_ns / std.time.ns_per_s, 0.1);
+            
+            
+            if (self.cursor_animating or self.scroll_animating) {
+                self.last_frame_time = now;
+            } else {
+                self.last_frame_time = null;
+            }
+
             // Update cursor animation if active
             if (self.cursor_animating) {
-                const now = std.time.Instant.now() catch null;
-                if (now) |n| {
-                    const last = self.last_frame_time orelse n;
-                    const dt_ns: f32 = @floatFromInt(n.since(last));
-                    const dt: f32 = @min(dt_ns / std.time.ns_per_s, 0.1);
+                // Time calculated above
+                
+                    
+                    
+                    
                     
                     const cursor_len = self.config.cursor_animation_duration;
                     const cursor_zeta = 1.0 - (self.config.cursor_animation_bounciness * 0.6);
@@ -1480,33 +1503,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         self.uniforms.cursor_offset_x = pos.x - target_x;
                         self.uniforms.cursor_offset_y = pos.y - target_y;
                     }
-                    self.last_frame_time = n;
+                    
                 }
-            }
 
             // Direct pixel scroll - just use the offset from Surface
             // Convert pixels to lines and apply -1.0 offset for extra top row
             
+            
             // Spring animation for scroll jumps
             var spring_offset_px: f32 = 0;
             if (self.scroll_animating) {
-                const now = std.time.Instant.now() catch null;
-                if (now) |n| {
-                    const last = self.last_frame_time orelse n;
-                    const dt_ns: f32 = @floatFromInt(n.since(last));
-                    const dt: f32 = @min(dt_ns / std.time.ns_per_s, 0.1);
-                    const scroll_len = self.config.scroll_animation_duration;
-                    const scroll_zeta = 1.0 - (self.config.scroll_animation_bounciness * 0.6);
-                    self.scroll_animating = self.scroll_spring.update(dt, scroll_len, scroll_zeta);
-                    spring_offset_px = self.scroll_spring.position * @as(f32, @floatFromInt(self.grid_metrics.cell_height));
-                    
-                    if (!self.cursor_animating) self.last_frame_time = n;
-                }
+                const scroll_len = self.config.scroll_animation_duration;
+                const scroll_zeta = 1.0 - (self.config.scroll_animation_bounciness * 0.6);
+                self.scroll_animating = self.scroll_spring.update(dt, scroll_len, scroll_zeta);
+                spring_offset_px = self.scroll_spring.position * @as(f32, @floatFromInt(self.grid_metrics.cell_height));
             }
 
-            // Total offset = (Cell Height - Touchpad Offset) + Jump Spring Offset
             const cell_h_scroll: f32 = @floatFromInt(self.grid_metrics.cell_height);
             self.uniforms.pixel_scroll_offset_y = (cell_h_scroll - self.scroll_pixel_offset) + spring_offset_px;
+
 
 
             // After the graphics API is complete (so we defer) we want to
@@ -2672,13 +2687,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Update cursor animation state
             cursor_anim: {
-                // Get current cursor position from uniforms
                 const cursor_x = self.uniforms.cursor_pos[0];
                 const cursor_y = self.uniforms.cursor_pos[1];
                 
-                // Check if cursor position is valid (not max value which means no cursor)
                 if (cursor_x == std.math.maxInt(u16) or cursor_y == std.math.maxInt(u16)) {
-                    // No cursor visible, reset animation
                     self.cursor_animation.snap();
                     self.uniforms.cursor_offset_x = 0;
                     self.uniforms.cursor_offset_y = 0;
@@ -2686,12 +2698,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :cursor_anim;
                 }
                 
-                // Check if cursor moved
                 const last_x = self.last_cursor_grid_pos[0];
                 const last_y = self.last_cursor_grid_pos[1];
                 
                 if (cursor_x != last_x or cursor_y != last_y) {
-                    // Cursor moved - calculate pixel positions
                     const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
                     const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
                     
@@ -2700,38 +2710,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const new_pixel_x: f32 = @as(f32, @floatFromInt(cursor_x)) * cell_width;
                     const new_pixel_y: f32 = @as(f32, @floatFromInt(cursor_y)) * cell_height;
                     
-                    // Set up animation - current position becomes offset from new target
                     self.cursor_animation.current_x = old_pixel_x;
                     self.cursor_animation.current_y = old_pixel_y;
                     self.cursor_animation.setTarget(new_pixel_x, new_pixel_y, cell_width);
                     
-                    // Update last position
                     self.last_cursor_grid_pos = .{ cursor_x, cursor_y };
                     self.cursor_animating = true;
                 }
                 
-                // Update animation (calculate dt from frame timing)
-                const now = std.time.Instant.now() catch {
-                    self.uniforms.cursor_offset_x = 0;
-                    self.uniforms.cursor_offset_y = 0;
-                    break :cursor_anim;
-                };
-                
-                const last = self.last_frame_time orelse now;
-                const dt_ns: f32 = @floatFromInt(now.since(last));
-                const dt: f32 = dt_ns / std.time.ns_per_s;
-                
-                // Clamp dt to reasonable range (avoid huge jumps on first frame or after pauses)
-                const clamped_dt = @min(dt, 0.1);
-                
-                const cursor_len = self.config.cursor_animation_duration;
-                const cursor_zeta = 1.0 - (self.config.cursor_animation_bounciness * 0.6);
-                self.cursor_animating = self.cursor_animation.update(clamped_dt, cursor_len, cursor_zeta);
-                
-                // Calculate offset from target position
                 const pos = self.cursor_animation.getPosition();
-                const target_pixel_x: f32 = @as(f32, @floatFromInt(cursor_x)) * @as(f32, @floatFromInt(self.grid_metrics.cell_width));
-                const target_pixel_y: f32 = @as(f32, @floatFromInt(cursor_y)) * @as(f32, @floatFromInt(self.grid_metrics.cell_height));
+                const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
+                const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                const target_pixel_x: f32 = @as(f32, @floatFromInt(cursor_x)) * cell_width;
+                const target_pixel_y: f32 = @as(f32, @floatFromInt(cursor_y)) * cell_height;
                 
                 self.uniforms.cursor_offset_x = pos.x - target_pixel_x;
                 self.uniforms.cursor_offset_y = pos.y - target_pixel_y;

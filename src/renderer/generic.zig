@@ -1386,10 +1386,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // When terminal viewport scrolls by N lines, we get scroll_delta_lines
                 // We set the spring to animate from that offset back to 0
 
-                // Detect scroll jumps (keyboard scrolling)
+                // Detect scroll jumps (keyboard scrolling, Neovim OSC 9999 hints)
+                // The content has already been updated to the new position.
+                // We use the spring to animate a visual "smoothing" effect.
+                // Since we only have 1 extra row at each edge, clamp the visual
+                // offset to ±1 line - this gives smooth feel without edge bounce.
                 const scroll_jump = self.terminal_state.scroll_jump;
                 if (scroll_jump != 0) {
-                    self.scroll_spring.position += scroll_jump;
+                    // Clamp to ±1 for visual smoothing (we only have 1 extra row each edge)
+                    const clamped_jump = std.math.clamp(scroll_jump, -1.0, 1.0);
+                    self.scroll_spring.position += clamped_jump;
                     self.scroll_animating = true;
                 }
 
@@ -1492,39 +1498,37 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Pixel scroll offset calculation
             // We render rows+2 (1 extra at top, 1 extra at bottom)
             // The offset shifts content so that at rest, the extra top row is hidden
-            // During scroll animation, we show partial content from extra rows
+            //
+            // Like Kitty, we use a normalized offset approach:
+            // - offset = cell_height means "normal" (extra top row hidden above screen)
+            // - offset = 0 means shifted up by 1 cell (extra top row visible at top)
+            // - offset = 2*cell_height means shifted down by 1 cell (extra bottom row visible)
+            //
+            // The offset should stay in range [0, 2*cell_height] to match our extra rows
 
             const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
 
-            // Base offset: cell_height puts us at "normal" position (extra top row hidden)
-            // scroll_pixel_offset (0 to cell_height) is the sub-cell offset from mouse/trackpad
-            var base_offset = cell_h - self.scroll_pixel_offset;
+            // Base offset from mouse/trackpad scrolling (0 to cell_height range)
+            // scroll_pixel_offset is how far into a line we've scrolled
+            // Subtracting from cell_h gives us the visual offset
+            var offset = cell_h - self.scroll_pixel_offset;
 
-            // Spring animation for scroll jumps (keyboard scrolling, Neovim hints, etc.)
+            // Spring animation for scroll jumps (keyboard scrolling, Neovim hints)
+            // The spring animates the visual "lag" back to zero
             if (self.scroll_animating) {
                 const scroll_len = self.config.scroll_animation_duration;
                 const scroll_zeta = 1.0 - (self.config.scroll_animation_bounciness * 0.6);
                 self.scroll_animating = self.scroll_spring.update(dt, scroll_len, scroll_zeta);
 
-                // Use only the FRACTIONAL part of spring position for visual offset
-                // This way large scrolls still animate smoothly but visual effect
-                // stays within our ±1 extra row bounds
-                // fract(x) = x - floor(x), gives us 0.0 to 1.0 range
-                const spring_pos = self.scroll_spring.position;
-                const fractional = spring_pos - @floor(spring_pos);
-
-                // If spring is negative, fractional will be positive (0 to 1)
-                // but we want negative offset, so check sign
-                const visual_offset = if (spring_pos >= 0)
-                    fractional * cell_h
-                else
-                    (fractional - 1.0) * cell_h; // -1 to 0 range for negative
-
-                base_offset += visual_offset;
+                // Spring position is in lines. Convert to pixels and add to offset.
+                // Clamp to ±1 line to stay within our extra row bounds.
+                const clamped_spring = std.math.clamp(self.scroll_spring.position, -1.0, 1.0);
+                offset += clamped_spring * cell_h;
             }
 
-            // Final offset should be in range [0, 2*cell_h] for our extra rows
-            self.uniforms.pixel_scroll_offset_y = @max(0.0, @min(base_offset, 2.0 * cell_h));
+            // Clamp final offset to valid range [0, 2*cell_h]
+            // This ensures we only show content from our rendered extra rows
+            self.uniforms.pixel_scroll_offset_y = std.math.clamp(offset, 0.0, 2.0 * cell_h);
 
             // After the graphics API is complete (so we defer) we want to
             // update our scrollbar state.

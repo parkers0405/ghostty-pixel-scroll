@@ -704,8 +704,10 @@ fragment float4 cell_text_fragment(
 ) {
   // Clip text that would appear outside the visible grid area during scroll
   // This prevents edge bounce - content scrolls but edges stay clean
-  float grid_top = uniforms.grid_padding.w;  // Top padding
-  float grid_bottom = grid_top + float(uniforms.grid_size.y - 2) * uniforms.cell_size.y;  // -2 for extra rows
+  // grid_padding is {top, right, bottom, left}
+  float grid_top = uniforms.grid_padding.x;  // Top padding (.x = top)
+  // Visible rows = grid_size.y - 2 (we render 2 extra rows for scroll buffer)
+  float grid_bottom = grid_top + float(uniforms.grid_size.y - 2) * uniforms.cell_size.y;
   
   // Discard fragments outside the visible viewport (between extra rows)
   if (in.screen_pos.y < grid_top || in.screen_pos.y > grid_bottom) {

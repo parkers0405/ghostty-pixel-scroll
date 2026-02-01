@@ -54,12 +54,14 @@ void main() {
     uint effective_scroll_bot = scroll_region_bot == 0u ? grid_size.y : scroll_region_bot;
     uint effective_scroll_right = scroll_region_right == 0u ? grid_size.x : scroll_region_right;
 
-    // Check if this cell is in the scroll region
-    // Include manual override from IS_SCROLL_GLYPH (for cells sliding in from header/footer)
-    bool in_scroll = (grid_pos.y >= scroll_region_top && grid_pos.y < effective_scroll_bot &&
-                      grid_pos.x >= scroll_region_left && grid_pos.x < effective_scroll_right) ||
-                     ((glyph_bools & IS_SCROLL_GLYPH) != 0u);
-    out_data.is_in_scroll_region = in_scroll ? 1u : 0u;
+    // Check if this cell is strictly inside the scroll region boundaries
+    bool in_scroll_bounds = grid_pos.y >= scroll_region_top && grid_pos.y < effective_scroll_bot &&
+                            grid_pos.x >= scroll_region_left && grid_pos.x < effective_scroll_right;
+
+    // Apply scroll offset ONLY if inside bounds or explicitly flagged as a scroll glyph
+    bool apply_scroll = in_scroll_bounds || ((glyph_bools & IS_SCROLL_GLYPH) != 0u);
+
+    out_data.is_in_scroll_region = apply_scroll ? 1u : 0u;
     out_data.grid_pos_out = grid_pos;
 
     // Convert the grid x, y into world space x, y by accounting for cell size
@@ -91,21 +93,15 @@ void main() {
     cell_pos = cell_pos + size * corner + offset;
     
     // Apply pixel scroll offset (base grid alignment)
-    // This is required because Ghostty renders an extra row at the top for smooth scrolling
-    // so we need to shift everything up by default to hide it.
+    // In terminal mode: shifts content up to hide an extra row for smooth scrollback.
+    // In TUI mode: this is 0, content stays at natural grid position.
     cell_pos.y -= pixel_scroll_offset_y;
     
     // Apply TUI scroll animation offset (Neovide-style)
     // This offset is ONLY applied to cells within the scroll region.
     // Cells in the header (above scroll_region_top) or statusline (at/below scroll_region_bot)
     // are NOT shifted - they stay fixed in place like Neovide does.
-    //
-    // The animation works like this:
-    // - When a scroll happens, tui_scroll_offset_y is set to the full delta (e.g., +16px for 1 line down)
-    // - It animates toward 0 using a spring
-    // - Cells within the scroll region are shifted by this offset, creating the sliding effect
-    // - At animation end (offset = 0), cells are in their final positions
-    if (tui_scroll_offset_y != 0.0 && in_scroll) {
+    if (tui_scroll_offset_y != 0.0 && apply_scroll) {
         cell_pos.y += tui_scroll_offset_y;
     }
 

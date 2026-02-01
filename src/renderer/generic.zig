@@ -1751,9 +1751,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
 
-            // Terminal scrollback (mouse/trackpad): uses scroll_pixel_offset for sub-cell positioning
-            // This keeps an extra row hidden above viewport for smooth scrolling.
-            const base_offset: f32 = cell_h - self.scroll_pixel_offset;
+            // Terminal scrollback (mouse/trackpad): uses scroll_pixel_offset for sub-cell positioning.
+            // For normal terminal mode, this keeps an extra row hidden above viewport.
+            // For TUI mode (Neovim etc.), we don't have an extra row, so we don't apply ANY base shift.
+            // TUI scroll animation is handled separately via tui_scroll_offset_y.
+            const base_offset: f32 = if (self.tui_scroll_active)
+                // TUI mode: no base shift - TUI apps fill the entire viewport
+                0.0
+            else
+                // Terminal mode: hide extra row above viewport for smooth scrollback
+                cell_h - self.scroll_pixel_offset;
             self.uniforms.pixel_scroll_offset_y = base_offset;
 
             // TUI scroll animation (Neovide-style per-cell offset)
@@ -1957,18 +1964,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     //    animation in the vertex shader.
                     try scrollback.populateCellsForRender(&self.cells);
 
-                    // TUI scrollback handles the extra row itself, so don't apply
-                    // terminal scrollback's hidden-row offset while animating.
-                    self.uniforms.pixel_scroll_offset_y = 0;
+                    // Note: pixel_scroll_offset_y is set to 0 in TUI mode (above), so content
+                    // is at its natural grid position. The tui_scroll_offset_y provides the
+                    // animation offset applied only to cells within the scroll region.
 
-                    // Sub-pixel offset for smooth animation
+                    // Sub-pixel offset for smooth animation within scroll region only
                     self.uniforms.tui_scroll_offset_y = scrollback.getSubLineOffset(cell_height_f);
 
-                    log.warn("TUI Scroll: pos={d:.2} offset_y={d:.1}px pixel_scroll={d:.1}px padding_top={d:.1}px", .{
+                    log.warn("TUI Scroll: pos={d:.2} tui_offset_y={d:.1}px pixel_scroll={d:.1}px", .{
                         scrollback.scroll_animation.position,
                         self.uniforms.tui_scroll_offset_y,
                         self.uniforms.pixel_scroll_offset_y,
-                        self.uniforms.grid_padding[0], // top padding
                     });
                 } else {
                     self.uniforms.tui_scroll_offset_y = 0;

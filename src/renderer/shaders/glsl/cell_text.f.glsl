@@ -31,18 +31,40 @@ void main() {
         uint eff_bot = scroll_region_bot == 0u ? grid_size.y : scroll_region_bot;
         uint eff_right = scroll_region_right == 0u ? grid_size.x : scroll_region_right;
 
-        float cell_top = float(in_data.grid_pos_out.y) * cell_size.y + tui_scroll_offset_y;
+        float cell_top = in_data.screen_pos.y;
         float cell_bottom = cell_top + cell_size.y;
-        float top_y = float(scroll_region_top) * cell_size.y;
-        float bot_y = float(eff_bot) * cell_size.y;
+        
+        // Calculate clip bounds in screen space
+        // Note: screen_pos already has pixel_scroll_offset_y subtracted
+        float top_y = float(scroll_region_top) * cell_size.y - pixel_scroll_offset_y;
+        float bot_y = float(eff_bot) * cell_size.y - pixel_scroll_offset_y;
 
-        float cell_left = float(in_data.grid_pos_out.x) * cell_size.x;
+        float cell_left = in_data.screen_pos.x;
         float cell_right = cell_left + cell_size.x;
         float left_x = float(scroll_region_left) * cell_size.x;
         float right_x = float(eff_right) * cell_size.x;
 
-        if (cell_bottom <= top_y || cell_top >= bot_y ||
-            cell_right <= left_x || cell_left >= right_x) {
+        // Strict clipping: if any part of the cell crosses the header/footer boundary, clip it?
+        // No, standard discard is pixel-based. But here we discard the whole fragment if it's out.
+        // Actually, screen_pos is the top-left of the cell.
+        // We should check the fragment coordinate? No, we check the cell position.
+        // Wait, screen_pos is varying? No, we passed it as 'in'. 
+        // It's interpolated across the primitive? 
+        // No, in vertex shader: out_data.screen_pos = cell_pos;
+        // So it IS interpolated.
+        // So for each pixel, we check if IT is inside the bounds.
+        
+        // Let's use the interpolated position for pixel-perfect clipping.
+        // in_data.screen_pos is the pixel coordinate of the fragment (roughly).
+        // Wait, cell_pos in vertex shader is top-left of the quad?
+        // No, cell_pos is modified by `corner` in vertex shader.
+        // But `out_data.screen_pos = cell_pos` happens AFTER corner offset?
+        // Let's check vertex shader.
+        // Yes: cell_pos = cell_pos + size * corner + offset;
+        // So `screen_pos` in fragment shader IS the pixel position!
+        
+        if (in_data.screen_pos.y < top_y || in_data.screen_pos.y >= bot_y ||
+            in_data.screen_pos.x < left_x || in_data.screen_pos.x >= right_x) {
             discard;
         }
     }

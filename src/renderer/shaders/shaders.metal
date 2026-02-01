@@ -479,14 +479,17 @@ fragment float4 cell_bg_fragment(
   }
 
   // Clamp y position if we should extend, otherwise discard if out of bounds.
+  // When pixel_scroll_offset_y is non-zero (smooth scrolling active), always clamp
+  // to ensure we fill edges with content from extra rows instead of black.
+  bool scrolling = uniforms.pixel_scroll_offset_y != uniforms.cell_size.y;
   if (grid_pos.y < 0) {
-    if (uniforms.padding_extend & EXTEND_UP) {
+    if (scrolling || (uniforms.padding_extend & EXTEND_UP)) {
       grid_pos.y = 0;
     } else {
       return bg;
     }
   } else if (grid_pos.y > uniforms.grid_size.y - 1) {
-    if (uniforms.padding_extend & EXTEND_DOWN) {
+    if (scrolling || (uniforms.padding_extend & EXTEND_DOWN)) {
       grid_pos.y = uniforms.grid_size.y - 1;
     } else {
       return bg;

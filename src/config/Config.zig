@@ -931,6 +931,18 @@ palette: Palette = .{},
 /// running inside the terminal (for example full-screen TUIs) that handle
 /// scrolling themselves.
 @"pixel-scroll": bool = true,
+    
+    /// The duration of the cursor animation in seconds.
+    @"cursor-animation-duration": f32 = 0.1,
+    
+    /// The bounciness of the cursor animation (0.0 to 1.0).
+    @"cursor-animation-bounciness": f32 = 0.0,
+    
+    /// The duration of the scroll animation in seconds.
+    @"scroll-animation-duration": f32 = 0.2,
+    
+    /// The bounciness of the scroll animation (0.0 to 1.0).
+    @"scroll-animation-bounciness": f32 = 0.0,
 
 /// The opacity level (opposite of transparency) of the background. A value of
 /// 1 is fully opaque and a value of 0 is fully transparent. A value less than 0

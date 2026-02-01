@@ -550,6 +550,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             arena: ArenaAllocator,
 
             font_thicken: bool,
+            pixel_scroll: bool,
+            cursor_animation_duration: f32,
+            cursor_animation_bounciness: f32,
+            scroll_animation_duration: f32,
+            scroll_animation_bounciness: f32,
             font_thicken_strength: u8,
             font_features: std.ArrayListUnmanaged([:0]const u8),
             font_styles: font.CodepointResolver.StyleStatus,
@@ -620,6 +625,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .background_opacity = @max(0, @min(1, config.@"background-opacity")),
                     .background_opacity_cells = config.@"background-opacity-cells",
                     .font_thicken = config.@"font-thicken",
+                    .pixel_scroll = config.@"pixel-scroll",
+                    .cursor_animation_duration = config.@"cursor-animation-duration",
+                    .cursor_animation_bounciness = config.@"cursor-animation-bounciness",
+                    .scroll_animation_duration = config.@"scroll-animation-duration",
+                    .scroll_animation_bounciness = config.@"scroll-animation-bounciness",
                     .font_thicken_strength = config.@"font-thicken-strength",
                     .font_features = font_features.list,
                     .font_styles = font_styles,
@@ -1456,7 +1466,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const dt_ns: f32 = @floatFromInt(n.since(last));
                     const dt: f32 = @min(dt_ns / std.time.ns_per_s, 0.1);
                     
-                    self.cursor_animating = self.cursor_animation.update(dt);
+                    const cursor_len = self.config.cursor_animation_duration;
+                    const cursor_zeta = 1.0 - (self.config.cursor_animation_bounciness * 0.6);
+                    self.cursor_animating = self.cursor_animation.update(dt, cursor_len, cursor_zeta);
                     
                     // Update uniform offsets
                     const pos = self.cursor_animation.getPosition();
@@ -1483,7 +1495,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const last = self.last_frame_time orelse n;
                     const dt_ns: f32 = @floatFromInt(n.since(last));
                     const dt: f32 = @min(dt_ns / std.time.ns_per_s, 0.1);
-                    self.scroll_animating = self.scroll_spring.update(dt, 0.15);
+                    const scroll_len = self.config.scroll_animation_duration;
+                    const scroll_zeta = 1.0 - (self.config.scroll_animation_bounciness * 0.6);
+                    self.scroll_animating = self.scroll_spring.update(dt, scroll_len, scroll_zeta);
                     spring_offset_px = self.scroll_spring.position * @as(f32, @floatFromInt(self.grid_metrics.cell_height));
                     
                     if (!self.cursor_animating) self.last_frame_time = n;
@@ -2710,7 +2724,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Clamp dt to reasonable range (avoid huge jumps on first frame or after pauses)
                 const clamped_dt = @min(dt, 0.1);
                 
-                self.cursor_animating = self.cursor_animation.update(clamped_dt);
+                const cursor_len = self.config.cursor_animation_duration;
+                const cursor_zeta = 1.0 - (self.config.cursor_animation_bounciness * 0.6);
+                self.cursor_animating = self.cursor_animation.update(clamped_dt, cursor_len, cursor_zeta);
                 
                 // Calculate offset from target position
                 const pos = self.cursor_animation.getPosition();

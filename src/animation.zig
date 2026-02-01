@@ -16,7 +16,7 @@ pub const Spring = struct {
 
     /// Update the spring animation.
     /// Returns true if still animating, false if settled.
-    pub fn update(self: *Spring, dt: f32, animation_length: f32) bool {
+    pub fn update(self: *Spring, dt: f32, animation_length: f32, zeta: f32) bool {
         // If animation would complete this frame, just snap
         if (animation_length <= dt) {
             self.reset();
@@ -30,7 +30,7 @@ pub const Spring = struct {
 
         // Critically damped spring (zeta = 1)
         // No oscillation, fastest settling without overshoot
-        const zeta: f32 = 1.0;
+        // zeta passed as arg
 
         // Omega calculated so destination reached with ~2% tolerance in animation_length time
         const omega = 4.0 / (zeta * animation_length);
@@ -73,9 +73,9 @@ pub const Spring2D = struct {
     x: Spring = .{},
     y: Spring = .{},
 
-    pub fn update(self: *Spring2D, dt: f32, animation_length: f32) bool {
-        const animating_x = self.x.update(dt, animation_length);
-        const animating_y = self.y.update(dt, animation_length);
+    pub fn update(self: *Spring2D, dt: f32, animation_length: f32, zeta: f32) bool {
+        const animating_x = self.x.update(dt, animation_length, zeta);
+        const animating_y = self.y.update(dt, animation_length, zeta);
         return animating_x or animating_y;
     }
 
@@ -208,12 +208,12 @@ pub const CursorAnimation = struct {
 
     /// Update animation state
     /// Returns true if still animating
-    pub fn update(self: *CursorAnimation, dt: f32) bool {
+    pub fn update(self: *CursorAnimation, dt: f32, animation_length: f32, zeta: f32) bool {
         if (!self.enabled) {
             return false;
         }
 
-        const animating = self.spring.update(dt, self.animation_length);
+        const animating = self.spring.update(dt, animation_length, zeta);
 
         // Current position = target + spring offset
         const offset = self.spring.getOffset();
@@ -243,7 +243,7 @@ test "spring settles to zero" {
     spring.velocity = 0;
 
     var iterations: u32 = 0;
-    while (spring.update(1.0 / 60.0, 0.15)) {
+    while (spring.update(1.0 / 60.0, 0.15, 1.0)) {
         iterations += 1;
         if (iterations > 1000) break;
     }
@@ -257,7 +257,7 @@ test "spring2d settles" {
     spring.setTarget(100, 50);
 
     var iterations: u32 = 0;
-    while (spring.update(1.0 / 60.0, 0.15)) {
+    while (spring.update(1.0 / 60.0, 0.15, 1.0)) {
         iterations += 1;
         if (iterations > 1000) break;
     }

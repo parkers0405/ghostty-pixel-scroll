@@ -242,6 +242,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         tui_scroll_left: u32 = 0,
         tui_scroll_right: u32 = 0,
         tui_scroll_active: bool = false,
+        /// Whether we're currently in the alternate screen (TUI apps like Neovim).
+        /// This is tracked separately from tui_scroll_active because we need to
+        /// disable terminal scrollback offset as soon as we enter alternate screen,
+        /// not just when OSC 9999 is received.
+        in_alternate_screen: bool = false,
 
         /// This value is used to force-update swap chain targets in the
         /// event of a config change that requires it (such as blending mode).
@@ -1629,6 +1634,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         self.tui_scroll_bot -= 1;
                     }
                 }
+                // Track alternate screen state - this determines whether to apply
+                // terminal scrollback offset (alternate screen = no scrollback = no offset)
+                self.in_alternate_screen = critical.tui_in_alternate;
+
                 if (critical.tui_scroll_active and critical.tui_in_alternate) {
                     self.tui_scroll_active = true;
                 } else if (!critical.tui_in_alternate) {
@@ -1753,13 +1762,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Terminal scrollback (mouse/trackpad): uses scroll_pixel_offset for sub-cell positioning.
             // For normal terminal mode, this keeps an extra row hidden above viewport.
-            // For TUI mode (Neovim etc.), we don't have an extra row, so we don't apply ANY base shift.
-            // TUI scroll animation is handled separately via tui_scroll_offset_y.
-            const base_offset: f32 = if (self.tui_scroll_active)
-                // TUI mode: no base shift - TUI apps fill the entire viewport
+            // For alternate screen (TUI apps like Neovim), there's no terminal scrollback,
+            // so we don't apply ANY base shift. TUI scroll animation uses tui_scroll_offset_y.
+            //
+            // IMPORTANT: We use in_alternate_screen (not tui_scroll_active) because we need
+            // to disable the scrollback offset as SOON as we enter alternate screen, not just
+            // when OSC 9999 is received. Otherwise there's a visual jump on first scroll.
+            const base_offset: f32 = if (self.in_alternate_screen)
+                // Alternate screen: no base shift - no terminal scrollback in this mode
                 0.0
             else
-                // Terminal mode: hide extra row above viewport for smooth scrollback
+                // Primary screen: hide extra row above viewport for smooth scrollback
                 cell_h - self.scroll_pixel_offset;
             self.uniforms.pixel_scroll_offset_y = base_offset;
 

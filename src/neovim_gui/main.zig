@@ -374,6 +374,7 @@ pub const NeovimGui = struct {
     }
 
     fn handleWinPos(self: *Self, data: Event.WinPos) !void {
+        log.info("handleWinPos: grid={} row={} col={}", .{ data.grid, data.start_row, data.start_col });
         const window = try self.getOrCreateWindow(data.grid);
         window.setPosition(data.start_row, data.start_col, data.width, data.height);
         window.window_type = .editor;

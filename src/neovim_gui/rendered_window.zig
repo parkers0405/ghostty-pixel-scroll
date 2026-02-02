@@ -177,20 +177,13 @@ pub const RenderedWindow = struct {
         self.dirty = true;
     }
 
-    pub fn setPosition(self: *Self, row: u64, col: u64, width: u64, height: u64) void {
-        const new_x: f32 = @floatFromInt(col);
-        const new_y: f32 = @floatFromInt(row);
+    pub fn setPosition(self: *Self, row: u64, col: u64, _: u64, _: u64) void {
+        // Use position exactly as Neovim specifies
+        self.grid_position = .{ @floatFromInt(col), @floatFromInt(row) };
+        self.target_position = self.grid_position;
+        self.position_spring_x.position = 0;
+        self.position_spring_y.position = 0;
 
-        // If position changed, animate to new position
-        if (new_x != self.target_position[0] or new_y != self.target_position[1]) {
-            // Set spring to animate from current to target
-            self.position_spring_x.position = self.grid_position[0] - new_x;
-            self.position_spring_y.position = self.grid_position[1] - new_y;
-            self.target_position = .{ new_x, new_y };
-        }
-
-        _ = width;
-        _ = height;
         self.valid = true;
         self.hidden = false;
         self.zindex = 0; // Normal windows at base z-index
@@ -200,12 +193,11 @@ pub const RenderedWindow = struct {
         const new_x: f32 = @floatFromInt(col);
         const new_y: f32 = @floatFromInt(row);
 
-        // If position changed, animate to new position
-        if (new_x != self.target_position[0] or new_y != self.target_position[1]) {
-            self.position_spring_x.position = self.grid_position[0] - new_x;
-            self.position_spring_y.position = self.grid_position[1] - new_y;
-            self.target_position = .{ new_x, new_y };
-        }
+        // Always set position - snap immediately
+        self.grid_position = .{ new_x, new_y };
+        self.target_position = .{ new_x, new_y };
+        self.position_spring_x.position = 0;
+        self.position_spring_y.position = 0;
 
         self.valid = true;
         self.hidden = false;

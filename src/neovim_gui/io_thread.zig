@@ -686,10 +686,14 @@ pub const IoThread = struct {
     fn processEvent(self: *Self, name: []const u8, args: []const Payload) !void {
         if (std.mem.eql(u8, name, "grid_resize")) {
             if (args.len >= 3) {
+                const grid = extractU64(args[0]) orelse return;
+                const width = extractU64(args[1]) orelse return;
+                const height = extractU64(args[2]) orelse return;
+                log.info("grid_resize: grid={} {}x{}", .{ grid, width, height });
                 try self.event_queue.push(.{ .grid_resize = .{
-                    .grid = extractU64(args[0]) orelse return,
-                    .width = extractU64(args[1]) orelse return,
-                    .height = extractU64(args[2]) orelse return,
+                    .grid = grid,
+                    .width = width,
+                    .height = height,
                 } });
             }
         } else if (std.mem.eql(u8, name, "grid_line")) {
@@ -722,13 +726,22 @@ pub const IoThread = struct {
             }
         } else if (std.mem.eql(u8, name, "win_pos")) {
             if (args.len >= 6) {
+                const grid = extractU64(args[0]) orelse return;
+                const start_row = extractU64(args[2]) orelse return;
+                const start_col = extractU64(args[3]) orelse return;
+                const width = extractU64(args[4]) orelse return;
+                const height = extractU64(args[5]) orelse return;
+                // args[1] is the window handle - it's an ext type, not a plain int
+                // For now, use 0 as placeholder since we don't really need it
+                const win = extractU64(args[1]) orelse 0;
+                log.info("win_pos: grid={} win={} row={} col={} {}x{}", .{ grid, win, start_row, start_col, width, height });
                 try self.event_queue.push(.{ .win_pos = .{
-                    .grid = extractU64(args[0]) orelse return,
-                    .win = extractU64(args[1]) orelse return,
-                    .start_row = extractU64(args[2]) orelse return,
-                    .start_col = extractU64(args[3]) orelse return,
-                    .width = extractU64(args[4]) orelse return,
-                    .height = extractU64(args[5]) orelse return,
+                    .grid = grid,
+                    .win = win,
+                    .start_row = start_row,
+                    .start_col = start_col,
+                    .width = width,
+                    .height = height,
                 } });
             }
         } else if (std.mem.eql(u8, name, "win_float_pos")) {

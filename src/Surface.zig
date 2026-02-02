@@ -874,6 +874,8 @@ pub fn initNeovimGui(self: *Surface) !void {
     errdefer nvim.deinit();
 
     // Set initial grid size based on terminal size
+    // Note: We use the exact terminal grid size. Neovim handles its own
+    // statusline, cmdline, tabline within this space.
     nvim.grid_width = self.size.grid().columns;
     nvim.grid_height = self.size.grid().rows;
     nvim.cell_width = @floatFromInt(self.size.cell.width);

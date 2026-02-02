@@ -1802,12 +1802,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Reset all cells
             self.cells.reset();
 
-            // Get grid dimensions from the first window (grid 1 is usually the main editor)
-            const main_window = nvim.getWindow(1) orelse return;
-
-            // Ensure our cells buffer matches the grid size
-            const rows: u16 = @intCast(main_window.grid_height);
-            const cols: u16 = @intCast(main_window.grid_width);
+            // Use the full grid size we requested from Neovim, not individual window sizes
+            // This ensures we fill the entire terminal area
+            const rows: u16 = @intCast(nvim.grid_height);
+            const cols: u16 = @intCast(nvim.grid_width);
 
             if (rows == 0 or cols == 0) return;
 

@@ -256,16 +256,28 @@ pub const NeovimGui = struct {
                 self.handleGridClear(grid);
             },
             .grid_cursor_goto => |data| {
+                const first_position = (self.cursor_row == 0 and self.cursor_col == 0 and
+                    self.cursor_renderer.dest_x == 0 and self.cursor_renderer.dest_y == 0);
                 self.cursor_grid = data.grid;
                 self.cursor_row = data.row;
                 self.cursor_col = data.col;
-                // Update cursor renderer with new position
-                self.cursor_renderer.setCursorPosition(
-                    @intCast(data.col),
-                    @intCast(data.row),
-                    self.cell_width,
-                    self.cell_height,
-                );
+
+                // On first cursor position, snap immediately (no animation from 0,0)
+                if (first_position) {
+                    self.cursor_renderer.snap(
+                        @intCast(data.col),
+                        @intCast(data.row),
+                        self.cell_width,
+                        self.cell_height,
+                    );
+                } else {
+                    self.cursor_renderer.setCursorPosition(
+                        @intCast(data.col),
+                        @intCast(data.row),
+                        self.cell_width,
+                        self.cell_height,
+                    );
+                }
                 self.dirty = true;
             },
             .win_pos => |data| {

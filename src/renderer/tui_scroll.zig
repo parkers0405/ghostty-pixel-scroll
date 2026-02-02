@@ -451,10 +451,8 @@ pub const TuiScrollback = struct {
         const scroll_right = self.scroll_region_right;
         const full_width = scroll_left == 0 and scroll_right == self.grid_columns;
 
-        // Render one extra line like Neovide (inner_size + 1).
-        const end_i: usize = inner_size + 1;
-
-        for (0..end_i) |i_usize| {
+        // Only render the actual scroll region rows (no extra row needed)
+        for (0..inner_size) |i_usize| {
             const i: isize = @intCast(i_usize);
 
             // Buffer index = offset + screen_row (relative to top of scroll region)
@@ -464,12 +462,8 @@ pub const TuiScrollback = struct {
             // Determine target logical grid row (visual position)
             const grid_row_signed = @as(isize, @intCast(self.scroll_region_top)) + i;
 
-            // Is this an "extra" row (the extra +1 line)?
-            const is_extra = i == @as(isize, @intCast(inner_size));
-
-            if (!is_extra) {
-                // Determine actual row index in cells buffer
-                if (grid_row_signed < 0 or grid_row_signed >= self.grid_rows) continue;
+            // Bounds check
+            if (grid_row_signed >= 0 and grid_row_signed < self.grid_rows) {
                 const grid_row: usize = @intCast(grid_row_signed);
 
                 // For inner rows, overwrite scroll region only for partial-width scrolls
@@ -515,27 +509,6 @@ pub const TuiScrollback = struct {
                                 try dest_list.append(self.alloc, adjusted);
                             }
                         }
-                    }
-                }
-            } else {
-                // Extra line just below the scroll region.
-                const scroll_bot: isize = @intCast(self.scroll_region_bot);
-                const dest_row_idx = scroll_bot - 1;
-
-                if (dest_row_idx < 0 or dest_row_idx >= self.grid_rows) continue;
-                const fg_row_index = @as(usize, @intCast(dest_row_idx)) + 1;
-
-                if (fg_row_index < cells.fg_rows.lists.len) {
-                    const dest_list = &cells.fg_rows.lists[fg_row_index];
-
-                    for (scrollback_row.fg_cells.items) |cell_text| {
-                        if (!full_width and (cell_text.grid_pos[0] < scroll_left or cell_text.grid_pos[0] >= scroll_right)) {
-                            continue;
-                        }
-                        var adjusted = cell_text;
-                        adjusted.grid_pos[1] = @intCast(dest_row_idx);
-                        adjusted.bools.is_scroll_glyph = true;
-                        try dest_list.append(self.alloc, adjusted);
                     }
                 }
             }

@@ -833,6 +833,14 @@ pub const NeovimGui = struct {
 
     fn handleWinViewport(self: *Self, data: Event.WinViewport) void {
         const window = self.windows.get(data.grid) orelse return;
+        if (data.scroll_delta != 0) {
+            log.info("win_viewport: grid={} scroll_delta={} topline={} botline={}", .{
+                data.grid,
+                data.scroll_delta,
+                data.topline,
+                data.botline,
+            });
+        }
         window.setViewport(data.topline, data.botline, data.scroll_delta);
     }
 

@@ -16,7 +16,7 @@ const App = @import("../App.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.renderer_thread);
 
-const DRAW_INTERVAL = 8; // 120 FPS
+const DRAW_INTERVAL = 6; // ~165 FPS for high refresh rate monitors
 const CURSOR_BLINK_INTERVAL = 600;
 
 /// Whether calls to `drawFrame` must be done from the app thread.
@@ -590,8 +590,14 @@ fn drawCallback(
         return .disarm;
     };
 
-    // Draw
-    t.drawFrame(false);
+    // For Neovim GUI mode: Call full renderCallback to process events + animate + draw together
+    // This ensures everything stays in sync at display refresh rate (like Neovide)
+    if (t.renderer.nvim_gui != null) {
+        _ = renderCallback(t, undefined, undefined, {});
+    } else {
+        // Terminal mode: just draw
+        t.drawFrame(false);
+    }
 
     // Only continue if we're still active
     if (t.draw_active) {

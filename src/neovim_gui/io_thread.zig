@@ -1203,22 +1203,27 @@ pub const IoThread = struct {
                 }
             }
         } else if (std.mem.eql(u8, name, "win_viewport")) {
+            log.info("win_viewport: args.len={}", .{args.len});
             if (args.len >= 8) {
                 const scroll_delta = extractI64(args[7]) orelse 0;
-                log.info("win_viewport: grid={} scroll_delta={}", .{
-                    extractU64(args[0]) orelse 0,
-                    scroll_delta,
+                const grid = extractU64(args[0]) orelse return;
+                if (scroll_delta != 0) {
+                    log.info("win_viewport: grid={} scroll_delta={}", .{ grid, scroll_delta });
+                }
+                // Note: args[1] is 'win' which is an ext type (window handle), not a u64
+                // We don't need it for scroll animation, so just skip it
+                try self.event_queue.push(.{
+                    .win_viewport = .{
+                        .grid = grid,
+                        .win = 0, // Not used - the real win is an ext type we can't extract
+                        .topline = extractU64(args[2]) orelse 0,
+                        .botline = extractU64(args[3]) orelse 0,
+                        .curline = extractU64(args[4]) orelse 0,
+                        .curcol = extractU64(args[5]) orelse 0,
+                        .line_count = extractU64(args[6]) orelse 0,
+                        .scroll_delta = scroll_delta,
+                    },
                 });
-                try self.event_queue.push(.{ .win_viewport = .{
-                    .grid = extractU64(args[0]) orelse return,
-                    .win = extractU64(args[1]) orelse return,
-                    .topline = extractU64(args[2]) orelse 0,
-                    .botline = extractU64(args[3]) orelse 0,
-                    .curline = extractU64(args[4]) orelse 0,
-                    .curcol = extractU64(args[5]) orelse 0,
-                    .line_count = extractU64(args[6]) orelse 0,
-                    .scroll_delta = scroll_delta,
-                } });
             }
         } else if (std.mem.eql(u8, name, "msg_set_pos")) {
             // msg_set_pos: [grid, row, scrolled, sep_char, zindex, compindex]

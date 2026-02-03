@@ -449,12 +449,18 @@ pub const RenderedWindow = struct {
         };
     }
 
-    /// Handle win_viewport event - sets scroll_delta for animation
+    /// Handle win_viewport event - sets scroll_delta for animation (like Neovide)
+    /// IMPORTANT: Only set scroll_delta when non-zero! Neovim sends multiple win_viewport
+    /// events per scroll - one with the actual delta, then one with delta=0 to "confirm".
+    /// If we blindly accept 0, it overwrites the real delta before flush() processes it.
+    /// This matches Neovide's behavior of using Option<i64> and only acting on Some values.
     pub fn setViewport(self: *Self, topline: u64, botline: u64, scroll_delta: i64) void {
         _ = topline;
         _ = botline;
-        // win_viewport provides scroll_delta directly - this drives the animation
-        self.scroll_delta = @intCast(scroll_delta);
+        // Only set scroll_delta when non-zero - ignore the "confirmation" events with delta=0
+        if (scroll_delta != 0) {
+            self.scroll_delta = @intCast(scroll_delta);
+        }
     }
 
     /// Handle grid_scroll event - rotates actual_lines (content movement)
@@ -619,6 +625,15 @@ pub const RenderedWindow = struct {
 
         const scroll_delta = self.scroll_delta;
 
+        if (scroll_delta != 0) {
+            log.info("flush: grid={} scroll_delta={} inner_size={} position_before={d:.2}", .{
+                self.id,
+                scroll_delta,
+                inner_size,
+                self.scroll_animation.position,
+            });
+        }
+
         // Rotate scrollback by scroll_delta
         scrollback.rotate(scroll_delta);
 
@@ -640,38 +655,20 @@ pub const RenderedWindow = struct {
 
         // Update scroll animation
         if (scroll_delta != 0) {
-            log.info("flush: scroll_delta={} animation_pos={d:.2}", .{ scroll_delta, self.scroll_animation.position });
-
             var scroll_offset = self.scroll_animation.position;
 
-            const max_delta: isize = @intCast(scrollback.length() / 2);
+            // Max visual offset - limit to a reasonable number of lines for smooth animation
+            // Even with a large scrollback, we don't want huge visual offsets
+            const max_visual_lines: f32 = 5.0;
 
-            // Check if this is a "far" scroll (beyond buffer capacity)
-            if (@abs(scroll_delta) > max_delta) {
-                // Far scroll - limit animation to a few lines
-                const far_lines: f32 = @floatFromInt(@min(self.scroll_settings.scroll_animation_far_lines, self.grid_height));
-                const sign: f32 = if (scroll_delta > 0) -1.0 else 1.0;
-                scroll_offset = far_lines * sign;
+            // Accumulate the scroll delta
+            scroll_offset -= @as(f32, @floatFromInt(scroll_delta));
 
-                // Clear the lines that will show the "empty" gap during far scroll
-                const empty_range_start: isize = if (scroll_delta > 0) -@as(isize, @intFromFloat(far_lines)) else inner_size;
-                const empty_range_end: isize = if (scroll_delta > 0) 0 else inner_size + @as(isize, @intFromFloat(far_lines));
-
-                var j = empty_range_start;
-                while (j < empty_range_end) : (j += 1) {
-                    const ptr = scrollback.get(j);
-                    if (ptr.*) |line| {
-                        line.deinit();
-                    }
-                    ptr.* = null;
-                }
-            } else {
-                // Normal scroll - accumulate and clamp
-                scroll_offset -= @as(f32, @floatFromInt(scroll_delta));
-                scroll_offset = std.math.clamp(scroll_offset, -@as(f32, @floatFromInt(max_delta)), @as(f32, @floatFromInt(max_delta)));
-            }
+            // Clamp to max visual offset - this prevents runaway accumulation
+            scroll_offset = std.math.clamp(scroll_offset, -max_visual_lines, max_visual_lines);
 
             self.scroll_animation.position = scroll_offset;
+            log.info("flush: grid={} position_after={d:.2}", .{ self.id, scroll_offset });
         }
 
         self.scroll_delta = 0;
@@ -740,16 +737,19 @@ pub const RenderedWindow = struct {
     }
 
     /// Get pixel offset for smooth scroll rendering (sub-line portion only)
-    /// This is the fractional part of the scroll position converted to pixels.
+    /// This matches Neovide's calculation exactly:
+    ///   scroll_offset = floor(position) - position
+    ///   scroll_offset_pixels = scroll_offset * cell_height
     ///
     /// Example: if scroll_animation.position = -2.7 and cell_height = 20
-    /// - floor(-2.7) = -3, fract = -2.7 - (-3) = 0.3
-    /// - pixel_offset = 0.3 * 20 = 6 pixels
+    /// - floor(-2.7) = -3
+    /// - scroll_offset = -3 - (-2.7) = -0.3
+    /// - pixel_offset = -0.3 * 20 = -6 pixels (shift content UP)
     pub fn getSubLineOffset(self: *const Self, cell_height: f32) f32 {
         const pos = self.scroll_animation.position;
-        // Get fractional part: pos - floor(pos)
-        const fract = pos - @floor(pos);
-        return fract * cell_height;
+        const scroll_offset_lines = @floor(pos);
+        const scroll_offset = scroll_offset_lines - pos;
+        return scroll_offset * cell_height;
     }
 
     /// Get the scrollable region bounds (excluding viewport margins)

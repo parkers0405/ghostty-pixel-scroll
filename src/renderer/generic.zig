@@ -1475,6 +1475,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// This is a separate code path that reads from Neovim windows instead of terminal state.
         fn updateFrameNeovim(self: *Self, nvim: *neovim_gui.NeovimGui) !void {
             // Process any pending Neovim events - this is the hot path
+            // Called immediately when mailbox is triggered for lowest latency
             nvim.processEvents() catch {};
 
             // Calculate time delta for smooth scroll animation
@@ -2010,6 +2011,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }
                 }
             }
+
+            // NOTE: For Neovim GUI mode, scroll animations are updated in updateFrameNeovim
+            // along with event processing, so they stay perfectly in sync (like Neovide).
+            // We don't duplicate animation updates here to avoid race conditions.
 
             // Pixel scroll offset for smooth scrolling
             //

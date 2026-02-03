@@ -21,6 +21,10 @@ layout(location = 5) in uint atlas;
 // Misc glyph properties.
 layout(location = 6) in uint glyph_bools;
 
+// Per-cell pixel Y offset for smooth scrolling (8.8 fixed-point format)
+// Used for Neovide-style per-window smooth scrolling
+layout(location = 7) in int pixel_offset_y_fixed;
+
 // Values `atlas` can take.
 const uint ATLAS_GRAYSCALE = 0u;
 const uint ATLAS_COLOR = 1u;
@@ -74,7 +78,12 @@ void main() {
     // and glyph offset to create the correct bounding box for the glyph.
     cell_pos = cell_pos + size * corner + offset;
     
-    // Apply pixel scroll offset (base grid alignment)
+    // Apply per-cell pixel scroll offset (8.8 fixed-point -> float)
+    // This enables per-window smooth scrolling in Neovim GUI mode
+    float per_cell_offset_y = float(pixel_offset_y_fixed) / 256.0;
+    cell_pos.y += per_cell_offset_y;
+    
+    // Apply global pixel scroll offset (base grid alignment)
     // In terminal mode: shifts content up to hide an extra row for smooth scrollback.
     cell_pos.y -= pixel_scroll_offset_y;
     

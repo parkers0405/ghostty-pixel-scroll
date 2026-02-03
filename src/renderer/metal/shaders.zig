@@ -282,6 +282,10 @@ pub const CellText = extern struct {
         is_cursor_glyph: bool = false,
         _padding: u6 = 0,
     } align(1) = .{},
+    /// Per-cell pixel Y offset for smooth scrolling (sub-pixel precision)
+    /// Uses 8.8 fixed-point format: upper 8 bits = integer, lower 8 bits = fraction
+    /// Range: -128.0 to +127.996 pixels
+    pixel_offset_y: i16 align(2) = 0,
 
     pub const Atlas = enum(u8) {
         grayscale = 0,

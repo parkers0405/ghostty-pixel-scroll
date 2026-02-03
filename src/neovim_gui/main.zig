@@ -67,6 +67,9 @@ pub const NeovimGui = struct {
     default_foreground: u32 = 0xcdd6f4,
     default_special: u32 = 0xff0000,
 
+    /// NormalFloat highlight ID (for floating window backgrounds)
+    normal_float_hl_id: ?u64 = null,
+
     /// Whether we're connected and ready
     ready: bool = false,
 
@@ -411,6 +414,7 @@ pub const NeovimGui = struct {
                 try self.hl_attrs.put(data.id, data.attr);
             },
             .default_colors_set => |data| {
+                log.info("default_colors_set: fg=0x{x} bg=0x{x} sp=0x{x}", .{ data.fg, data.bg, data.sp });
                 self.default_foreground = data.fg;
                 self.default_background = data.bg;
                 self.default_special = data.sp;
@@ -609,7 +613,11 @@ pub const NeovimGui = struct {
             // Highlight group set
             .hl_group_set => |data| {
                 log.info("hl_group_set: {s} -> {}", .{ data.name, data.hl_id });
-                // Store in a hashmap if needed - for now just log
+                // Track NormalFloat for floating window backgrounds
+                if (std.mem.eql(u8, data.name, "NormalFloat")) {
+                    self.normal_float_hl_id = data.hl_id;
+                    log.info("NormalFloat hl_id set to {}", .{data.hl_id});
+                }
                 self.dirty = true;
             },
             // Window extmark (Neovim 0.10+)
@@ -897,7 +905,7 @@ pub const NeovimGui = struct {
         // Called after a batch of updates - trigger render
         var it = self.windows.valueIterator();
         while (it.next()) |window_ptr| {
-            window_ptr.*.flush(self.cell_height);
+            window_ptr.*.flush();
         }
         self.dirty = true;
     }
@@ -922,6 +930,30 @@ pub const NeovimGui = struct {
     /// Get highlight attributes for a given ID
     pub fn getHlAttr(self: *const Self, id: u64) HlAttr {
         if (id == 0) {
+            return HlAttr{
+                .foreground = self.default_foreground,
+                .background = self.default_background,
+            };
+        }
+        return self.hl_attrs.get(id) orelse HlAttr{
+            .foreground = self.default_foreground,
+            .background = self.default_background,
+        };
+    }
+
+    /// Get highlight attributes for a floating window context
+    /// Uses NormalFloat background for hl_id 0 if available
+    pub fn getHlAttrForFloat(self: *const Self, id: u64) HlAttr {
+        if (id == 0) {
+            // For floating windows, use NormalFloat background if available
+            if (self.normal_float_hl_id) |float_id| {
+                if (self.hl_attrs.get(float_id)) |float_attr| {
+                    return HlAttr{
+                        .foreground = float_attr.foreground orelse self.default_foreground,
+                        .background = float_attr.background orelse self.default_background,
+                    };
+                }
+            }
             return HlAttr{
                 .foreground = self.default_foreground,
                 .background = self.default_background,

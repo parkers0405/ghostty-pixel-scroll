@@ -15,9 +15,8 @@ vec4 cell_bg() {
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
     
     // Calculate grid position from fragment coordinates
-    // NOTE: We do NOT apply pixel_scroll_offset_y here because background colors
-    // are already at their correct final positions (Neovim has scrolled the content).
-    // The scroll offset only affects TEXT rendering for the visual animation effect.
+    // NOTE: Scroll offset is NOT applied here - it's handled per-window in the CPU
+    // by adjusting glyph positions. Backgrounds are rendered at final positions.
     vec2 adjusted_coord = gl_FragCoord.xy;
     
     ivec2 grid_pos = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));

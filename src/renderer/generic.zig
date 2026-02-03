@@ -1508,11 +1508,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.draw_mutex.lock();
             defer self.draw_mutex.unlock();
 
-            // NEOVIM GUI MODE: Scroll animation
-            // TODO: Implement proper Neovide-style scrollback buffer rendering
-            // For now, we disable scroll offset because without a scrollback buffer,
-            // the text shifts but backgrounds don't, causing visual artifacts.
-            // The animation system is in place but we need scrollback rendering to use it.
+            // NEOVIM GUI MODE: Per-window smooth scrolling
+            // The global pixel_scroll_offset_y is disabled since we use per-cell offsets.
+            // Each cell has its own pixel_offset_y field that gets the window's scroll
+            // animation position applied in rebuildCellsFromNeovim().
             self.uniforms.pixel_scroll_offset_y = 0;
 
             // Rebuild cells from Neovim window content
@@ -1573,7 +1572,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const window = window_ptr.*;
                 if (window.hidden or !window.valid) continue;
                 if (window.grid_height == 0 or window.grid_width == 0) continue;
-                if (window.cells.len == 0) continue;
+                if (window.actual_lines == null) continue;
                 windows_to_render.append(self.alloc, window) catch continue;
             }
 
@@ -1584,31 +1583,69 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }.lessThan);
 
+            // Get cell height for scroll offset calculation
+            const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+
             // Process each Neovim window in z-order
             for (windows_to_render.items) |window| {
                 // Get window position offset
                 const win_col: u16 = @intFromFloat(window.grid_position[0]);
                 const win_row: u16 = @intFromFloat(window.grid_position[1]);
 
-                // Debug: log floating window info
-                if (window.zindex > 0) {
-                    log.err("FLOAT window {}: pos=({},{}) size={}x{} zindex={} type={}", .{
-                        window.id,
-                        win_col,
-                        win_row,
-                        window.grid_width,
-                        window.grid_height,
-                        window.zindex,
-                        @intFromEnum(window.window_type),
-                    });
+                // Check if this is a floating window
+                const is_floating = window.zindex > 0 or window.window_type == .floating;
+
+                // Get per-window scroll offset in pixels for smooth scrolling
+                // Only editor windows scroll - floating windows and messages don't
+                const scroll_pixel_offset: f32 = if (!is_floating)
+                    window.getSubLineOffset(cell_h)
+                else
+                    0;
+
+                // For floating windows, fill the entire window area with background color first
+                // This ensures the window is opaque even if cells don't have explicit backgrounds
+                // (Like Neovide's canvas.clear(default_background))
+                if (is_floating) {
+                    // Use the global default background - same as Neovide does
+                    const float_bg = default_bg;
+
+                    const float_bg_r: u8 = @intCast((float_bg >> 16) & 0xFF);
+                    const float_bg_g: u8 = @intCast((float_bg >> 8) & 0xFF);
+                    const float_bg_b: u8 = @intCast(float_bg & 0xFF);
+
+                    // Fill entire window area with background
+                    var fill_row: u32 = 0;
+                    while (fill_row < window.grid_height) : (fill_row += 1) {
+                        var fill_col: u32 = 0;
+                        while (fill_col < window.grid_width) : (fill_col += 1) {
+                            const screen_y = @as(u16, @intCast(fill_row)) + win_row;
+                            const screen_x = @as(u16, @intCast(fill_col)) + win_col;
+                            if (screen_y < self.cells.size.rows and screen_x < self.cells.size.columns) {
+                                self.cells.bgCell(screen_y, screen_x).* = .{ float_bg_r, float_bg_g, float_bg_b, 255 };
+                            }
+                        }
+                    }
                 }
 
                 // Render each cell in the grid
+                // For scrollable rows during animation, read from scrollback buffer
+                // For margin rows (winbar, statusline), read from actual_lines
                 var row: u32 = 0;
                 while (row < window.grid_height) : (row += 1) {
+                    const is_scrollable_row = window.isRowScrollable(row);
+
                     var col: u32 = 0;
                     while (col < window.grid_width) : (col += 1) {
-                        const grid_cell = window.getCell(row, col) orelse continue;
+                        // Get cell from appropriate source:
+                        // - Scrollable rows during animation: read from scrollback
+                        // - Margin rows or no animation: read from actual_lines
+                        const grid_cell: ?*const neovim_gui.GridCell = if (is_scrollable_row and !is_floating)
+                            window.getScrollbackCell(row, col) orelse window.getCell(row, col)
+                        else
+                            window.getCell(row, col);
+
+                        if (grid_cell == null) continue;
+                        const cell = grid_cell.?;
 
                         // Apply window position offset
                         const y: u16 = @intCast(row);
@@ -1619,7 +1656,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
 
                         // Get highlight attributes from NeovimGui
-                        const hl_attr = nvim.getHlAttr(grid_cell.hl_id);
+                        // Use NormalFloat background for floating windows with hl_id 0
+                        const hl_attr = if (is_floating)
+                            nvim.getHlAttrForFloat(cell.hl_id)
+                        else
+                            nvim.getHlAttr(cell.hl_id);
 
                         // Handle reverse video
                         var fg_color = hl_attr.foreground orelse default_fg;
@@ -1632,22 +1673,62 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         }
 
                         // Set background color at screen position
-                        // Apply blend for transparency (0 = opaque, 100 = fully transparent)
-                        const alpha: u8 = if (hl_attr.blend > 0)
-                            @intCast(255 - (@as(u16, hl_attr.blend) * 255 / 100))
-                        else
-                            255;
-                        self.cells.bgCell(screen_y, screen_x).* = .{
-                            @intCast((bg_color >> 16) & 0xFF),
-                            @intCast((bg_color >> 8) & 0xFF),
-                            @intCast(bg_color & 0xFF),
-                            alpha,
-                        };
+                        // For floating windows: the fill already set a solid background,
+                        // so we only need to draw cell backgrounds that are DIFFERENT from the fill
+                        // (which was default_bg). This prevents overwriting the opaque fill.
+                        if (is_floating) {
+                            // Only draw if cell has a custom background (not default)
+                            // or if it has blend (which we'll composite properly)
+                            const has_custom_bg = hl_attr.background != null and hl_attr.background.? != default_bg;
+
+                            if (has_custom_bg or hl_attr.blend > 0) {
+                                if (hl_attr.blend > 0) {
+                                    // Blend with the fill color (default_bg)
+                                    const blend_alpha = 255 - (@as(u16, hl_attr.blend) * 255 / 100);
+                                    const inv_alpha = 255 - blend_alpha;
+
+                                    const cell_r: u16 = @intCast((bg_color >> 16) & 0xFF);
+                                    const cell_g: u16 = @intCast((bg_color >> 8) & 0xFF);
+                                    const cell_b: u16 = @intCast(bg_color & 0xFF);
+                                    const def_r: u16 = @intCast((default_bg >> 16) & 0xFF);
+                                    const def_g: u16 = @intCast((default_bg >> 8) & 0xFF);
+                                    const def_b: u16 = @intCast(default_bg & 0xFF);
+
+                                    const final_r: u8 = @intCast((cell_r * blend_alpha + def_r * inv_alpha) / 255);
+                                    const final_g: u8 = @intCast((cell_g * blend_alpha + def_g * inv_alpha) / 255);
+                                    const final_b: u8 = @intCast((cell_b * blend_alpha + def_b * inv_alpha) / 255);
+
+                                    self.cells.bgCell(screen_y, screen_x).* = .{ final_r, final_g, final_b, 255 };
+                                } else {
+                                    // Custom background, no blend
+                                    self.cells.bgCell(screen_y, screen_x).* = .{
+                                        @intCast((bg_color >> 16) & 0xFF),
+                                        @intCast((bg_color >> 8) & 0xFF),
+                                        @intCast(bg_color & 0xFF),
+                                        255,
+                                    };
+                                }
+                            }
+                            // else: keep the fill color (don't overwrite)
+                        } else {
+                            // Non-floating: always set background
+                            self.cells.bgCell(screen_y, screen_x).* = .{
+                                @intCast((bg_color >> 16) & 0xFF),
+                                @intCast((bg_color >> 8) & 0xFF),
+                                @intCast(bg_color & 0xFF),
+                                255,
+                            };
+                        }
 
                         // Render the glyph if cell has text
-                        const text = grid_cell.getText();
+                        const text = cell.getText();
                         if (text.len > 0) {
-                            self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr) catch {};
+                            // Apply scroll offset only to scrollable rows (not margins like statusline/winbar)
+                            const row_scroll_offset: f32 = if (is_scrollable_row)
+                                scroll_pixel_offset
+                            else
+                                0;
+                            self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, row_scroll_offset) catch {};
                         }
                     }
                 }
@@ -1694,17 +1775,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.uniforms.cursor_offset_x = 0;
             self.uniforms.cursor_offset_y = 0;
 
-            // Debug: log every cursor update
-            log.err("CURSOR: grid={} local=({},{}) + win=({d:.0},{d:.0}) = screen=({},{})", .{
-                nvim.cursor_grid,
-                nvim.cursor_col,
-                nvim.cursor_row,
-                cursor_window.grid_position[0],
-                cursor_window.grid_position[1],
-                screen_col,
-                screen_row,
-            });
-
             const alpha: u8 = 255;
 
             // Render cursor glyph
@@ -1714,11 +1784,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .b = @intCast(default_fg & 0xFF),
             };
 
-            // Render a block cursor sprite
+            // Get cursor shape from current mode
+            const cursor_mode = nvim.getCurrentCursorMode();
+            const cursor_shape = if (cursor_mode) |mode| mode.shape orelse .block else .block;
+
+            // Select the appropriate sprite based on cursor shape
+            const cursor_sprite: font.Sprite = switch (cursor_shape) {
+                .block => .cursor_rect,
+                .vertical => .cursor_bar,
+                .horizontal => .cursor_underline,
+            };
+
+            // Render cursor sprite
             const render = self.font_grid.renderGlyph(
                 self.alloc,
                 font.sprite_index,
-                @intFromEnum(font.Sprite.cursor_rect),
+                @intFromEnum(cursor_sprite),
                 .{
                     .cell_width = 1,
                     .grid_metrics = self.grid_metrics,
@@ -1726,6 +1807,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             ) catch {
                 return;
             };
+
+            // Map Neovim cursor shape to Ghostty cursor style for setCursor
+            const ghostty_cursor_style: renderer.CursorStyle = switch (cursor_shape) {
+                .block => .block,
+                .vertical => .bar,
+                .horizontal => .underline,
+            };
+
+            // Calculate cursor scroll offset based on whether cursor is in scrollable region
+            const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+            const cursor_scroll_offset: f32 = if (cursor_window.isRowScrollable(@intCast(nvim.cursor_row)))
+                cursor_window.getSubLineOffset(cell_h)
+            else
+                0;
+            const cursor_fixed_offset: i16 = @intFromFloat(std.math.clamp(cursor_scroll_offset * 256.0, -32768.0, 32767.0));
 
             // Add cursor using setCursor - this marks it with is_cursor_glyph
             // so the shader applies cursor_offset_x/y for animation
@@ -1740,10 +1836,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_x),
                     @intCast(render.glyph.offset_y),
                 },
-            }, .block);
+                .pixel_offset_y = cursor_fixed_offset,
+            }, ghostty_cursor_style);
         }
 
         /// Add a glyph from Neovim cell content
+        /// pixel_offset_y: Per-cell pixel offset for smooth scrolling (in pixels, can be fractional)
         fn addNeovimGlyph(
             self: *Self,
             x: u16,
@@ -1751,6 +1849,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             text: []const u8,
             fg_color: u32,
             hl_attr: neovim_gui.HlAttr,
+            pixel_offset_y: f32,
         ) !void {
             // Decode the first codepoint from text
             var iter = std.unicode.Utf8Iterator{ .bytes = text, .i = 0 };
@@ -1795,6 +1894,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 return;
             };
 
+            // Convert pixel offset to 8.8 fixed-point format for GPU
+            // Range: -128.0 to +127.996 pixels (sufficient for smooth scrolling)
+            const fixed_offset: i16 = @intFromFloat(std.math.clamp(pixel_offset_y * 256.0, -32768.0, 32767.0));
+
             try self.cells.add(self.alloc, .text, .{
                 .atlas = .grayscale,
                 .grid_pos = .{ x, y },
@@ -1816,6 +1919,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_x),
                     @intCast(render.glyph.offset_y),
                 },
+                .pixel_offset_y = fixed_offset,
             });
 
             // Handle underline
@@ -1831,7 +1935,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .b = @intCast(fg_color & 0xFF),
                 };
 
-                self.addUnderline(x, y, underline_style, underline_color, 255) catch {};
+                self.addUnderline(x, y, underline_style, underline_color, 255, pixel_offset_y) catch {};
             }
 
             // Handle strikethrough
@@ -1842,7 +1946,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .b = @intCast(fg_color & 0xFF),
                 };
 
-                self.addStrikethrough(x, y, strike_color, 255) catch {};
+                self.addStrikethrough(x, y, strike_color, 255, pixel_offset_y) catch {};
             }
         }
 
@@ -3521,6 +3625,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     underline,
                     style.underlineColor(&state.colors.palette) orelse fg,
                     alpha,
+                    0, // No scroll offset in terminal mode
                 ) catch |err| {
                     log.warn(
                         "error adding underline to cell, will be invalid x={} y={}, err={}",
@@ -3615,6 +3720,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(y),
                     fg,
                     alpha,
+                    0, // No scroll offset in terminal mode
                 ) catch |err| {
                     log.warn(
                         "error adding strikethrough to cell, will be invalid x={} y={}, err={}",
@@ -3632,6 +3738,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             style: terminal.Attribute.Underline,
             color: terminal.color.RGB,
             alpha: u8,
+            pixel_offset_y: f32,
         ) !void {
             const sprite: font.Sprite = switch (style) {
                 .none => unreachable,
@@ -3652,6 +3759,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 },
             );
 
+            const fixed_offset: i16 = @intFromFloat(std.math.clamp(pixel_offset_y * 256.0, -32768.0, 32767.0));
+
             try self.cells.add(self.alloc, .underline, .{
                 .atlas = .grayscale,
                 .grid_pos = .{ @intCast(x), @intCast(y) },
@@ -3662,6 +3771,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_x),
                     @intCast(render.glyph.offset_y),
                 },
+                .pixel_offset_y = fixed_offset,
             });
         }
 
@@ -3693,6 +3803,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_x),
                     @intCast(render.glyph.offset_y),
                 },
+                .pixel_offset_y = 0, // Overline is terminal-only, no scroll offset
             });
         }
 
@@ -3703,6 +3814,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             y: terminal.size.CellCountInt,
             color: terminal.color.RGB,
             alpha: u8,
+            pixel_offset_y: f32,
         ) !void {
             const render = try self.font_grid.renderGlyph(
                 self.alloc,
@@ -3714,6 +3826,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 },
             );
 
+            const fixed_offset: i16 = @intFromFloat(std.math.clamp(pixel_offset_y * 256.0, -32768.0, 32767.0));
+
             try self.cells.add(self.alloc, .strikethrough, .{
                 .atlas = .grayscale,
                 .grid_pos = .{ @intCast(x), @intCast(y) },
@@ -3724,6 +3838,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_x),
                     @intCast(render.glyph.offset_y),
                 },
+                .pixel_offset_y = fixed_offset,
             });
         }
 
@@ -3787,6 +3902,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_x + shaper_cell.x_offset),
                     @intCast(render.glyph.offset_y + shaper_cell.y_offset),
                 },
+                .pixel_offset_y = 0, // Terminal mode doesn't use per-cell scroll offset
             });
         }
 
@@ -3876,6 +3992,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_x),
                     @intCast(render.glyph.offset_y),
                 },
+                .pixel_offset_y = 0, // Terminal mode cursor doesn't have per-cell scroll
             }, cursor_style);
         }
 
@@ -3923,12 +4040,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_x),
                     @intCast(render.glyph.offset_y),
                 },
+                .pixel_offset_y = 0, // Preedit text doesn't scroll
             });
 
             // Add underline
-            try self.addUnderline(@intCast(coord.x), @intCast(coord.y), .single, screen_fg, 255);
+            try self.addUnderline(@intCast(coord.x), @intCast(coord.y), .single, screen_fg, 255, 0);
             if (cp.wide and coord.x < self.cells.size.columns - 1) {
-                try self.addUnderline(@intCast(coord.x + 1), @intCast(coord.y), .single, screen_fg, 255);
+                try self.addUnderline(@intCast(coord.x + 1), @intCast(coord.y), .single, screen_fg, 255, 0);
             }
         }
 

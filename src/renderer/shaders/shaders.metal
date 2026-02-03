@@ -552,6 +552,9 @@ struct CellTextVertexIn {
 
   // Misc properties of the glyph.
   uint8_t bools [[attribute(6)]];
+
+  // Per-cell pixel Y offset for smooth scrolling (8.8 fixed-point format)
+  short pixel_offset_y_fixed [[attribute(7)]];
 };
 
 struct CellTextVertexOut {
@@ -627,7 +630,13 @@ vertex CellTextVertexOut cell_text_vertex(
   // Calculate the final position of the cell which uses our glyph size
   // and glyph offset to create the correct bounding box for the glyph.
   cell_pos = cell_pos + size * corner + offset;
-  // Apply pixel scroll offset for smooth scrolling
+  
+  // Apply per-cell pixel scroll offset (8.8 fixed-point -> float)
+  // This enables per-window smooth scrolling in Neovim GUI mode
+  float per_cell_offset_y = float(in.pixel_offset_y_fixed) / 256.0f;
+  cell_pos.y += per_cell_offset_y;
+  
+  // Apply global pixel scroll offset for smooth scrolling
   cell_pos.y -= uniforms.pixel_scroll_offset_y;
   
   // Apply cursor animation offset if this is the cursor glyph

@@ -1204,6 +1204,11 @@ pub const IoThread = struct {
             }
         } else if (std.mem.eql(u8, name, "win_viewport")) {
             if (args.len >= 8) {
+                const scroll_delta = extractI64(args[7]) orelse 0;
+                log.info("win_viewport: grid={} scroll_delta={}", .{
+                    extractU64(args[0]) orelse 0,
+                    scroll_delta,
+                });
                 try self.event_queue.push(.{ .win_viewport = .{
                     .grid = extractU64(args[0]) orelse return,
                     .win = extractU64(args[1]) orelse return,
@@ -1212,7 +1217,7 @@ pub const IoThread = struct {
                     .curline = extractU64(args[4]) orelse 0,
                     .curcol = extractU64(args[5]) orelse 0,
                     .line_count = extractU64(args[6]) orelse 0,
-                    .scroll_delta = extractI64(args[7]) orelse 0,
+                    .scroll_delta = scroll_delta,
                 } });
             }
         } else if (std.mem.eql(u8, name, "msg_set_pos")) {

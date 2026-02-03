@@ -236,6 +236,11 @@ pub fn renderCodepoint(
 
     // Get the glyph for the font
     const glyph_index = glyph_index: {
+        // For special fonts (sprites), the glyph index IS the codepoint.
+        // The sprite Face uses the codepoint directly to look up drawing functions.
+        if (index.special() != null) {
+            break :glyph_index cp;
+        }
         self.lock.lockShared();
         defer self.lock.unlockShared();
         const face = try self.resolver.collection.getFace(index);

@@ -1575,6 +1575,9 @@ pub const IoThread = struct {
         if (rgb_map.mapGet("reverse") catch null) |v| {
             attr.reverse = extractBool(v);
         }
+        if (rgb_map.mapGet("blend") catch null) |v| {
+            attr.blend = @intCast(extractU64(v) orelse 0);
+        }
 
         try self.event_queue.push(.{ .hl_attr_define = .{
             .id = id,

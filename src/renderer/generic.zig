@@ -1590,15 +1590,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const win_col: u16 = @intFromFloat(window.grid_position[0]);
                 const win_row: u16 = @intFromFloat(window.grid_position[1]);
 
-                // Debug: log window positions
-                if (window.dirty) {
-                    log.debug("RENDER window {}: pos=({},{}) size={}x{} zindex={}", .{
+                // Debug: log floating window info
+                if (window.zindex > 0) {
+                    log.err("FLOAT window {}: pos=({},{}) size={}x{} zindex={} type={}", .{
                         window.id,
                         win_col,
                         win_row,
                         window.grid_width,
                         window.grid_height,
                         window.zindex,
+                        @intFromEnum(window.window_type),
                     });
                 }
 
@@ -1631,16 +1632,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         }
 
                         // Set background color at screen position
-                        // DEBUG: Check if we have a non-default bg
-                        const is_special_bg = bg_color != default_bg;
-                        if (is_special_bg and screen_y < 5) {
-                            log.err("BG: cell({},{}) hl_id={} bg=0x{x:0>6}", .{ screen_x, screen_y, grid_cell.hl_id, bg_color });
-                        }
+                        // Apply blend for transparency (0 = opaque, 100 = fully transparent)
+                        const alpha: u8 = if (hl_attr.blend > 0)
+                            @intCast(255 - (@as(u16, hl_attr.blend) * 255 / 100))
+                        else
+                            255;
                         self.cells.bgCell(screen_y, screen_x).* = .{
                             @intCast((bg_color >> 16) & 0xFF),
                             @intCast((bg_color >> 8) & 0xFF),
                             @intCast(bg_color & 0xFF),
-                            255,
+                            alpha,
                         };
 
                         // Render the glyph if cell has text
@@ -1778,11 +1779,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .cell_width = 1,
                     .grid_metrics = self.grid_metrics,
                 },
-            ) catch {
+            ) catch |err| {
+                // Debug: log render failures for box-drawing
+                if (codepoint >= 0x2500 and codepoint <= 0x257F) {
+                    log.err("BOX_DRAW RENDER FAIL: 0x{x} err={}", .{ codepoint, err });
+                }
                 return;
             };
 
-            const render = render_result orelse return;
+            const render = render_result orelse {
+                // Debug: log null renders for box-drawing
+                if (codepoint >= 0x2500 and codepoint <= 0x257F) {
+                    log.err("BOX_DRAW RENDER NULL: 0x{x}", .{codepoint});
+                }
+                return;
+            };
 
             try self.cells.add(self.alloc, .text, .{
                 .atlas = .grayscale,

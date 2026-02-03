@@ -698,13 +698,6 @@ pub const NeovimGui = struct {
     fn handleGridLine(self: *Self, grid: u64, row: u64, col_start: u64, cells: []const Event.Cell) void {
         const window = self.windows.get(grid) orelse return;
 
-        // Debug: log grid_line events for a specific grid to see what's coming
-        if (cells.len > 0 and cells[0].hl_id != 0) {
-            log.err("GRID_LINE: grid={} row={} col_start={} first_hl={}", .{
-                grid, row, col_start, cells[0].hl_id,
-            });
-        }
-
         // Convert Event.Cell to the format expected by RenderedWindow
         var col = col_start;
         for (cells) |cell| {

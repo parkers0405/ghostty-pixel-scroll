@@ -933,7 +933,8 @@ palette: Palette = .{},
 @"pixel-scroll": bool = true,
 
 /// The duration of the cursor animation in seconds.
-@"cursor-animation-duration": f32 = 0.1,
+/// Neovide uses 0.04s for typing, 0.15s for long jumps - we use 0.06s as a good middle ground.
+@"cursor-animation-duration": f32 = 0.06,
 
 /// The bounciness of the cursor animation (0.0 to 1.0).
 @"cursor-animation-bounciness": f32 = 0.0,

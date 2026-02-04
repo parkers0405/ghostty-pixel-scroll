@@ -795,24 +795,12 @@ pub const RenderedWindow = struct {
             animating = true;
         }
 
-        // Animate position (window movement)
-        const snap_threshold: f32 = 10.0;
-
-        if (@abs(self.position_spring_x.position) > snap_threshold) {
-            self.position_spring_x.reset();
-        } else if (self.position_spring_x.update(dt, self.position_animation_length, 0)) {
-            animating = true;
-        }
-
-        if (@abs(self.position_spring_y.position) > snap_threshold) {
-            self.position_spring_y.reset();
-        } else if (self.position_spring_y.update(dt, self.position_animation_length, 0)) {
-            animating = true;
-        }
-
-        // Update grid_position from springs
-        self.grid_position[0] = self.target_position[0] + self.position_spring_x.position;
-        self.grid_position[1] = self.target_position[1] + self.position_spring_y.position;
+        // Window position: INSTANT (no animation)
+        // Neovim plugins like nvim-tree have their own animations - don't interfere
+        self.grid_position[0] = self.target_position[0];
+        self.grid_position[1] = self.target_position[1];
+        self.position_spring_x.reset();
+        self.position_spring_y.reset();
 
         return animating;
     }

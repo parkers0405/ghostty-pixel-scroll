@@ -331,7 +331,10 @@ pub const RenderedWindow = struct {
         const scrollback_size = height * 2;
         self.scrollback_lines = try RingBuffer(?*GridLine).init(self.alloc, scrollback_size);
 
-        // Initialize scrollback - copy from actual_lines for now
+        // Initialize scrollback - populate BOTH halves with the same content
+        // This ensures negative indices (scroll down) have valid data immediately
+        // First half: scrollback[0..height]
+        // Second half: scrollback[height..2*height] (for negative index wrapping)
         i = 0;
         while (i < height) : (i += 1) {
             const line = try GridLine.init(self.alloc, width);
@@ -341,9 +344,15 @@ pub const RenderedWindow = struct {
             }
             self.scrollback_lines.?.set(@intCast(i), line);
         }
-        // Rest of scrollback is null (will be filled as we scroll)
+        // Populate second half with same content (for scroll down support)
         while (i < scrollback_size) : (i += 1) {
-            self.scrollback_lines.?.set(@intCast(i), null);
+            const line = try GridLine.init(self.alloc, width);
+            // Copy from corresponding position in first half
+            const src_idx = i - height;
+            if (self.actual_lines.?.getConst(@intCast(src_idx))) |src| {
+                line.copyFromSlice(src.cells);
+            }
+            self.scrollback_lines.?.set(@intCast(i), line);
         }
 
         self.grid_width = width;
@@ -616,10 +625,22 @@ pub const RenderedWindow = struct {
             self.scrollback_lines = RingBuffer(?*GridLine).init(self.alloc, expected_scrollback_size) catch return;
             scrollback = &self.scrollback_lines.?;
 
-            // Copy inner view to scrollback
+            // Copy inner view to BOTH halves of scrollback
+            // This ensures negative indices (scroll down) have valid data immediately
             var i: isize = 0;
+            // First half: scrollback[0..inner_size]
             while (i < inner_size) : (i += 1) {
                 const src_row = inner_top + i;
+                if (actual.getConst(src_row)) |src_line| {
+                    const new_line = GridLine.init(self.alloc, self.grid_width) catch continue;
+                    new_line.copyFromSlice(src_line.cells);
+                    scrollback.set(i, new_line);
+                }
+            }
+            // Second half: scrollback[inner_size..2*inner_size] (for negative index wrapping)
+            while (i < inner_size * 2) : (i += 1) {
+                const src_idx = i - inner_size; // Map to first half
+                const src_row = inner_top + src_idx;
                 if (actual.getConst(src_row)) |src_line| {
                     const new_line = GridLine.init(self.alloc, self.grid_width) catch continue;
                     new_line.copyFromSlice(src_line.cells);
@@ -849,7 +870,11 @@ pub const RenderedWindow = struct {
         if (self.scrollback_lines == null) return null;
         if (col >= self.grid_width) return null;
 
-        const scroll_offset_lines: isize = @intFromFloat(@floor(self.scroll_animation.position));
+        // Use trunc instead of floor - this rounds toward zero for both positive and negative
+        // For scroll UP (pos > 0): trunc(1.5) = 1, same as floor
+        // For scroll DOWN (pos < 0): trunc(-1.5) = -1, but floor(-1.5) = -2
+        // This fixes the off-by-one when scrolling down
+        const scroll_offset_lines: isize = @intFromFloat(@trunc(self.scroll_animation.position));
         const scrollback_idx: isize = scroll_offset_lines + @as(isize, inner_row);
 
         const scrollback = &self.scrollback_lines.?;
@@ -871,18 +896,45 @@ pub const RenderedWindow = struct {
         return &line.cells[col];
     }
 
+    /// Check if scrollback has valid data for smooth scrolling
+    /// Returns false if scrollback would return null for the edge rows during animation
+    pub fn hasValidScrollbackData(self: *const Self) bool {
+        if (self.scrollback_lines == null) return false;
+
+        const pos = self.scroll_animation.position;
+        if (pos == 0) return true; // No animation, always valid
+
+        const scrollback = &self.scrollback_lines.?;
+        // Use trunc to match getScrollbackCellByInnerRowSigned
+        const trunc_pos: isize = @intFromFloat(@trunc(pos));
+
+        // For scroll animation, we read scrollback[trunc_pos + row] for each inner row
+        // We need valid data at trunc_pos (first row we'll read)
+        // Check both the first and edge rows we'll need
+
+        // Check first row we'll read (trunc_pos + 0 = trunc_pos)
+        const first_line = scrollback.getConst(trunc_pos);
+        if (first_line == null) return false;
+        if (first_line.?.cells.len == 0) return false;
+
+        return true;
+    }
+
     /// Get pixel offset for smooth scroll rendering (sub-line portion only)
-    /// This matches Neovide's calculation exactly:
-    ///   scroll_offset = floor(position) - position
-    ///   scroll_offset_pixels = scroll_offset * cell_height
+    /// Uses trunc (round toward zero) to match getScrollbackCellByInnerRowSigned
     ///
-    /// Example: if scroll_animation.position = -2.7 and cell_height = 20
-    /// - floor(-2.7) = -3
-    /// - scroll_offset = -3 - (-2.7) = -0.3
-    /// - pixel_offset = -0.3 * 20 = -6 pixels (shift content UP)
+    /// Example for scroll DOWN: position = -1.5, cell_height = 51
+    /// - trunc(-1.5) = -1
+    /// - scroll_offset = -1 - (-1.5) = 0.5
+    /// - pixel_offset = 0.5 * 51 = 25.5 pixels (shift content DOWN)
+    ///
+    /// Example for scroll UP: position = 1.5, cell_height = 51
+    /// - trunc(1.5) = 1
+    /// - scroll_offset = 1 - 1.5 = -0.5
+    /// - pixel_offset = -0.5 * 51 = -25.5 pixels (shift content UP)
     pub fn getSubLineOffset(self: *const Self, cell_height: f32) f32 {
         const pos = self.scroll_animation.position;
-        const scroll_offset_lines = @floor(pos);
+        const scroll_offset_lines = @trunc(pos);
         const scroll_offset = scroll_offset_lines - pos;
         return scroll_offset * cell_height;
     }

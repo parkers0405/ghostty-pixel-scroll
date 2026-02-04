@@ -802,7 +802,7 @@ pub const IoThread = struct {
         // So we should NOT free opts separately - it will be freed when params is freed
         // NOTE: Do NOT enable ext_messages or ext_cmdline - they conflict with noice.nvim
         // and other plugins that handle messages/cmdline themselves.
-        // We still parse those events if they're sent, but we don't request them.
+        // Neovide also doesn't enable these - it handles msg_set_pos events instead.
         const opts = try msgpack.object(self.alloc, .{
             .rgb = true,
             .ext_linegrid = true,

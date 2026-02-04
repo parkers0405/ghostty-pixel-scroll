@@ -1542,8 +1542,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (self.cells.size.rows != rows or self.cells.size.columns != cols) {
                 try self.cells.resize(self.alloc, .{ .rows = rows, .columns = cols });
                 // Add 2 to rows for shader uniform because the Metal shader clips grid_size.y - 2
-                // Terminal mode adds +2 rows to the buffer, but Neovim mode doesn't, so we
-                // compensate here to make the shader's clipping math work correctly.
                 self.uniforms.grid_size = .{ cols, rows + 2 };
             }
 
@@ -1573,6 +1571,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (window.hidden or !window.valid) continue;
                 if (window.grid_height == 0 or window.grid_width == 0) continue;
                 if (window.actual_lines == null) continue;
+                // Skip message windows - they cause extra line issues
+                if (window.window_type == .message) continue;
                 windows_to_render.append(self.alloc, window) catch continue;
             }
 
@@ -1595,23 +1595,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Check if this is a floating window
                 const is_floating = window.zindex > 0 or window.window_type == .floating;
 
-                // Check if this is grid 1 (global grid)
-                // In ext_multigrid mode, grid 1 contains tabline at top and statusline/cmdline at bottom
-                // The MIDDLE rows are covered by editor windows and should NOT be rendered
-                const is_global_grid = window.id == 1;
-
                 // Get per-window scroll offset in pixels for smooth scrolling
-                // Only editor windows scroll - floating windows, messages, and grid 1 don't
-                const scroll_pixel_offset: f32 = if (!is_floating and !is_global_grid)
+                // Only editor windows scroll - floating windows and messages don't
+                // Also skip scroll animation if scrollback doesn't have valid data (e.g., nvim-tree)
+                const has_valid_scrollback = if (!is_floating) window.hasValidScrollbackData() else false;
+                const scroll_pixel_offset: f32 = if (has_valid_scrollback)
                     window.getSubLineOffset(cell_h)
                 else
                     0;
 
-                // Fill window area with background to prevent content from previous frames showing through
-                // This is CRITICAL for:
-                // 1. Floating windows (to make them opaque)
-                // 2. Editor windows with scroll animation (to block scrolled content from bleeding into tabline/statusline)
-                // Grid 1 doesn't need this (it's the base layer)
+                // Check if this is grid 1 (global grid)
+                const is_global_grid = window.id == 1;
+
+                // For non-global-grid windows, fill the entire window area with background color first
+                // This ensures the window is opaque even if cells don't have explicit backgrounds
+                // Grid 1 (global) has garbage in middle rows, so we handle it differently
                 if (!is_global_grid) {
                     // Use the global default background - same as Neovide does
                     const float_bg = default_bg;
@@ -1667,36 +1665,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }
                 }
 
+                // Debug: log when we have scroll animation but invalid scrollback
+                if (!is_floating and !has_valid_scrollback and window.scroll_animation.position != 0) {
+                    if (inner_size > 0) {
+                        std.log.err("RENDER grid={}: pos={d:.2}, has_valid_scrollback=false, falling back to actual_lines", .{
+                            window.id,
+                            window.scroll_animation.position,
+                        });
+                    }
+                }
+
                 // Render scrollable region
-                // Iterate over inner_size rows (the scrollable content area)
-                // Note: We don't render extra rows at edges because we don't have GPU clipping
-                // to prevent them from overwriting statusline/margins. The smooth scroll
-                // animation still works via pixel offset on glyphs.
-                //
-                // SPECIAL CASE: Grid 1 (global grid) in ext_multigrid mode
-                // Grid 1 only has useful content in:
-                // - Row 0: tabline (rendered in margin_top loop above if margins.top > 0, otherwise here)
-                // - Last 2 rows: statusline, cmdline (rendered in margin_bottom loop below)
-                // The MIDDLE rows contain garbage/empty cells and are covered by editor windows.
-                // We SKIP rendering grid 1's middle rows to prevent overlap artifacts.
+                // Iterate 0..inner_size (the extra +1 row is handled by scrollback containing 2x size)
                 var inner_row: u32 = 0;
                 while (inner_row < inner_size) : (inner_row += 1) {
-                    // For grid 1: only render row 0 (if margin_top is 0, meaning tabline is in inner region)
-                    // Skip all middle rows - they're covered by editor windows
-                    if (is_global_grid) {
-                        const actual_row = margin_top + inner_row;
-                        // Only render row 0 (tabline) from the inner region
-                        // Skip everything else - the bottom rows are handled by margin_bottom loop
-                        if (actual_row > 0) continue;
-                    }
-
                     var col: u32 = 0;
                     while (col < window.grid_width) : (col += 1) {
-                        // Read from scrollback for scroll animation, or direct for floating/grid1
-                        const grid_cell = if (is_floating or is_global_grid)
-                            window.getCell(margin_top + inner_row, col)
+                        // Read from scrollback using inner row index, but only if we have valid scrollback data.
+                        // When has_valid_scrollback is false (e.g., initial scroll down before scrollback is populated),
+                        // we read from actual_lines instead to avoid reading from invalid negative indices.
+                        const grid_cell = if (!is_floating and has_valid_scrollback)
+                            window.getScrollbackCellByInnerRow(inner_row, col)
                         else
-                            window.getScrollbackCellByInnerRow(inner_row, col);
+                            window.getCell(margin_top + inner_row, col);
 
                         if (grid_cell == null) continue;
                         const cell = grid_cell.?;
@@ -1776,28 +1767,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         // Render the glyph if cell has text
                         const text = cell.getText();
                         if (text.len > 0) {
-                            // Clip glyphs that would scroll above the window start (into tabline area)
-                            // Calculate final visual Y position in pixels
-                            const visual_y_pixels = @as(f32, @floatFromInt(screen_y)) * cell_h + scroll_pixel_offset;
-                            const window_start_pixels = @as(f32, @floatFromInt(win_row)) * cell_h;
-
-                            // Skip rendering if glyph would appear above the window start
-                            if (visual_y_pixels >= window_start_pixels - cell_h * 0.5) {
-                                // All scrollable rows get the scroll pixel offset
-                                self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, scroll_pixel_offset) catch {};
-                            }
+                            // Scrollable rows get the scroll pixel offset
+                            self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, scroll_pixel_offset) catch {};
                         }
                     }
                 }
 
                 // Render bottom margin rows (statusline etc) - no scroll
-                // For grid 1: render last 2 rows for statusline/cmdline even if margin_bottom is 0
-                const bottom_start: u32 = if (is_global_grid and margin_bottom == 0)
-                    window.grid_height -| 2
-                else
-                    window.grid_height -| margin_bottom;
-
-                row = bottom_start;
+                row = window.grid_height -| margin_bottom;
                 while (row < window.grid_height) : (row += 1) {
                     var col: u32 = 0;
                     while (col < window.grid_width) : (col += 1) {
@@ -1837,18 +1814,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             if (!cursor_window.valid or cursor_window.hidden) return;
 
             // Calculate screen position
+            // nvim.cursor_row is the row within the grid, already accounting for winbar etc
             const local_col_f: f32 = @floatFromInt(nvim.cursor_col);
             const local_row_f: f32 = @floatFromInt(nvim.cursor_row);
             const grid_x = local_col_f + cursor_window.grid_position[0];
-            var grid_y = local_row_f + cursor_window.grid_position[1];
-            grid_y -= cursor_window.scroll_animation.position;
-
-            const top_border: f32 = @floatFromInt(cursor_window.viewport_margins.top);
-            const bottom_border: f32 = @floatFromInt(cursor_window.viewport_margins.bottom);
-            const win_y: f32 = cursor_window.grid_position[1];
-            const win_height: f32 = @floatFromInt(cursor_window.grid_height);
-            grid_y = @max(grid_y, win_y + top_border);
-            grid_y = @min(grid_y, win_y + win_height - 1.0 - bottom_border);
+            const grid_y = local_row_f + cursor_window.grid_position[1];
 
             const screen_col: u16 = @intFromFloat(@max(0, grid_x));
             const screen_row: u16 = @intFromFloat(@max(0, grid_y));

@@ -231,6 +231,11 @@ pub const NeovimGui = struct {
 
         self.ready = true;
 
+        // Set cmdheight=0 to eliminate the blank cmdline row at the bottom
+        // With cmdheight=0, messages appear via vim.notify (handled by noice.nvim)
+        // and the cmdline appears as a floating window when typing :
+        try self.io.?.sendCommand("set cmdheight=0");
+
         // Force resize - Neovim may ignore the size in attachUi
         try self.io.?.resizeUi(self.grid_width, self.grid_height);
 
@@ -258,6 +263,9 @@ pub const NeovimGui = struct {
         try self.io.?.start();
 
         self.ready = true;
+
+        // Set cmdheight=0 to eliminate the blank cmdline row at the bottom
+        try self.io.?.sendCommand("set cmdheight=0");
 
         // Force resize - Neovim may ignore the size in attachUi
         try self.io.?.resizeUi(self.grid_width, self.grid_height);
@@ -331,6 +339,9 @@ pub const NeovimGui = struct {
         try self.io.?.start();
 
         self.ready = true;
+
+        // Set cmdheight=0 to eliminate the blank cmdline row at the bottom
+        try self.io.?.sendCommand("set cmdheight=0");
 
         // Force resize - Neovim may ignore the size in attachUi
         try self.io.?.resizeUi(self.grid_width, self.grid_height);

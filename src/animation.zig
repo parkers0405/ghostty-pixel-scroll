@@ -201,7 +201,8 @@ pub const CursorAnimation = struct {
         _ = is_small_jump;
 
         // Set the spring to animate from current to target
-        self.spring.setTarget(self.current_x - x, self.current_y - y);
+        // Neovide convention: delta = target - current, spring animates toward 0
+        self.spring.setTarget(x - self.current_x, y - self.current_y);
         self.target_x = x;
         self.target_y = y;
     }
@@ -215,10 +216,11 @@ pub const CursorAnimation = struct {
 
         const animating = self.spring.update(dt, animation_length, zeta);
 
-        // Current position = target + spring offset
+        // Current position = target - spring offset
+        // As spring.position approaches 0, current approaches target
         const offset = self.spring.getOffset();
-        self.current_x = self.target_x + offset.x;
-        self.current_y = self.target_y + offset.y;
+        self.current_x = self.target_x - offset.x;
+        self.current_y = self.target_y - offset.y;
 
         return animating;
     }
@@ -357,13 +359,13 @@ pub const CornerCursorAnimation = struct {
     /// Whether we just jumped to a new position
     jumped: bool = false,
 
-    // Neovide default settings (hardcoded to match exactly)
-    /// Base animation length (0.15 seconds)
-    const ANIMATION_LENGTH: f32 = 0.150;
+    // Neovide-style settings (tuned for less extreme stretch)
+    /// Base animation length (0.10 seconds - slightly faster than Neovide's 0.15)
+    const ANIMATION_LENGTH: f32 = 0.10;
     /// Short animation for typing (0.04 seconds)
     const SHORT_ANIMATION_LENGTH: f32 = 0.04;
-    /// Trail size (1.0 = full trail, leading corners jump instantly to destination)
-    const TRAIL_SIZE: f32 = 1.0;
+    /// Trail size (0.8 = moderate trail, less extreme than Neovide's 1.0)
+    const TRAIL_SIZE: f32 = 0.8;
 
     pub fn init() CornerCursorAnimation {
         var self = CornerCursorAnimation{};
@@ -374,6 +376,30 @@ pub const CornerCursorAnimation = struct {
         }
         return self;
     }
+
+    /// Update corner relative positions based on cursor shape
+    /// This transforms corners for vertical bar (insert mode) or horizontal underline (replace mode)
+    pub fn setCursorShape(self: *CornerCursorAnimation, shape: CursorShape, cell_percentage: f32) void {
+        for (0..4) |i| {
+            const x = STANDARD_CORNERS[i][0];
+            const y = STANDARD_CORNERS[i][1];
+
+            self.corners[i].relative_position = switch (shape) {
+                .block => .{ x, y },
+                // Transform x so right side is at cell_percentage position
+                // For 20% bar: x=-0.5 stays at -0.5, x=0.5 becomes -0.3 (thin bar on left)
+                .vertical => .{ (x + 0.5) * cell_percentage - 0.5, y },
+                // Transform y so horizontal bar is at bottom with cell_percentage height
+                .horizontal => .{ x, -((-y + 0.5) * cell_percentage - 0.5) },
+            };
+        }
+    }
+
+    pub const CursorShape = enum {
+        block,
+        vertical,
+        horizontal,
+    };
 
     /// Set new target position (called when cursor moves)
     /// x, y = top-left of cursor cell in pixels

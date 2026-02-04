@@ -213,6 +213,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Last known scroll position (for detecting scroll changes)
         last_cursor_scroll_pos: f32 = 0,
 
+        /// Last cursor shape (for detecting shape changes)
+        last_cursor_shape: ?neovim_gui.CursorShape = null,
+
         /// Whether cursor animation is currently active (needs continuous render)
         cursor_animating: bool = false,
 
@@ -1513,14 +1516,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
             self.scroll_animating = any_animating;
 
-            // Update corner cursor animation (Neovide-style stretchy cursor)
+            // Update cursor animations (Neovide-style)
             // MUST be in same timing as scroll to stay in sync
-            // Always call update() unconditionally - it's cheap and ensures corners
-            // continue animating even if cursor_animating flag gets out of sync
+            // Always call update() unconditionally - it's cheap and ensures animations
+            // continue even if cursor_animating flag gets out of sync
             {
                 const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
                 const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
-                self.cursor_animating = self.corner_cursor.update(dt, cell_width, cell_height);
+
+                // 1. Update the floaty spring animation (smooth cursor center movement)
+                const floaty_animating = self.cursor_animation.update(dt, 0.13, 1.0);
+
+                // 2. Update the stretchy corner animation
+                const corner_animating = self.corner_cursor.update(dt, cell_width, cell_height);
+
+                self.cursor_animating = floaty_animating or corner_animating;
             }
 
             // Step 3: Render with current position and updated scrollback
@@ -1593,6 +1603,24 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // They may be populated differently
                 const is_message_or_float = window.zindex > 0 or window.window_type == .floating or window.window_type == .message;
                 if (window.actual_lines == null and !is_message_or_float) continue;
+
+                // Skip newly created floating windows that have no content yet
+                // This prevents black rectangles appearing before content loads (e.g., nvim-tree opening)
+                if (is_message_or_float and window.actual_lines != null) {
+                    const has_content = blk: {
+                        const actual = &window.actual_lines.?;
+                        var y: u32 = 0;
+                        while (y < window.grid_height) : (y += 1) {
+                            if (actual.getConst(@intCast(y))) |line| {
+                                for (line.cells) |cell| {
+                                    if (cell.text_len > 0) break :blk true;
+                                }
+                            }
+                        }
+                        break :blk false;
+                    };
+                    if (!has_content) continue;
+                }
 
                 // Partition: floating windows have zindex > 0 or are explicitly floating/message type
                 const is_floating = is_message_or_float;
@@ -2004,12 +2032,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Detect if cursor grid position changed OR scroll position changed
             if (screen_col != last_x or screen_row != last_y or scroll_pos != last_scroll) {
-                // Position changed - set new target for corner animation
+                // Position changed - set new target for BOTH animations:
+                // 1. Floaty spring animation (smooth center movement)
+                self.cursor_animation.setTarget(target_pixel_x, target_pixel_y, cell_width);
+                // 2. Stretchy corner animation (uses animated position from floaty spring)
                 self.corner_cursor.setTarget(target_pixel_x, target_pixel_y, cell_width, cell_height);
+
                 self.last_cursor_grid_pos = .{ screen_col, screen_row };
                 self.last_cursor_scroll_pos = scroll_pos;
                 self.cursor_animating = true;
             }
+
+            // Get the floaty animated position (smooth spring movement)
+            const floaty_pos = self.cursor_animation.getPosition();
+
+            // Update corner cursor destination to track the floaty position
+            // This makes corners stretch relative to the smoothly moving center
+            self.corner_cursor.destination = .{
+                floaty_pos.x + cell_width * 0.5,
+                floaty_pos.y + cell_height * 0.5,
+            };
 
             // Get animated corner positions
             const corners = self.corner_cursor.getCorners();
@@ -2035,6 +2077,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Get cursor shape from current mode
             const cursor_mode = nvim.getCurrentCursorMode();
             const cursor_shape = if (cursor_mode) |mode| mode.shape orelse .block else .block;
+            const cell_percentage = if (cursor_mode) |mode| mode.cell_percentage orelse 0.25 else 0.25;
+
+            // Update corner positions if cursor shape changed
+            if (self.last_cursor_shape == null or self.last_cursor_shape.? != cursor_shape) {
+                const corner_shape: animation.CornerCursorAnimation.CursorShape = switch (cursor_shape) {
+                    .block => .block,
+                    .vertical => .vertical,
+                    .horizontal => .horizontal,
+                };
+                self.corner_cursor.setCursorShape(corner_shape, cell_percentage);
+                self.last_cursor_shape = cursor_shape;
+            }
 
             // Select the appropriate sprite based on cursor shape
             const cursor_sprite: font.Sprite = switch (cursor_shape) {

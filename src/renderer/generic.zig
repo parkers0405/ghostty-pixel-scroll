@@ -204,6 +204,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Cursor animation state for smooth cursor movement.
         cursor_animation: animation.CursorAnimation = .{},
 
+        /// Corner-based cursor animation (Neovide-style stretchy cursor)
+        corner_cursor: animation.CornerCursorAnimation = animation.CornerCursorAnimation.init(),
+
         /// Last known cursor grid position (for detecting cursor movement)
         last_cursor_grid_pos: [2]u16 = .{ 0, 0 },
 
@@ -1507,6 +1510,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
             self.scroll_animating = any_animating;
 
+            // Update cursor animation - MUST be in same timing as scroll to stay in sync
+            if (self.cursor_animating) {
+                const cursor_len = self.config.cursor_animation_duration;
+                const cursor_zeta = 1.0 - (self.config.cursor_animation_bounciness * 0.6);
+                self.cursor_animating = self.cursor_animation.update(dt, cursor_len, cursor_zeta);
+            }
+
             // Step 3: Render with current position and updated scrollback
             self.draw_mutex.lock();
             defer self.draw_mutex.unlock();
@@ -1768,16 +1778,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }
                 }
 
-                // Debug: log when we have scroll animation but invalid scrollback
-                if (!is_floating and !has_valid_scrollback and window.scroll_animation.position != 0) {
-                    if (inner_size > 0) {
-                        std.log.err("RENDER grid={}: pos={d:.2}, has_valid_scrollback=false, falling back to actual_lines", .{
-                            window.id,
-                            window.scroll_animation.position,
-                        });
-                    }
-                }
-
                 // Render scrollable region
                 // Iterate 0..inner_size (the extra +1 row is handled by scrollback containing 2x size)
                 var inner_row: u32 = 0;
@@ -1956,47 +1956,70 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const cursor_window = nvim.windows.get(nvim.cursor_grid) orelse return;
             if (!cursor_window.valid or cursor_window.hidden) return;
 
-            // Calculate screen position
-            // nvim.cursor_row is the row within the grid, already accounting for winbar etc
-            const local_col_f: f32 = @floatFromInt(nvim.cursor_col);
-            const local_row_f: f32 = @floatFromInt(nvim.cursor_row);
-            const grid_x = local_col_f + cursor_window.grid_position[0];
-            const grid_y = local_row_f + cursor_window.grid_position[1];
-
-            const screen_col: u16 = @intFromFloat(@max(0, grid_x));
-            const screen_row: u16 = @intFromFloat(@max(0, grid_y));
-
-            if (screen_row >= self.cells.size.rows or screen_col >= self.cells.size.columns) return;
-
-            // Set cursor position in uniforms (target position)
-            self.uniforms.cursor_pos = .{ screen_col, screen_row };
-
-            // Cursor animation - smooth movement between grid positions
-            // Scroll is handled separately via content offset, cursor just animates between cells
             const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
             const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
 
-            const target_pixel_x: f32 = @as(f32, @floatFromInt(screen_col)) * cell_width;
-            const target_pixel_y: f32 = @as(f32, @floatFromInt(screen_row)) * cell_height;
+            // Get scroll animation position
+            const scroll_pos = cursor_window.scroll_animation.position;
+            const is_scrolling = scroll_pos != 0;
 
-            // Check if cursor grid position changed - trigger animation
-            const last_x = self.last_cursor_grid_pos[0];
-            const last_y = self.last_cursor_grid_pos[1];
+            // Calculate grid position
+            const local_col_f: f32 = @floatFromInt(nvim.cursor_col);
+            const local_row_f: f32 = @floatFromInt(nvim.cursor_row);
+            const grid_x = local_col_f + cursor_window.grid_position[0];
+            const grid_y_base = local_row_f + cursor_window.grid_position[1];
 
-            if (screen_col != last_x or screen_row != last_y) {
-                self.cursor_animation.setTarget(target_pixel_x, target_pixel_y, cell_width);
+            // Screen position (integer grid cell)
+            const screen_col: u16 = @intFromFloat(@max(0, grid_x));
+            const screen_row: u16 = @intFromFloat(@max(0, grid_y_base));
+
+            if (screen_row >= self.cells.size.rows or screen_col >= self.cells.size.columns) return;
+
+            // Set cursor position in uniforms
+            self.uniforms.cursor_pos = .{ screen_col, screen_row };
+
+            // Pixel positions
+            const target_pixel_x: f32 = grid_x * cell_width;
+            const target_pixel_y: f32 = grid_y_base * cell_height;
+
+            // Scroll pixel offset (sub-cell smooth scrolling)
+            // MUST match getSubLineOffset exactly: (trunc(pos) - pos) * cell_height
+            const scroll_offset_lines = @trunc(scroll_pos);
+            const scroll_offset_y = (scroll_offset_lines - scroll_pos) * cell_height;
+
+            if (is_scrolling) {
+                // During scroll: NO cursor animation, just follow content exactly
+                // Snap cursor animation to current position
+                self.cursor_animation.current_x = target_pixel_x;
+                self.cursor_animation.current_y = target_pixel_y;
+                self.cursor_animation.target_x = target_pixel_x;
+                self.cursor_animation.target_y = target_pixel_y;
+                self.cursor_animation.spring.x.reset();
+                self.cursor_animation.spring.y.reset();
                 self.last_cursor_grid_pos = .{ screen_col, screen_row };
-                self.cursor_animating = true;
+                self.cursor_animating = false;
+
+                // Apply scroll offset directly
+                self.uniforms.cursor_offset_x = 0;
+                self.uniforms.cursor_offset_y = scroll_offset_y;
+            } else {
+                // Not scrolling: normal cursor animation
+                const last_x = self.last_cursor_grid_pos[0];
+                const last_y = self.last_cursor_grid_pos[1];
+
+                if (screen_col != last_x or screen_row != last_y) {
+                    self.cursor_animation.setTarget(target_pixel_x, target_pixel_y, cell_width);
+                    self.last_cursor_grid_pos = .{ screen_col, screen_row };
+                    self.cursor_animating = true;
+                }
+
+                // Get animated position
+                const pos = self.cursor_animation.getPosition();
+
+                // Calculate offset from target
+                self.uniforms.cursor_offset_x = pos.x - target_pixel_x;
+                self.uniforms.cursor_offset_y = pos.y - target_pixel_y;
             }
-
-            // Get animated position
-            const pos = self.cursor_animation.getPosition();
-
-            // Cursor offset is pure animation offset (where cursor IS vs where it SHOULD BE)
-            self.uniforms.cursor_offset_x = pos.x - target_pixel_x;
-            // For Y: add scroll offset so cursor moves with content during scroll animation
-            const scroll_offset = cursor_window.scroll_animation.position * cell_height;
-            self.uniforms.cursor_offset_y = pos.y - target_pixel_y - scroll_offset;
 
             const alpha: u8 = 255;
 
@@ -2095,21 +2118,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .cell_width = 1,
                     .grid_metrics = self.grid_metrics,
                 },
-            ) catch |err| {
-                // Debug: log render failures for box-drawing
-                if (codepoint >= 0x2500 and codepoint <= 0x257F) {
-                    log.err("BOX_DRAW RENDER FAIL: 0x{x} err={}", .{ codepoint, err });
-                }
-                return;
-            };
+            ) catch return;
 
-            const render = render_result orelse {
-                // Debug: log null renders for box-drawing
-                if (codepoint >= 0x2500 and codepoint <= 0x257F) {
-                    log.err("BOX_DRAW RENDER NULL: 0x{x}", .{codepoint});
-                }
-                return;
-            };
+            const render = render_result orelse return;
 
             // Convert pixel offset to 8.8 fixed-point format for GPU
             // Range: -128.0 to +127.996 pixels (sufficient for smooth scrolling)
@@ -2213,15 +2224,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const cursor_zeta = 1.0 - (self.config.cursor_animation_bounciness * 0.6);
                 self.cursor_animating = self.cursor_animation.update(dt, cursor_len, cursor_zeta);
 
-                // Update uniform offsets for both terminal and Neovim mode
-                const pos = self.cursor_animation.getPosition();
-                const cursor_x = self.uniforms.cursor_pos[0];
-                const cursor_y = self.uniforms.cursor_pos[1];
-                if (cursor_x != std.math.maxInt(u16) and cursor_y != std.math.maxInt(u16)) {
-                    const target_x: f32 = @as(f32, @floatFromInt(cursor_x)) * @as(f32, @floatFromInt(self.grid_metrics.cell_width));
-                    const target_y: f32 = @as(f32, @floatFromInt(cursor_y)) * @as(f32, @floatFromInt(self.grid_metrics.cell_height));
-                    self.uniforms.cursor_offset_x = pos.x - target_x;
-                    self.uniforms.cursor_offset_y = pos.y - target_y;
+                // For non-Neovim mode, update uniform offsets here
+                // Neovim mode updates them in renderNeovimCursor
+                if (self.nvim_gui == null) {
+                    const pos = self.cursor_animation.getPosition();
+                    const cursor_x = self.uniforms.cursor_pos[0];
+                    const cursor_y = self.uniforms.cursor_pos[1];
+                    if (cursor_x != std.math.maxInt(u16) and cursor_y != std.math.maxInt(u16)) {
+                        const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
+                        const cell_h_anim: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                        const target_x: f32 = @as(f32, @floatFromInt(cursor_x)) * cell_w;
+                        const target_y: f32 = @as(f32, @floatFromInt(cursor_y)) * cell_h_anim;
+                        self.uniforms.cursor_offset_x = pos.x - target_x;
+                        self.uniforms.cursor_offset_y = pos.y - target_y;
+                    }
                 }
             }
 

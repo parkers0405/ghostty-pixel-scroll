@@ -204,8 +204,8 @@ pub const ViewportMargins = struct {
 /// Scroll animation settings
 pub const ScrollSettings = struct {
     /// Animation duration in seconds
-    /// Neovide default is 0.3s
-    animation_length: f32 = 0.3,
+    /// Neovide default is 0.3s, but we use 0.15 for snappier response
+    animation_length: f32 = 0.15,
     /// For "far" scrolls (> buffer capacity), show this many lines of animation
     scroll_animation_far_lines: u32 = 1,
 };
@@ -623,9 +623,6 @@ pub const RenderedWindow = struct {
         const expected_scrollback_size: usize = @intCast(inner_size * 2);
         if (scrollback.length() != expected_scrollback_size) {
             // Resize scrollback - this resets the animation
-            log.err("!!! SCROLLBACK RESIZE grid={}: old_size={} new_size={} inner_size={} pos_before={d:.2}", .{
-                self.id, scrollback.length(), expected_scrollback_size, inner_size, self.scroll_animation.position,
-            });
             scrollback.deinit();
             self.scrollback_lines = RingBuffer(?*GridLine).init(self.alloc, expected_scrollback_size) catch return;
             scrollback = &self.scrollback_lines.?;
@@ -659,68 +656,16 @@ pub const RenderedWindow = struct {
         }
 
         const scroll_delta = self.scroll_delta;
-
-        // Debug: show actual_lines content at flush time
-        if (scroll_delta != 0) {
-            // Check first cell of first and last inner row
-            const first_row = actual.getConst(inner_top);
-            const last_row = actual.getConst(inner_bottom - 1);
-            const first_char: u8 = if (first_row) |r| (if (r.cells.len > 0) r.cells[0].text[0] else 0) else 0;
-            const last_char: u8 = if (last_row) |r| (if (r.cells.len > 0) r.cells[0].text[0] else 0) else 0;
-            log.err("FLUSH grid={}: delta={}, pos={d:.2}, actual[{}] first='{c}', actual[{}] last='{c}'", .{
-                self.id,
-                scroll_delta,
-                self.scroll_animation.position,
-                inner_top,
-                first_char,
-                inner_bottom - 1,
-                last_char,
-            });
-
-            // Debug: show first few chars of row 0 (the potential winbar row)
-            const row0 = actual.getConst(0);
-            if (row0) |r| {
-                var row0_preview: [32]u8 = undefined;
-                var preview_len: usize = 0;
-                for (r.cells[0..@min(r.cells.len, 30)]) |cell| {
-                    if (cell.text[0] != 0 and preview_len < 31) {
-                        row0_preview[preview_len] = cell.text[0];
-                        preview_len += 1;
-                    }
-                }
-                row0_preview[preview_len] = 0;
-                log.err("ROW0 grid={}: '{s}' margins=({},{})", .{
-                    self.id,
-                    row0_preview[0..preview_len],
-                    self.viewport_margins.top,
-                    self.viewport_margins.bottom,
-                });
-            }
-        }
+        self.scroll_delta = 0;
 
         // Rotate scrollback by scroll_delta
-        scrollback.rotate(scroll_delta);
-
-        // Debug: Check what's at scrollback[-1] BEFORE copy (this is what we'll read during animation)
-        if (scroll_delta > 0) {
-            const check_idx: isize = -1;
-            const check_line = scrollback.getConst(check_idx);
-            if (check_line) |line| {
-                // Check if line has content
-                const has_content = if (line.cells.len > 0)
-                    (line.cells[0].text[0] != 0)
-                else
-                    false;
-                log.debug("flush pre-copy: scrollback[-1] exists, has_content={}, cells_len={}", .{
-                    has_content,
-                    line.cells.len,
-                });
-            } else {
-                log.debug("flush pre-copy: scrollback[-1] is NULL!", .{});
-            }
+        if (scroll_delta != 0) {
+            scrollback.rotate(scroll_delta);
         }
 
-        // Copy inner view from actual_lines into scrollback at position 0..inner_size
+        // ALWAYS copy inner view from actual_lines into scrollback
+        // This is required because we don't have GPU buffer caching - scrollback
+        // must always reflect current content for rendering
         var i: isize = 0;
         while (i < inner_size) : (i += 1) {
             const src_row = inner_top + i;
@@ -746,44 +691,7 @@ pub const RenderedWindow = struct {
             scroll_offset = std.math.clamp(scroll_offset, -max_delta, max_delta);
 
             self.scroll_animation.position = scroll_offset;
-
-            log.debug("flush: scroll_delta={}, new_pos={d:.2}, current_index={}, inner_size={}", .{
-                scroll_delta,
-                self.scroll_animation.position,
-                scrollback.current_index,
-                inner_size,
-            });
-
-            // Debug: Check what's at the edge positions after copy
-            // For scroll down (pos > 0), we'll read scrollback[floor(pos) + inner_size - 1]
-            // For scroll up (pos < 0), we'll read scrollback[floor(pos) + 0]
-            const floor_pos: isize = @intFromFloat(@floor(scroll_offset));
-            if (scroll_offset > 0) {
-                // Scroll down: check position inner_size (one past visible)
-                const edge_idx = floor_pos + inner_size;
-                const edge_line = scrollback.getConst(edge_idx);
-                const has_data = if (edge_line) |line| line.cells.len > 0 else false;
-                log.err("SCROLL_DOWN: pos={d:.2}, floor={}, edge_idx={}, has_data={}", .{
-                    scroll_offset,
-                    floor_pos,
-                    edge_idx,
-                    has_data,
-                });
-            } else if (scroll_offset < 0) {
-                // Scroll up: check position -1 (one before visible)
-                const edge_idx = floor_pos - 1;
-                const edge_line = scrollback.getConst(edge_idx);
-                const has_data = if (edge_line) |line| line.cells.len > 0 else false;
-                log.err("SCROLL_UP: pos={d:.2}, floor={}, edge_idx={}, has_data={}", .{
-                    scroll_offset,
-                    floor_pos,
-                    edge_idx,
-                    has_data,
-                });
-            }
         }
-
-        self.scroll_delta = 0;
     }
 
     /// Animate the window, returns true if still animating
@@ -806,11 +714,13 @@ pub const RenderedWindow = struct {
     }
 
     /// Get a cell from the scrollback buffer for rendering during scroll animation.
-    /// This reads from scrollback_lines[floor(scroll_pos) + row] where row is
+    /// This reads from scrollback_lines[trunc(scroll_pos) + row] where row is
     /// relative to the inner (scrollable) region.
     ///
     /// Returns null if the position is outside the scrollback buffer or if
     /// this is a margin row (which should be read from actual_lines instead).
+    ///
+    /// NOTE: Uses @trunc to match getScrollbackCellByInnerRowSigned and getSubLineOffset.
     pub fn getScrollbackCell(self: *const Self, row: u32, col: u32) ?*const GridCell {
         if (self.scrollback_lines == null) return null;
         if (col >= self.grid_width) return null;
@@ -822,28 +732,15 @@ pub const RenderedWindow = struct {
         // Convert to inner row index
         const inner_row: isize = @as(isize, @intCast(row)) - @as(isize, @intCast(self.viewport_margins.top));
 
-        // Get the scroll offset in lines
-        const scroll_offset_lines: isize = @intFromFloat(@floor(self.scroll_animation.position));
+        // Get the scroll offset in lines (use trunc to match other functions)
+        const scroll_offset_lines: isize = @intFromFloat(@trunc(self.scroll_animation.position));
 
         // Calculate the scrollback index
         const scrollback_row: isize = scroll_offset_lines + inner_row;
 
         // Get the line from scrollback
         const scrollback = &self.scrollback_lines.?;
-        const line = scrollback.getConst(scrollback_row) orelse {
-            // Debug: log when we get null from scrollback
-            if (col == 0) { // Only log once per row
-                log.warn("scrollback NULL: row={}, inner_row={}, scroll_offset={}, scrollback_row={}, current_index={}, buffer_len={}", .{
-                    row,
-                    inner_row,
-                    scroll_offset_lines,
-                    scrollback_row,
-                    scrollback.current_index,
-                    scrollback.length(),
-                });
-            }
-            return null;
-        };
+        const line = scrollback.getConst(scrollback_row) orelse return null;
 
         // Get the cell
         if (col >= line.cells.len) return null;
@@ -871,20 +768,7 @@ pub const RenderedWindow = struct {
         const scrollback_idx: isize = scroll_offset_lines + @as(isize, inner_row);
 
         const scrollback = &self.scrollback_lines.?;
-        const line = scrollback.getConst(scrollback_idx) orelse {
-            // Debug: log when we get null from scrollback (only once per row)
-            if (col == 0 and self.scroll_animation.position != 0) {
-                log.warn("getScrollbackCellByInnerRowSigned NULL: inner_row={}, pos={d:.2}, scroll_offset={}, scrollback_idx={}, current_idx={}, buf_len={}", .{
-                    inner_row,
-                    self.scroll_animation.position,
-                    scroll_offset_lines,
-                    scrollback_idx,
-                    scrollback.current_index,
-                    scrollback.length(),
-                });
-            }
-            return null;
-        };
+        const line = scrollback.getConst(scrollback_idx) orelse return null;
         if (col >= line.cells.len) return null;
         return &line.cells[col];
     }
@@ -894,21 +778,25 @@ pub const RenderedWindow = struct {
     pub fn hasValidScrollbackData(self: *const Self) bool {
         if (self.scrollback_lines == null) return false;
 
-        const pos = self.scroll_animation.position;
-        if (pos == 0) return true; // No animation, always valid
-
         const scrollback = &self.scrollback_lines.?;
+
+        // Check if scrollback has been populated at all
+        // Even when pos == 0, we need valid data at row 0
+        const first_line = scrollback.getConst(0);
+        if (first_line == null) return false;
+        if (first_line.?.cells.len == 0) return false;
+
+        const pos = self.scroll_animation.position;
+        if (pos == 0) return true; // No animation, first row check passed
+
         // Use trunc to match getScrollbackCellByInnerRowSigned
         const trunc_pos: isize = @intFromFloat(@trunc(pos));
 
         // For scroll animation, we read scrollback[trunc_pos + row] for each inner row
-        // We need valid data at trunc_pos (first row we'll read)
-        // Check both the first and edge rows we'll need
-
-        // Check first row we'll read (trunc_pos + 0 = trunc_pos)
-        const first_line = scrollback.getConst(trunc_pos);
-        if (first_line == null) return false;
-        if (first_line.?.cells.len == 0) return false;
+        // Check the first row we'll read during animation
+        const anim_first_line = scrollback.getConst(trunc_pos);
+        if (anim_first_line == null) return false;
+        if (anim_first_line.?.cells.len == 0) return false;
 
         return true;
     }
@@ -923,8 +811,13 @@ pub const RenderedWindow = struct {
     ///
     /// Example for scroll UP: position = 1.5, cell_height = 51
     /// - trunc(1.5) = 1
-    /// - scroll_offset = 1 - 1.5 = -0.5
-    /// - pixel_offset = -0.5 * 51 = -25.5 pixels (shift content UP)
+    /// Get the sub-line pixel offset for smooth scrolling.
+    /// Uses @trunc to match getScrollbackCellByInnerRowSigned.
+    ///
+    /// Example: position = -1.5 (scrolling down, animation in progress)
+    /// - scroll_offset_lines = trunc(-1.5) = -1
+    /// - scroll_offset = -1 - (-1.5) = 0.5
+    /// - pixel_offset = 0.5 * 51 = +25.5 pixels (shift content DOWN)
     pub fn getSubLineOffset(self: *const Self, cell_height: f32) f32 {
         const pos = self.scroll_animation.position;
         const scroll_offset_lines = @trunc(pos);

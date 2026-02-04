@@ -396,7 +396,6 @@ pub const NeovimGui = struct {
                 try self.handleWinPos(data);
             },
             .win_float_pos => |data| {
-                log.info("SWITCH: win_float_pos event received for grid={}", .{data.grid});
                 try self.handleWinFloatPos(data);
             },
             .win_viewport => |data| {
@@ -737,16 +736,6 @@ pub const NeovimGui = struct {
 
     fn handleGridScroll(self: *Self, data: Event.GridScroll) void {
         const window = self.windows.get(data.grid) orelse return;
-        log.err("Grid scroll: grid={} rows={} region=[{}-{}]x[{}-{}] grid_size={}x{}", .{
-            data.grid,
-            data.rows,
-            data.top,
-            data.bot,
-            data.left,
-            data.right,
-            window.grid_width,
-            window.grid_height,
-        });
         window.handleScroll(.{
             .top = data.top,
             .bottom = data.bot,
@@ -765,36 +754,20 @@ pub const NeovimGui = struct {
     }
 
     fn handleWinPos(self: *Self, data: Event.WinPos) !void {
-        log.info("handleWinPos START: grid={} row={} col={} size={}x{}", .{ data.grid, data.start_row, data.start_col, data.width, data.height });
         const window = try self.getOrCreateWindow(data.grid);
-        log.info("handleWinPos: got window grid={} old_size={}x{}", .{ data.grid, window.grid_width, window.grid_height });
         window.setPosition(data.start_row, data.start_col, data.width, data.height);
         window.window_type = .editor;
         self.dirty = true;
-        log.info("handleWinPos DONE: grid={} final_pos=({d:.1},{d:.1})", .{ data.grid, window.grid_position[0], window.grid_position[1] });
     }
 
     fn handleWinFloatPos(self: *Self, data: Event.WinFloatPos) !void {
-        // CRITICAL DEBUG - this MUST print
-        log.err("=== handleWinFloatPos ENTERED === grid={}", .{data.grid});
-        log.info("handleWinFloatPos START: grid={} anchor_grid={} anchor={} raw=({d:.1},{d:.1}) zindex={}", .{
-            data.grid,
-            data.anchor_grid,
-            @intFromEnum(data.anchor),
-            data.anchor_col,
-            data.anchor_row,
-            data.zindex,
-        });
-
         const window = try self.getOrCreateWindow(data.grid);
-        log.info("handleWinFloatPos: got window grid={} size={}x{}", .{ data.grid, window.grid_width, window.grid_height });
 
         // Get parent window position (anchor grid)
         const parent_pos: [2]f32 = if (self.windows.get(data.anchor_grid)) |parent|
             parent.grid_position
         else
             .{ 0, 0 };
-        log.info("handleWinFloatPos: parent_pos=({d:.1},{d:.1})", .{ parent_pos[0], parent_pos[1] });
 
         // Calculate position based on anchor type (like Neovide's modified_top_left)
         // The anchor position is relative to the anchor grid
@@ -806,24 +779,19 @@ pub const NeovimGui = struct {
 
         // Adjust position based on anchor type
         switch (data.anchor) {
-            .NW => {
-                log.info("handleWinFloatPos: anchor NW, no adjustment", .{});
-            },
+            .NW => {},
             .NE => {
                 // top-right corner: window extends left from anchor
                 left = data.anchor_col - width_f;
-                log.info("handleWinFloatPos: anchor NE, left={d:.1} - {d:.1} = {d:.1}", .{ data.anchor_col, width_f, left });
             },
             .SW => {
                 // bottom-left corner: window extends up from anchor
                 top = data.anchor_row - height_f;
-                log.info("handleWinFloatPos: anchor SW, top={d:.1} - {d:.1} = {d:.1}", .{ data.anchor_row, height_f, top });
             },
             .SE => {
                 // bottom-right corner: window extends up and left from anchor
                 left = data.anchor_col - width_f;
                 top = data.anchor_row - height_f;
-                log.info("handleWinFloatPos: anchor SE, left={d:.1}, top={d:.1}", .{ left, top });
             },
         }
 
@@ -831,16 +799,12 @@ pub const NeovimGui = struct {
         left += parent_pos[0];
         top += parent_pos[1];
 
-        log.info("handleWinFloatPos: after parent offset left={d:.1} top={d:.1}", .{ left, top });
-
         // Clamp to valid range
         left = @max(0, left);
         top = @max(0, top);
 
         const start_row: u64 = @intFromFloat(top);
         const start_col: u64 = @intFromFloat(left);
-
-        log.info("handleWinFloatPos: FINAL grid={} pos=({},{}) zindex={}", .{ data.grid, start_col, start_row, data.zindex });
 
         window.setFloatPosition(start_row, start_col, data.zindex);
         window.window_type = .floating;

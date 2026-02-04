@@ -411,9 +411,14 @@ pub const RenderedWindow = struct {
 
         self.valid = true;
         self.hidden = false;
-        self.zindex = 0;
-        self.anchor_info = null;
-        self.window_type = .editor;
+        // DON'T reset zindex/window_type if already set as floating
+        // win_pos can come after win_float_pos and we don't want to lose the float info
+        // Only reset if this is being set as a docked window (zindex was 0)
+        if (self.window_type != .floating and self.window_type != .message) {
+            self.zindex = 0;
+            self.anchor_info = null;
+            self.window_type = .editor;
+        }
     }
 
     pub fn setFloatPosition(self: *Self, row: u64, col: u64, zindex: u64) void {

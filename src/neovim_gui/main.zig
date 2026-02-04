@@ -970,6 +970,7 @@ pub const NeovimGui = struct {
     }
 
     /// Get highlight attributes for a given ID
+    /// Returns attributes with default colors filled in for null fg/bg
     pub fn getHlAttr(self: *const Self, id: u64) HlAttr {
         if (id == 0) {
             return HlAttr{
@@ -977,34 +978,34 @@ pub const NeovimGui = struct {
                 .background = self.default_background,
             };
         }
-        return self.hl_attrs.get(id) orelse HlAttr{
+        if (self.hl_attrs.get(id)) |attr| {
+            // Return attr but ensure fg/bg have values (use defaults if null)
+            return HlAttr{
+                .foreground = attr.foreground orelse self.default_foreground,
+                .background = attr.background orelse self.default_background,
+                .special = attr.special,
+                .bold = attr.bold,
+                .italic = attr.italic,
+                .underline = attr.underline,
+                .undercurl = attr.undercurl,
+                .underdotted = attr.underdotted,
+                .underdashed = attr.underdashed,
+                .underdouble = attr.underdouble,
+                .strikethrough = attr.strikethrough,
+                .reverse = attr.reverse,
+                .blend = attr.blend,
+            };
+        }
+        return HlAttr{
             .foreground = self.default_foreground,
             .background = self.default_background,
         };
     }
 
     /// Get highlight attributes for a floating window context
-    /// Uses NormalFloat background for hl_id 0 if available
+    /// Same as getHlAttr - just use the colors Neovim sends
     pub fn getHlAttrForFloat(self: *const Self, id: u64) HlAttr {
-        if (id == 0) {
-            // For floating windows, use NormalFloat background if available
-            if (self.normal_float_hl_id) |float_id| {
-                if (self.hl_attrs.get(float_id)) |float_attr| {
-                    return HlAttr{
-                        .foreground = float_attr.foreground orelse self.default_foreground,
-                        .background = float_attr.background orelse self.default_background,
-                    };
-                }
-            }
-            return HlAttr{
-                .foreground = self.default_foreground,
-                .background = self.default_background,
-            };
-        }
-        return self.hl_attrs.get(id) orelse HlAttr{
-            .foreground = self.default_foreground,
-            .background = self.default_background,
-        };
+        return self.getHlAttr(id);
     }
 
     /// Get the current cursor mode based on mode_idx

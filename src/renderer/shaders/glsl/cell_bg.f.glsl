@@ -59,6 +59,9 @@ vec4 cell_bg() {
             use_linear_blending
         );
 
+    // Force full opacity for debug
+    cell_color.a = 1.0;
+
     return cell_color;
 }
 

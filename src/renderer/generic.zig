@@ -1560,24 +1560,35 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            // Collect windows and sort by z-index for proper layering
-            // Lower z-index windows render first, higher ones on top
-            var windows_to_render = std.ArrayListUnmanaged(*neovim_gui.RenderedWindow){};
-            defer windows_to_render.deinit(self.alloc);
+            // Partition windows into root (non-floating) and floating, like Neovide does
+            // Root windows render first, then floating windows sorted by z-index on top
+            var root_windows = std.ArrayListUnmanaged(*neovim_gui.RenderedWindow){};
+            defer root_windows.deinit(self.alloc);
+            var floating_windows = std.ArrayListUnmanaged(*neovim_gui.RenderedWindow){};
+            defer floating_windows.deinit(self.alloc);
 
             var window_iter = nvim.windows.valueIterator();
             while (window_iter.next()) |window_ptr| {
                 const window = window_ptr.*;
                 if (window.hidden or !window.valid) continue;
                 if (window.grid_height == 0 or window.grid_width == 0) continue;
-                if (window.actual_lines == null) continue;
-                // Skip message windows - they cause extra line issues
-                if (window.window_type == .message) continue;
-                windows_to_render.append(self.alloc, window) catch continue;
+
+                // Allow message/floating windows even if actual_lines is null
+                // They may be populated differently
+                const is_message_or_float = window.zindex > 0 or window.window_type == .floating or window.window_type == .message;
+                if (window.actual_lines == null and !is_message_or_float) continue;
+
+                // Partition: floating windows have zindex > 0 or are explicitly floating/message type
+                const is_floating = is_message_or_float;
+                if (is_floating) {
+                    floating_windows.append(self.alloc, window) catch continue;
+                } else {
+                    root_windows.append(self.alloc, window) catch continue;
+                }
             }
 
-            // Sort by z-index (lower first, so higher z-index renders on top)
-            std.mem.sort(*neovim_gui.RenderedWindow, windows_to_render.items, {}, struct {
+            // Sort floating windows by z-index (lower first, so higher z-index renders on top)
+            std.mem.sort(*neovim_gui.RenderedWindow, floating_windows.items, {}, struct {
                 fn lessThan(_: void, a: *neovim_gui.RenderedWindow, b: *neovim_gui.RenderedWindow) bool {
                     return a.zindex < b.zindex;
                 }
@@ -1586,14 +1597,85 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Get cell height for scroll offset calculation
             const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
 
+            // Build final render order: root windows first (by grid id), then floating windows (by zindex)
+            var windows_to_render = std.ArrayListUnmanaged(*neovim_gui.RenderedWindow){};
+            defer windows_to_render.deinit(self.alloc);
+
+            // Add root windows first (sorted by grid id for stability)
+            std.mem.sort(*neovim_gui.RenderedWindow, root_windows.items, {}, struct {
+                fn lessThan(_: void, a: *neovim_gui.RenderedWindow, b: *neovim_gui.RenderedWindow) bool {
+                    return a.id < b.id;
+                }
+            }.lessThan);
+            for (root_windows.items) |w| {
+                windows_to_render.append(self.alloc, w) catch continue;
+            }
+
+            // Add floating windows on top (already sorted by zindex)
+            for (floating_windows.items) |w| {
+                windows_to_render.append(self.alloc, w) catch continue;
+            }
+
+            // Occlusion Map: Track which window "owns" each cell.
+            // Initialize with 0 (no owner).
+            // Iterate windows from Top (highest Z) to Bottom (lowest Z).
+            // If a cell is 0, claim it. If it's already claimed, it's occluded.
+            // This ensures we don't render text/bg for windows covered by floating windows.
+            //
+            // SPECIAL CASE: Message windows (noice.nvim command area) only claim cells
+            // that have actual visible content. Empty message windows are transparent.
+            var occlusion_map = try self.alloc.alloc(u64, rows * cols);
+            defer self.alloc.free(occlusion_map);
+            @memset(occlusion_map, 0);
+
+            // Reverse iterate (Top to Bottom)
+            var i: usize = windows_to_render.items.len;
+            while (i > 0) {
+                i -= 1;
+                const window = windows_to_render.items[i];
+                const win_col: u16 = @intFromFloat(window.grid_position[0]);
+                const win_row: u16 = @intFromFloat(window.grid_position[1]);
+
+                // Message windows only claim cells with actual content
+                // This allows the underlying statusline to show through when no message is displayed
+                const is_message_window = window.window_type == .message;
+
+                var py: u32 = 0;
+                while (py < window.grid_height) : (py += 1) {
+                    var px: u32 = 0;
+                    while (px < window.grid_width) : (px += 1) {
+                        const sy = @as(u16, @intCast(py)) + win_row;
+                        const sx = @as(u16, @intCast(px)) + win_col;
+                        if (sy < rows and sx < cols) {
+                            if (occlusion_map[sy * cols + sx] == 0) {
+                                // For message windows, only claim if cell has content
+                                if (is_message_window) {
+                                    const cell = window.getCell(py, px);
+                                    if (cell) |c| {
+                                        const text = c.getText();
+                                        // Only claim if there's actual text content
+                                        if (text.len > 0 and text[0] != ' ' and text[0] != 0) {
+                                            occlusion_map[sy * cols + sx] = window.id;
+                                        }
+                                    }
+                                } else {
+                                    // Regular floating windows always claim their cells
+                                    occlusion_map[sy * cols + sx] = window.id;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             // Process each Neovim window in z-order
             for (windows_to_render.items) |window| {
                 // Get window position offset
                 const win_col: u16 = @intFromFloat(window.grid_position[0]);
                 const win_row: u16 = @intFromFloat(window.grid_position[1]);
 
-                // Check if this is a floating window
-                const is_floating = window.zindex > 0 or window.window_type == .floating;
+                // Check if this is a floating window (includes message windows like NOICE command bar)
+                const is_floating = window.zindex > 0 or window.window_type == .floating or window.window_type == .message;
 
                 // Get per-window scroll offset in pixels for smooth scrolling
                 // Only editor windows scroll - floating windows and messages don't
@@ -1604,64 +1686,91 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 else
                     0;
 
-                // Check if this is grid 1 (global grid)
-                const is_global_grid = window.id == 1;
-
-                // For non-global-grid windows, fill the entire window area with background color first
-                // This ensures the window is opaque even if cells don't have explicit backgrounds
-                // Grid 1 (global) has garbage in middle rows, so we handle it differently
-                if (!is_global_grid) {
-                    // Use the global default background - same as Neovide does
-                    const float_bg = default_bg;
-
-                    const float_bg_r: u8 = @intCast((float_bg >> 16) & 0xFF);
-                    const float_bg_g: u8 = @intCast((float_bg >> 8) & 0xFF);
-                    const float_bg_b: u8 = @intCast(float_bg & 0xFF);
-
-                    // Fill entire window area with background
-                    var fill_row: u32 = 0;
-                    while (fill_row < window.grid_height) : (fill_row += 1) {
-                        var fill_col: u32 = 0;
-                        while (fill_col < window.grid_width) : (fill_col += 1) {
-                            const screen_y = @as(u16, @intCast(fill_row)) + win_row;
-                            const screen_x = @as(u16, @intCast(fill_col)) + win_col;
-                            if (screen_y < self.cells.size.rows and screen_x < self.cells.size.columns) {
-                                self.cells.bgCell(screen_y, screen_x).* = .{ float_bg_r, float_bg_g, float_bg_b, 255 };
-                            }
-                        }
-                    }
-                }
-
-                // Render cells - like Neovide, iterate inner_size+1 for scrollable region
-                // This allows showing partial lines at top/bottom during scroll animation
                 const margin_top = window.viewport_margins.top;
                 const margin_bottom = window.viewport_margins.bottom;
                 const inner_size = window.grid_height -| margin_top -| margin_bottom;
+
+                // Debug: check statusline dimensions
+                if (window.window_type == .message) {
+                    std.log.err("MSG grid={} pos=({},{}) dim={}x{} margins=({},{}) inner={} actual_lines={}", .{
+                        window.id,
+                        win_col,
+                        win_row,
+                        window.grid_width,
+                        window.grid_height,
+                        margin_top,
+                        margin_bottom,
+                        inner_size,
+                        window.actual_lines != null,
+                    });
+                }
 
                 // Render top margin rows (winbar etc) - no scroll
                 var row: u32 = 0;
                 while (row < margin_top) : (row += 1) {
                     var col: u32 = 0;
                     while (col < window.grid_width) : (col += 1) {
-                        const grid_cell = window.getCell(row, col);
-                        if (grid_cell == null) continue;
-                        const cell = grid_cell.?;
                         const screen_y = @as(u16, @intCast(row)) + win_row;
                         const screen_x = @as(u16, @intCast(col)) + win_col;
                         if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
-                        const hl_attr = if (is_floating) nvim.getHlAttrForFloat(cell.hl_id) else nvim.getHlAttr(cell.hl_id);
-                        var fg_color = hl_attr.foreground orelse default_fg;
-                        var bg_color = hl_attr.background orelse default_bg;
+
+                        // OCCLUSION CHECK: Skip if this cell is owned by another (higher) window
+                        if (occlusion_map[screen_y * cols + screen_x] != window.id) continue;
+
+                        const grid_cell = window.getCell(row, col);
+                        // Get highlight attributes - use getHlAttrForFloat for floating windows
+                        const hl_id: u64 = if (grid_cell) |c| c.hl_id else 0;
+                        const hl_attr = if (is_floating) nvim.getHlAttrForFloat(hl_id) else nvim.getHlAttr(hl_id);
+
+                        // getHlAttr always returns non-null colors
+                        var fg_color = hl_attr.foreground.?;
+                        var bg_color = hl_attr.background.?;
                         if (hl_attr.reverse) {
                             const tmp = fg_color;
                             fg_color = bg_color;
                             bg_color = tmp;
                         }
-                        self.cells.bgCell(screen_y, screen_x).* = .{
-                            @intCast((bg_color >> 16) & 0xFF), @intCast((bg_color >> 8) & 0xFF), @intCast(bg_color & 0xFF), 255,
-                        };
-                        const text = cell.getText();
-                        if (text.len > 0) self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, 0) catch {};
+
+                        // For floating windows: IGNORE blend, always use solid bg_color
+                        // This prevents "transparent" floating windows - they must be opaque
+                        if (is_floating) {
+                            // Floating windows: solid background, no blending/transparency
+                            self.cells.bgCell(screen_y, screen_x).* = .{
+                                @intCast((bg_color >> 16) & 0xFF),
+                                @intCast((bg_color >> 8) & 0xFF),
+                                @intCast(bg_color & 0xFF),
+                                255,
+                            };
+                        } else if (hl_attr.blend > 0) {
+                            const blend_alpha = 255 - (@as(u16, hl_attr.blend) * 255 / 100);
+                            const inv_alpha = 255 - blend_alpha;
+
+                            const cell_r: u16 = @intCast((bg_color >> 16) & 0xFF);
+                            const cell_g: u16 = @intCast((bg_color >> 8) & 0xFF);
+                            const cell_b: u16 = @intCast(bg_color & 0xFF);
+                            const def_r: u16 = @intCast((default_bg >> 16) & 0xFF);
+                            const def_g: u16 = @intCast((default_bg >> 8) & 0xFF);
+                            const def_b: u16 = @intCast(default_bg & 0xFF);
+
+                            const final_r: u8 = @intCast((cell_r * blend_alpha + def_r * inv_alpha) / 255);
+                            const final_g: u8 = @intCast((cell_g * blend_alpha + def_g * inv_alpha) / 255);
+                            const final_b: u8 = @intCast((cell_b * blend_alpha + def_b * inv_alpha) / 255);
+
+                            self.cells.bgCell(screen_y, screen_x).* = .{ final_r, final_g, final_b, 255 };
+                        } else {
+                            // Solid background
+                            self.cells.bgCell(screen_y, screen_x).* = .{
+                                @intCast((bg_color >> 16) & 0xFF),
+                                @intCast((bg_color >> 8) & 0xFF),
+                                @intCast(bg_color & 0xFF),
+                                255,
+                            };
+                        }
+
+                        if (grid_cell) |cell| {
+                            const text = cell.getText();
+                            if (text.len > 0) self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, 0) catch {};
+                        }
                     }
                 }
 
@@ -1681,17 +1790,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 while (inner_row < inner_size) : (inner_row += 1) {
                     var col: u32 = 0;
                     while (col < window.grid_width) : (col += 1) {
-                        // Read from scrollback using inner row index, but only if we have valid scrollback data.
-                        // When has_valid_scrollback is false (e.g., initial scroll down before scrollback is populated),
-                        // we read from actual_lines instead to avoid reading from invalid negative indices.
-                        const grid_cell = if (!is_floating and has_valid_scrollback)
-                            window.getScrollbackCellByInnerRow(inner_row, col)
-                        else
-                            window.getCell(margin_top + inner_row, col);
-
-                        if (grid_cell == null) continue;
-                        const cell = grid_cell.?;
-
                         // Screen position: margin_top + inner_row
                         const screen_row = margin_top + inner_row;
                         const screen_y = @as(u16, @intCast(screen_row)) + win_row;
@@ -1699,16 +1797,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                         if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
 
-                        // Get highlight attributes from NeovimGui
-                        // Use NormalFloat background for floating windows with hl_id 0
-                        const hl_attr = if (is_floating)
-                            nvim.getHlAttrForFloat(cell.hl_id)
-                        else
-                            nvim.getHlAttr(cell.hl_id);
+                        // OCCLUSION CHECK: Skip if this cell is owned by another (higher) window
+                        const occluded = occlusion_map[screen_y * cols + screen_x] != window.id;
+                        if (window.window_type == .message and col == 0) {
+                            std.log.err("Grid={} row={} col={} sy={} owner={} me={} occluded={}", .{ window.id, row, col, screen_y, occlusion_map[screen_y * cols + screen_x], window.id, occluded });
+                        }
+                        if (occluded) continue;
 
-                        // Handle reverse video
-                        var fg_color = hl_attr.foreground orelse default_fg;
-                        var bg_color = hl_attr.background orelse default_bg;
+                        // Read from scrollback or actual_lines
+                        const grid_cell = if (!is_floating and has_valid_scrollback)
+                            window.getScrollbackCellByInnerRow(inner_row, col)
+                        else
+                            window.getCell(margin_top + inner_row, col);
+
+                        // Get highlight attributes - use getHlAttrForFloat for floating windows
+                        const hl_id: u64 = if (grid_cell) |c| c.hl_id else 0;
+                        const hl_attr = if (is_floating) nvim.getHlAttrForFloat(hl_id) else nvim.getHlAttr(hl_id);
+
+                        // getHlAttr always returns non-null colors (defaults filled in)
+                        var fg_color = hl_attr.foreground.?;
+                        var bg_color = hl_attr.background.?;
 
                         if (hl_attr.reverse) {
                             const tmp = fg_color;
@@ -1716,46 +1824,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             bg_color = tmp;
                         }
 
-                        // Set background color at screen position
-                        // For floating windows: the fill already set a solid background,
-                        // so we only need to draw cell backgrounds that are DIFFERENT from the fill
-                        // (which was default_bg). This prevents overwriting the opaque fill.
+                        // For floating windows: IGNORE blend, always use solid bg_color
+                        // This prevents "transparent" floating windows - they must be opaque
                         if (is_floating) {
-                            // Only draw if cell has a custom background (not default)
-                            // or if it has blend (which we'll composite properly)
-                            const has_custom_bg = hl_attr.background != null and hl_attr.background.? != default_bg;
+                            // Floating windows: solid background, no blending/transparency
+                            self.cells.bgCell(screen_y, screen_x).* = .{
+                                @intCast((bg_color >> 16) & 0xFF),
+                                @intCast((bg_color >> 8) & 0xFF),
+                                @intCast(bg_color & 0xFF),
+                                255,
+                            };
+                        } else if (hl_attr.blend > 0) {
+                            const blend_alpha = 255 - (@as(u16, hl_attr.blend) * 255 / 100);
+                            const inv_alpha = 255 - blend_alpha;
 
-                            if (has_custom_bg or hl_attr.blend > 0) {
-                                if (hl_attr.blend > 0) {
-                                    // Blend with the fill color (default_bg)
-                                    const blend_alpha = 255 - (@as(u16, hl_attr.blend) * 255 / 100);
-                                    const inv_alpha = 255 - blend_alpha;
+                            const cell_r: u16 = @intCast((bg_color >> 16) & 0xFF);
+                            const cell_g: u16 = @intCast((bg_color >> 8) & 0xFF);
+                            const cell_b: u16 = @intCast(bg_color & 0xFF);
+                            const def_r: u16 = @intCast((default_bg >> 16) & 0xFF);
+                            const def_g: u16 = @intCast((default_bg >> 8) & 0xFF);
+                            const def_b: u16 = @intCast(default_bg & 0xFF);
 
-                                    const cell_r: u16 = @intCast((bg_color >> 16) & 0xFF);
-                                    const cell_g: u16 = @intCast((bg_color >> 8) & 0xFF);
-                                    const cell_b: u16 = @intCast(bg_color & 0xFF);
-                                    const def_r: u16 = @intCast((default_bg >> 16) & 0xFF);
-                                    const def_g: u16 = @intCast((default_bg >> 8) & 0xFF);
-                                    const def_b: u16 = @intCast(default_bg & 0xFF);
+                            const final_r: u8 = @intCast((cell_r * blend_alpha + def_r * inv_alpha) / 255);
+                            const final_g: u8 = @intCast((cell_g * blend_alpha + def_g * inv_alpha) / 255);
+                            const final_b: u8 = @intCast((cell_b * blend_alpha + def_b * inv_alpha) / 255);
 
-                                    const final_r: u8 = @intCast((cell_r * blend_alpha + def_r * inv_alpha) / 255);
-                                    const final_g: u8 = @intCast((cell_g * blend_alpha + def_g * inv_alpha) / 255);
-                                    const final_b: u8 = @intCast((cell_b * blend_alpha + def_b * inv_alpha) / 255);
-
-                                    self.cells.bgCell(screen_y, screen_x).* = .{ final_r, final_g, final_b, 255 };
-                                } else {
-                                    // Custom background, no blend
-                                    self.cells.bgCell(screen_y, screen_x).* = .{
-                                        @intCast((bg_color >> 16) & 0xFF),
-                                        @intCast((bg_color >> 8) & 0xFF),
-                                        @intCast(bg_color & 0xFF),
-                                        255,
-                                    };
-                                }
-                            }
-                            // else: keep the fill color (don't overwrite)
+                            self.cells.bgCell(screen_y, screen_x).* = .{ final_r, final_g, final_b, 255 };
                         } else {
-                            // Non-floating: always set background
+                            // Solid background
                             self.cells.bgCell(screen_y, screen_x).* = .{
                                 @intCast((bg_color >> 16) & 0xFF),
                                 @intCast((bg_color >> 8) & 0xFF),
@@ -1765,10 +1861,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         }
 
                         // Render the glyph if cell has text
-                        const text = cell.getText();
-                        if (text.len > 0) {
-                            // Scrollable rows get the scroll pixel offset
-                            self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, scroll_pixel_offset) catch {};
+                        if (grid_cell) |cell| {
+                            const text = cell.getText();
+                            if (text.len > 0) {
+                                // Scrollable rows get the scroll pixel offset
+                                self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, scroll_pixel_offset) catch {};
+                            }
                         }
                     }
                 }
@@ -1778,25 +1876,133 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 while (row < window.grid_height) : (row += 1) {
                     var col: u32 = 0;
                     while (col < window.grid_width) : (col += 1) {
-                        const grid_cell = window.getCell(row, col);
-                        if (grid_cell == null) continue;
-                        const cell = grid_cell.?;
                         const screen_y = @as(u16, @intCast(row)) + win_row;
                         const screen_x = @as(u16, @intCast(col)) + win_col;
                         if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
-                        const hl_attr = if (is_floating) nvim.getHlAttrForFloat(cell.hl_id) else nvim.getHlAttr(cell.hl_id);
-                        var fg_color = hl_attr.foreground orelse default_fg;
-                        var bg_color = hl_attr.background orelse default_bg;
+
+                        // OCCLUSION CHECK: Skip if this cell is owned by another (higher) window
+                        if (occlusion_map[screen_y * cols + screen_x] != window.id) continue;
+
+                        const grid_cell = window.getCell(row, col);
+                        // Get highlight attributes - use getHlAttrForFloat for floating windows
+                        const hl_id: u64 = if (grid_cell) |c| c.hl_id else 0;
+                        const hl_attr = if (is_floating) nvim.getHlAttrForFloat(hl_id) else nvim.getHlAttr(hl_id);
+
+                        // getHlAttr always returns non-null colors
+                        var fg_color = hl_attr.foreground.?;
+                        var bg_color = hl_attr.background.?;
                         if (hl_attr.reverse) {
                             const tmp = fg_color;
                             fg_color = bg_color;
                             bg_color = tmp;
                         }
-                        self.cells.bgCell(screen_y, screen_x).* = .{
-                            @intCast((bg_color >> 16) & 0xFF), @intCast((bg_color >> 8) & 0xFF), @intCast(bg_color & 0xFF), 255,
-                        };
-                        const text = cell.getText();
-                        if (text.len > 0) self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, 0) catch {};
+
+                        // For floating windows: IGNORE blend, always use solid bg_color
+                        // This prevents "transparent" floating windows - they must be opaque
+                        if (is_floating) {
+                            // Floating windows: solid background, no blending/transparency
+                            self.cells.bgCell(screen_y, screen_x).* = .{
+                                @intCast((bg_color >> 16) & 0xFF),
+                                @intCast((bg_color >> 8) & 0xFF),
+                                @intCast(bg_color & 0xFF),
+                                255,
+                            };
+                        } else if (hl_attr.blend > 0) {
+                            const blend_alpha = 255 - (@as(u16, hl_attr.blend) * 255 / 100);
+                            const inv_alpha = 255 - blend_alpha;
+
+                            const cell_r: u16 = @intCast((bg_color >> 16) & 0xFF);
+                            const cell_g: u16 = @intCast((bg_color >> 8) & 0xFF);
+                            const cell_b: u16 = @intCast(bg_color & 0xFF);
+                            const def_r: u16 = @intCast((default_bg >> 16) & 0xFF);
+                            const def_g: u16 = @intCast((default_bg >> 8) & 0xFF);
+                            const def_b: u16 = @intCast(default_bg & 0xFF);
+
+                            const final_r: u8 = @intCast((cell_r * blend_alpha + def_r * inv_alpha) / 255);
+                            const final_g: u8 = @intCast((cell_g * blend_alpha + def_g * inv_alpha) / 255);
+                            const final_b: u8 = @intCast((cell_b * blend_alpha + def_b * inv_alpha) / 255);
+
+                            self.cells.bgCell(screen_y, screen_x).* = .{ final_r, final_g, final_b, 255 };
+                        } else {
+                            // Solid background
+                            self.cells.bgCell(screen_y, screen_x).* = .{
+                                @intCast((bg_color >> 16) & 0xFF),
+                                @intCast((bg_color >> 8) & 0xFF),
+                                @intCast(bg_color & 0xFF),
+                                255,
+                            };
+                        }
+
+                        if (grid_cell) |cell| {
+                            const text = cell.getText();
+                            if (text.len > 0) {
+                                self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, scroll_pixel_offset) catch {};
+                            }
+                        }
+                    }
+                }
+
+                // Render bottom margin rows (statusline etc) - no scroll
+                row = window.grid_height -| margin_bottom;
+                while (row < window.grid_height) : (row += 1) {
+                    var col: u32 = 0;
+                    while (col < window.grid_width) : (col += 1) {
+                        const screen_y = @as(u16, @intCast(row)) + win_row;
+                        const screen_x = @as(u16, @intCast(col)) + win_col;
+                        if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
+
+                        // OCCLUSION CHECK
+                        if (occlusion_map[screen_y * cols + screen_x] != window.id) continue;
+
+                        const grid_cell = window.getCell(row, col);
+                        const hl_id: u64 = if (grid_cell) |c| c.hl_id else 0;
+                        const hl_attr = if (is_floating) nvim.getHlAttrForFloat(hl_id) else nvim.getHlAttr(hl_id);
+
+                        var fg_color = hl_attr.foreground.?;
+                        var bg_color = hl_attr.background.?;
+                        if (hl_attr.reverse) {
+                            const tmp = fg_color;
+                            fg_color = bg_color;
+                            bg_color = tmp;
+                        }
+
+                        // For floating windows: IGNORE blend
+                        if (is_floating) {
+                            self.cells.bgCell(screen_y, screen_x).* = .{
+                                @intCast((bg_color >> 16) & 0xFF),
+                                @intCast((bg_color >> 8) & 0xFF),
+                                @intCast(bg_color & 0xFF),
+                                255,
+                            };
+                        } else if (hl_attr.blend > 0) {
+                            const blend_alpha = 255 - (@as(u16, hl_attr.blend) * 255 / 100);
+                            const inv_alpha = 255 - blend_alpha;
+
+                            const cell_r: u16 = @intCast((bg_color >> 16) & 0xFF);
+                            const cell_g: u16 = @intCast((bg_color >> 8) & 0xFF);
+                            const cell_b: u16 = @intCast(bg_color & 0xFF);
+                            const def_r: u16 = @intCast((default_bg >> 16) & 0xFF);
+                            const def_g: u16 = @intCast((default_bg >> 8) & 0xFF);
+                            const def_b: u16 = @intCast(default_bg & 0xFF);
+
+                            const final_r: u8 = @intCast((cell_r * blend_alpha + def_r * inv_alpha) / 255);
+                            const final_g: u8 = @intCast((cell_g * blend_alpha + def_g * inv_alpha) / 255);
+                            const final_b: u8 = @intCast((cell_b * blend_alpha + def_b * inv_alpha) / 255);
+
+                            self.cells.bgCell(screen_y, screen_x).* = .{ final_r, final_g, final_b, 255 };
+                        } else {
+                            self.cells.bgCell(screen_y, screen_x).* = .{
+                                @intCast((bg_color >> 16) & 0xFF),
+                                @intCast((bg_color >> 8) & 0xFF),
+                                @intCast(bg_color & 0xFF),
+                                255,
+                            };
+                        }
+
+                        if (grid_cell) |cell| {
+                            const text = cell.getText();
+                            if (text.len > 0) self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, 0) catch {};
+                        }
                     }
                 }
             }

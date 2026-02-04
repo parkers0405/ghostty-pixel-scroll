@@ -803,10 +803,12 @@ pub const IoThread = struct {
         // NOTE: Do NOT enable ext_messages or ext_cmdline - they conflict with noice.nvim
         // and other plugins that handle messages/cmdline themselves.
         // Neovide also doesn't enable these - it handles msg_set_pos events instead.
+        // ext_hlstate gives us detailed highlight info including winhighlight resolution
         const opts = try msgpack.object(self.alloc, .{
             .rgb = true,
             .ext_linegrid = true,
             .ext_multigrid = true,
+            .ext_hlstate = true,
         });
         // opts is now owned by params - do NOT free it
 

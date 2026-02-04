@@ -48,6 +48,9 @@ pub const NeovimGui = struct {
     /// Local buffer for processing events (avoids allocations in render loop)
     local_events: std.ArrayListUnmanaged(Event) = .empty,
 
+    /// Flag to stop processing events after a flush (to ensure consistent frame)
+    stop_processing_flush: bool = false,
+
     /// All windows received from Neovim, keyed by grid ID
     windows: std.AutoHashMap(u64, *RenderedWindow),
 
@@ -342,14 +345,37 @@ pub const NeovimGui = struct {
         // Swap event buffers - this is the only synchronization point
         self.event_queue.popAll(&self.local_events);
 
-        // Process all events
+        // Process events until queue empty OR flush encountered
+        // We must STOP after flush to ensure we render a consistent frame state.
+        // If we process past a flush (e.g. into the next batch), we might update
+        // viewport_margins (top=0) but fail to update scrollback (size=24 from top=1 flush),
+        // leading to inconsistent state during render.
+        self.stop_processing_flush = false;
+        var processed_count: usize = 0;
         for (self.local_events.items) |*event| {
+            processed_count += 1;
             self.handleEvent(event.*) catch |err| {
                 log.err("Event error: {}", .{err});
             };
             event.deinit(self.alloc);
+
+            if (self.stop_processing_flush) {
+                break;
+            }
         }
-        self.local_events.clearRetainingCapacity();
+
+        // Remove processed events from the buffer
+        if (processed_count > 0) {
+            if (processed_count == self.local_events.items.len) {
+                self.local_events.clearRetainingCapacity();
+            } else {
+                // Move remaining items to front
+                const remaining = self.local_events.items[processed_count..];
+                log.err("STOPPED AT FLUSH: processed={} remaining={}", .{ processed_count, remaining.len });
+                std.mem.copyForwards(Event, self.local_events.items, remaining);
+                self.local_events.items.len = remaining.len;
+            }
+        }
     }
 
     fn handleEvent(self: *Self, event: Event) !void {
@@ -436,6 +462,10 @@ pub const NeovimGui = struct {
             },
             .flush => {
                 self.flush();
+                // Stop processing further events in this frame to ensure consistency
+                // The remaining events will be processed in the next frame
+                self.stop_processing_flush = true;
+                log.err("FLUSH EVENT: stopping event processing", .{});
             },
             .suspend_event => {
                 log.info("Neovim suspend event received", .{});
@@ -721,16 +751,17 @@ pub const NeovimGui = struct {
     }
 
     fn handleGridScroll(self: *Self, data: Event.GridScroll) void {
-        log.debug("Grid scroll: grid={} rows={} region=[{}-{}]x[{}-{}]", .{
+        const window = self.windows.get(data.grid) orelse return;
+        log.err("Grid scroll: grid={} rows={} region=[{}-{}]x[{}-{}] grid_size={}x{}", .{
             data.grid,
             data.rows,
             data.top,
             data.bot,
             data.left,
             data.right,
+            window.grid_width,
+            window.grid_height,
         });
-
-        const window = self.windows.get(data.grid) orelse return;
         window.handleScroll(.{
             .top = data.top,
             .bottom = data.bot,

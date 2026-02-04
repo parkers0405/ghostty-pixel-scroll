@@ -1303,6 +1303,11 @@ pub const IoThread = struct {
             }
         } else if (std.mem.eql(u8, name, "win_viewport_margins")) {
             // win_viewport_margins: [grid, win, top, bottom, left, right]
+            // DEBUG: Log what we actually receive
+            log.err("win_viewport_margins RAW: args.len={}", .{args.len});
+            for (args, 0..) |arg, i| {
+                log.err("  arg[{}] = {}", .{ i, arg });
+            }
             if (args.len >= 6) {
                 const grid = extractU64(args[0]) orelse return;
                 const win = extractU64(args[1]) orelse 0;
@@ -1310,7 +1315,7 @@ pub const IoThread = struct {
                 const bottom = extractU64(args[3]) orelse 0;
                 const left = extractU64(args[4]) orelse 0;
                 const right = extractU64(args[5]) orelse 0;
-                log.info("win_viewport_margins: grid={} win={} top={} bottom={} left={} right={}", .{ grid, win, top, bottom, left, right });
+                log.err("win_viewport_margins PARSED: grid={} win={} top={} bottom={} left={} right={}", .{ grid, win, top, bottom, left, right });
                 try self.event_queue.push(.{ .win_viewport_margins = .{
                     .grid = grid,
                     .win = win,

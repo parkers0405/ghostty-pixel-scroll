@@ -650,6 +650,26 @@ pub const RenderedWindow = struct {
                 inner_bottom - 1,
                 last_char,
             });
+
+            // Debug: show first few chars of row 0 (the potential winbar row)
+            const row0 = actual.getConst(0);
+            if (row0) |r| {
+                var row0_preview: [32]u8 = undefined;
+                var preview_len: usize = 0;
+                for (r.cells[0..@min(r.cells.len, 30)]) |cell| {
+                    if (cell.text[0] != 0 and preview_len < 31) {
+                        row0_preview[preview_len] = cell.text[0];
+                        preview_len += 1;
+                    }
+                }
+                row0_preview[preview_len] = 0;
+                log.err("ROW0 grid={}: '{s}' margins=({},{})", .{
+                    self.id,
+                    row0_preview[0..preview_len],
+                    self.viewport_margins.top,
+                    self.viewport_margins.bottom,
+                });
+            }
         }
 
         // Rotate scrollback by scroll_delta
@@ -707,6 +727,34 @@ pub const RenderedWindow = struct {
                 scrollback.current_index,
                 inner_size,
             });
+
+            // Debug: Check what's at the edge positions after copy
+            // For scroll down (pos > 0), we'll read scrollback[floor(pos) + inner_size - 1]
+            // For scroll up (pos < 0), we'll read scrollback[floor(pos) + 0]
+            const floor_pos: isize = @intFromFloat(@floor(scroll_offset));
+            if (scroll_offset > 0) {
+                // Scroll down: check position inner_size (one past visible)
+                const edge_idx = floor_pos + inner_size;
+                const edge_line = scrollback.getConst(edge_idx);
+                const has_data = if (edge_line) |line| line.cells.len > 0 else false;
+                log.err("SCROLL_DOWN: pos={d:.2}, floor={}, edge_idx={}, has_data={}", .{
+                    scroll_offset,
+                    floor_pos,
+                    edge_idx,
+                    has_data,
+                });
+            } else if (scroll_offset < 0) {
+                // Scroll up: check position -1 (one before visible)
+                const edge_idx = floor_pos - 1;
+                const edge_line = scrollback.getConst(edge_idx);
+                const has_data = if (edge_line) |line| line.cells.len > 0 else false;
+                log.err("SCROLL_UP: pos={d:.2}, floor={}, edge_idx={}, has_data={}", .{
+                    scroll_offset,
+                    floor_pos,
+                    edge_idx,
+                    has_data,
+                });
+            }
         }
 
         self.scroll_delta = 0;
@@ -792,17 +840,29 @@ pub const RenderedWindow = struct {
     /// Like Neovide's iter_scrollable_lines which iterates 0..inner_size+1
     /// This allows reading one extra row at the edge during animation
     pub fn getScrollbackCellByInnerRow(self: *const Self, inner_row: u32, col: u32) ?*const GridCell {
+        return self.getScrollbackCellByInnerRowSigned(@intCast(inner_row), col);
+    }
+
+    /// Get scrollback cell by signed inner row index (can be -1 for extra top row)
+    /// This supports rendering one extra row above the visible region during scroll animation
+    pub fn getScrollbackCellByInnerRowSigned(self: *const Self, inner_row: i32, col: u32) ?*const GridCell {
         if (self.scrollback_lines == null) return null;
         if (col >= self.grid_width) return null;
 
         const scroll_offset_lines: isize = @intFromFloat(@floor(self.scroll_animation.position));
-        const scrollback_idx: isize = scroll_offset_lines + @as(isize, @intCast(inner_row));
+        const scrollback_idx: isize = scroll_offset_lines + @as(isize, inner_row);
 
         const scrollback = &self.scrollback_lines.?;
         const line = scrollback.getConst(scrollback_idx) orelse {
-            if (col == 0) {
-                log.warn("getScrollbackCellByInnerRow NULL: inner_row={}, pos={d:.3}, floor={}, idx={}", .{
-                    inner_row, self.scroll_animation.position, scroll_offset_lines, scrollback_idx,
+            // Debug: log when we get null from scrollback (only once per row)
+            if (col == 0 and self.scroll_animation.position != 0) {
+                log.warn("getScrollbackCellByInnerRowSigned NULL: inner_row={}, pos={d:.2}, scroll_offset={}, scrollback_idx={}, current_idx={}, buf_len={}", .{
+                    inner_row,
+                    self.scroll_animation.position,
+                    scroll_offset_lines,
+                    scrollback_idx,
+                    scrollback.current_index,
+                    scrollback.length(),
                 });
             }
             return null;

@@ -876,8 +876,37 @@ pub fn initNeovimGui(self: *Surface) !void {
     // Set initial grid size based on terminal size
     // Note: We use the exact terminal grid size. Neovim handles its own
     // statusline, cmdline, tabline within this space.
-    nvim.grid_width = self.size.grid().columns;
-    nvim.grid_height = self.size.grid().rows;
+    //
+    // IMPORTANT: Calculate grid size using ONLY explicit padding, not balanced padding.
+    // Balanced padding adds extra padding to center content, but for Neovim we want
+    // to use all available rows. Neovim handles its own layout.
+    const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
+    const x_dpi = content_scale.x * font.face.default_dpi;
+    const y_dpi = content_scale.y * font.face.default_dpi;
+    const explicit_padding = self.config.scaledPadding(x_dpi, y_dpi);
+
+    // Calculate grid with only explicit padding (not balanced)
+    const screen_without_balanced = self.size.screen.subPadding(explicit_padding);
+    const grid_size = rendererpkg.GridSize.init(screen_without_balanced, self.size.cell);
+
+    log.info("initNeovimGui: screen={}x{} explicit_padding=({},{},{},{}) balanced_padding=({},{},{},{}) cell={}x{} grid={}x{}", .{
+        self.size.screen.width,
+        self.size.screen.height,
+        explicit_padding.top,
+        explicit_padding.bottom,
+        explicit_padding.left,
+        explicit_padding.right,
+        self.size.padding.top,
+        self.size.padding.bottom,
+        self.size.padding.left,
+        self.size.padding.right,
+        self.size.cell.width,
+        self.size.cell.height,
+        grid_size.columns,
+        grid_size.rows,
+    });
+    nvim.grid_width = grid_size.columns;
+    nvim.grid_height = grid_size.rows;
     nvim.cell_width = @floatFromInt(self.size.cell.width);
     nvim.cell_height = @floatFromInt(self.size.cell.height);
 
@@ -2570,12 +2599,24 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
 
     // If in Neovim GUI mode, resize the Neovim UI
     if (self.nvim_gui) |nvim| {
-        // Tell Neovim the EXACT grid size - don't subtract anything
-        // Neovide doesn't subtract either, they match window size to grid exactly
-        std.log.info("NEOVIM RESIZE: Terminal grid {}x{} -> Telling Neovim same size", .{ grid_size.columns, grid_size.rows });
+        // Calculate grid size using ONLY explicit padding for Neovim
+        // This ensures Neovim gets all available rows, not reduced by balanced padding
+        const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
+        const x_dpi = content_scale.x * font.face.default_dpi;
+        const y_dpi = content_scale.y * font.face.default_dpi;
+        const explicit_padding = self.config.scaledPadding(x_dpi, y_dpi);
+        const screen_without_balanced = self.size.screen.subPadding(explicit_padding);
+        const nvim_grid_size = rendererpkg.GridSize.init(screen_without_balanced, self.size.cell);
+
+        log.info("NEOVIM RESIZE: screen {}x{} -> grid {}x{} (explicit padding only)", .{
+            self.size.screen.width,
+            self.size.screen.height,
+            nvim_grid_size.columns,
+            nvim_grid_size.rows,
+        });
         nvim.resize(
-            grid_size.columns,
-            grid_size.rows,
+            nvim_grid_size.columns,
+            nvim_grid_size.rows,
             @floatFromInt(self.size.cell.width),
             @floatFromInt(self.size.cell.height),
         ) catch |err| {
@@ -2591,9 +2632,9 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
 fn balancePaddingIfNeeded(self: *Surface) void {
     if (!self.config.window_padding_balance) return;
 
-    // Enable balanced padding for Neovim to center content vertically
-    // This handles the case where window height > grid height
-    // if (self.nvim_gui != null) return;
+    // Skip balanced padding for Neovim mode - we want to use the full grid space
+    // Neovim handles its own layout (tabline, statusline, etc.)
+    if (self.nvim_gui != null) return;
 
     const content_scale = try self.rt_surface.getContentScale();
     const x_dpi = content_scale.x * font.face.default_dpi;

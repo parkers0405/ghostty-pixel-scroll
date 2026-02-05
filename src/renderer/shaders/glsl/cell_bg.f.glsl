@@ -39,7 +39,23 @@ vec4 cell_bg() {
         if (offset_i16 != 0) {
             float per_cell_offset_y = float(offset_i16) / 256.0;
             adjusted_coord.y -= per_cell_offset_y;
-            grid_pos = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
+            ivec2 new_grid_pos = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
+            
+            // Check if the new position is a fixed cell (statusline)
+            // If so, don't use that cell's color - keep the original scrolling cell's color
+            if (new_grid_pos.x >= 0 && new_grid_pos.x < int(grid_size.x) &&
+                new_grid_pos.y >= 0 && new_grid_pos.y < int(grid_size.y)) {
+                int new_cell_index = new_grid_pos.y * int(grid_size.x) + new_grid_pos.x;
+                int new_offset_raw = cells[new_cell_index].offset_y_fixed;
+                int new_offset_i16 = (new_offset_raw << 16) >> 16;
+                
+                // Only use the new position if it's also a scrolling cell (not fixed)
+                if (new_offset_i16 != 0) {
+                    grid_pos = new_grid_pos;
+                }
+                // If new cell is fixed (offset=0), keep original grid_pos
+                // This prevents statusline color from bleeding into scrolling area
+            }
         }
     }
 

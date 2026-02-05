@@ -484,7 +484,21 @@ fragment float4 cell_bg_fragment(
     if (per_cell_offset_fixed != 0) {
       float per_cell_offset_y = float(per_cell_offset_fixed) / 256.0;
       adjusted_pos.y -= per_cell_offset_y;
-      grid_pos = int2(floor((adjusted_pos - uniforms.grid_padding.wx) / uniforms.cell_size));
+      int2 new_grid_pos = int2(floor((adjusted_pos - uniforms.grid_padding.wx) / uniforms.cell_size));
+      
+      // Check if the new position is a fixed cell (statusline)
+      // If so, don't use that cell's color - keep the original scrolling cell's color
+      if (new_grid_pos.x >= 0 && new_grid_pos.x < uniforms.grid_size.x &&
+          new_grid_pos.y >= 0 && new_grid_pos.y < uniforms.grid_size.y) {
+        int new_cell_index = new_grid_pos.y * uniforms.grid_size.x + new_grid_pos.x;
+        short new_offset_fixed = cells[new_cell_index].offset_y_fixed;
+        
+        // Only use the new position if it's also a scrolling cell (not fixed)
+        if (new_offset_fixed != 0) {
+          grid_pos = new_grid_pos;
+        }
+        // If new cell is fixed (offset=0), keep original grid_pos
+      }
     }
   }
 

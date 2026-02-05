@@ -379,12 +379,6 @@ pub const NeovimGui = struct {
             },
             .grid_line => |data| {
                 self.handleGridLine(data.grid, data.row, data.col_start, data.cells);
-                // Force all windows to be marked dirty to trigger full redraw
-                // This ensures floating windows render properly on first open
-                var it = self.windows.valueIterator();
-                while (it.next()) |window_ptr| {
-                    window_ptr.*.dirty = true;
-                }
             },
             .grid_scroll => |data| {
                 self.handleGridScroll(data);
@@ -808,13 +802,6 @@ pub const NeovimGui = struct {
             log.err("grid_line: DROPPED - window not found for grid={} row={}", .{ grid, row });
             return;
         };
-
-        // Debug: log grid_line for high grid IDs (likely Telescope floats) to track content updates
-        if (grid >= 5 and row == 0 and cells.len > 0) {
-            log.err("grid_line: grid={} row={} col_start={} cells={} text='{s}' type={s}", .{
-                grid, row, col_start, cells.len, cells[0].text, @tagName(window.window_type),
-            });
-        }
 
         // Convert Event.Cell to the format expected by RenderedWindow
         var col = col_start;

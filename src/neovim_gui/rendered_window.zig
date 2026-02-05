@@ -374,20 +374,20 @@ pub const RenderedWindow = struct {
             height,
         });
 
-        // Grid 1 is special - it's the outer container with statusline/cmdline at the bottom.
-        // Don't preserve content for grid 1 since positions change completely on resize.
-        // Also don't preserve if we have no old content to preserve.
-        // Also don't preserve if width is SHRINKING - this causes color bleeding artifacts
-        // from statusline/tabline highlights that extend to the window edge.
-        const width_shrinking = (self.grid_width > 0) and (width < self.grid_width);
-        const should_preserve = (self.id != 1) and (self.actual_lines != null) and (self.grid_height > 0) and !width_shrinking;
+        // Preserve old content during resize to prevent black flashes.
+        // Grid 1 is special: on height change, row semantics shift (e.g., old interior
+        // row becomes the new statusline row), so stale highlight data from preserved
+        // content would cause color smearing. Preserve grid 1 only on width-only changes
+        // (handled by the fast path below). For other windows, always preserve.
+        const height_changing = (height != self.grid_height);
+        const should_preserve = (self.actual_lines != null) and (self.grid_height > 0) and
+            !(self.id == 1 and height_changing);
 
         // Optimization: if only width changed and height is the same, just resize existing lines
-        // This is common during nvim-tree animations (1x25 -> 2x25 -> 3x25 -> ...)
-        // Only use this fast path when GROWING - shrinking can cause color artifacts
+        // This is common during nvim-tree animations and hy3 layout changes
+        // Works for both growing and shrinking - resizeWidth handles truncation safely
         const height_unchanged = (height == self.grid_height and self.actual_lines != null);
-        const width_growing = (width > self.grid_width);
-        if (height_unchanged and width_growing) {
+        if (height_unchanged) {
             // Just resize each line's cell array
             if (self.actual_lines) |*al| {
                 var i: u32 = 0;
@@ -408,6 +408,8 @@ pub const RenderedWindow = struct {
                 }
             }
             self.grid_width = width;
+            self.display_width = width;
+            self.display_height = height;
             self.dirty = true;
             return;
         }
@@ -483,6 +485,8 @@ pub const RenderedWindow = struct {
         self.scrollback_lines = new_scrollback;
         self.grid_width = width;
         self.grid_height = height;
+        self.display_width = width;
+        self.display_height = height;
         self.scroll_delta = 0;
         self.scroll_animation.reset();
         self.valid = true;

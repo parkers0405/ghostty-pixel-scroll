@@ -1631,7 +1631,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (rows == 0 or cols == 0) return;
                 if (self.cells.size.rows != rows or self.cells.size.columns != cols) {
                     try self.cells.resize(self.alloc, .{ .rows = rows, .columns = cols });
-                    self.uniforms.grid_size = .{ cols, rows + 2 };
+                    self.uniforms.grid_size = .{ cols, rows };
                 }
                 return; // No windows to render yet
             };
@@ -1645,8 +1645,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             if (self.cells.size.rows != rows or self.cells.size.columns != cols) {
                 try self.cells.resize(self.alloc, .{ .rows = rows, .columns = cols });
-                // Add 2 to rows for shader uniform because the Metal shader clips grid_size.y - 2
-                self.uniforms.grid_size = .{ cols, rows + 2 };
+                self.uniforms.grid_size = .{ cols, rows };
             }
 
             // Get default colors from Neovim
@@ -1690,9 +1689,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     continue;
                 }
 
-                // Determine if this is a floating/message window
-                const is_message_or_float = window.zindex > 0 or window.window_type == .floating or window.window_type == .message;
-
                 // Skip windows that have no content buffer (actual_lines not initialized)
                 // This happens when win_float_pos arrives before grid_resize
                 // Previously we allowed floating windows through, but they render empty without actual_lines
@@ -1703,6 +1699,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 if (window.grid_width == 0 or window.grid_height == 0) {
                     continue;
                 }
+
+                // Determine if this is a floating/message window
+                const is_message_or_float = window.zindex > 0 or window.window_type == .floating or window.window_type == .message;
 
                 // Partition: floating windows have zindex > 0 or are explicitly floating/message type
                 const is_floating = is_message_or_float;
@@ -1906,11 +1905,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
 
                         // Check if this window owns this cell for TEXT rendering
+                        // Margin rows are excluded from the occlusion map, so unclaimed
+                        // cells (owner == 0) in our margin rows belong to us.
                         const owner = occlusion_map[screen_y * cols + screen_x];
-                        var owns_cell = owner == window.id;
+                        var owns_cell = (owner == window.id) or (owner == 0);
                         if (is_floating and !owns_cell) {
-                            // Floating windows should render over root windows even if occlusion claims root.
-                            if (owner == 0 or !floating_ids.contains(owner)) {
+                            if (!floating_ids.contains(owner)) {
                                 owns_cell = true;
                             }
                         }
@@ -2117,10 +2117,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
 
                         // Check if this window owns this cell for TEXT rendering
+                        // Margin rows are excluded from the occlusion map, so unclaimed
+                        // cells (owner == 0) in our margin rows belong to us.
                         const owner = occlusion_map[screen_y * cols + screen_x];
-                        var owns_cell = owner == window.id;
+                        var owns_cell = (owner == window.id) or (owner == 0);
                         if (is_floating and !owns_cell) {
-                            if (owner == 0 or !floating_ids.contains(owner)) {
+                            if (!floating_ids.contains(owner)) {
                                 owns_cell = true;
                             }
                         }

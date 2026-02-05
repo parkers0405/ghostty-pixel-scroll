@@ -1,12 +1,26 @@
 #include "common.glsl"
 
+// Position the origin to the upper left for clipping check
+layout(origin_upper_left) in vec4 gl_FragCoord;
+
 layout(binding = 0) uniform sampler2DRect atlas_grayscale;
 layout(binding = 1) uniform sampler2DRect atlas_color;
+
+// Per-cell background data for checking if fragment falls into fixed (statusline) region
+struct CellBgData {
+    uint color;
+    int offset_y_fixed;
+};
+
+layout(binding = 1, std430) readonly buffer bg_cells {
+    CellBgData cells[];
+};
 
 in CellTextVertexOut {
     flat uint atlas;
     flat vec4 color;
     flat vec4 bg_color;
+    flat int pixel_offset_y;  // From vertex shader for clipping check
     vec2 tex_coord;
 } in_data;
 
@@ -18,6 +32,27 @@ const uint ATLAS_COLOR = 1u;
 layout(location = 0) out vec4 out_FragColor;
 
 void main() {
+    // Check if this fragment is scrolling text that landed in a fixed cell (statusline)
+    // Only clip if: this text HAS an offset AND lands in a cell with offset=0
+    if (in_data.pixel_offset_y != 0) {
+        uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
+        vec2 adjusted_coord = gl_FragCoord.xy;
+        adjusted_coord.y += pixel_scroll_offset_y;
+        ivec2 dest_grid_pos = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
+        
+        if (dest_grid_pos.x >= 0 && dest_grid_pos.x < int(grid_size.x) &&
+            dest_grid_pos.y >= 0 && dest_grid_pos.y < int(grid_size.y)) {
+            int cell_index = dest_grid_pos.y * int(grid_size.x) + dest_grid_pos.x;
+            int offset_raw = cells[cell_index].offset_y_fixed;
+            int offset_i16 = (offset_raw << 16) >> 16;
+            
+            // If dest cell is fixed (offset=0) but this text has offset, clip it
+            // This prevents scrolling text from bleeding into statusline
+            if (offset_i16 == 0) {
+                discard;
+            }
+        }
+    }
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
     bool use_linear_correction = (bools & USE_LINEAR_CORRECTION) != 0;
 

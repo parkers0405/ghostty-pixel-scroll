@@ -593,6 +593,7 @@ struct CellTextVertexOut {
   uint8_t atlas [[flat]];
   float4 color [[flat]];
   float4 bg_color [[flat]];
+  short pixel_offset_y [[flat]];  // For statusline clipping
   float2 tex_coord;
   float2 screen_pos;  // For clipping during scroll
 };
@@ -728,6 +729,9 @@ vertex CellTextVertexOut cell_text_vertex(
     true
   );
   out.bg_color += global_bg * (1.0 - out.bg_color.a);
+  
+  // Pass pixel offset for statusline clipping in fragment shader
+  out.pixel_offset_y = in.pixel_offset_y_fixed;
 
   // If we have a minimum contrast, we need to check if we need to
   // change the color of the text to ensure it has enough contrast
@@ -761,16 +765,31 @@ fragment float4 cell_text_fragment(
   CellTextVertexOut in [[stage_in]],
   texture2d<float> textureGrayscale [[texture(0)]],
   texture2d<float> textureColor [[texture(1)]],
-  constant Uniforms& uniforms [[buffer(1)]]
+  constant Uniforms& uniforms [[buffer(1)]],
+  constant CellBgData *bg_cells [[buffer(2)]]
 ) {
-  // Clip text that would appear outside the visible grid area during scroll
-  // This prevents edge bounce - content scrolls but edges stay clean
-  // grid_padding is {top, right, bottom, left}
-  float grid_top = uniforms.grid_padding.x;  // Top padding (.x = top)
-  // Visible rows = grid_size.y - 2 (we render 2 extra rows for scroll buffer)
-  float grid_bottom = grid_top + float(uniforms.grid_size.y - 2) * uniforms.cell_size.y;
+  // Check if this fragment is scrolling text that landed in a fixed cell (statusline)
+  // Only clip if: this text HAS an offset AND lands in a cell with offset=0
+  if (in.pixel_offset_y != 0) {
+    float2 adjusted_pos = in.position.xy;
+    adjusted_pos.y += uniforms.pixel_scroll_offset_y;
+    int2 dest_grid_pos = int2(floor((adjusted_pos - uniforms.grid_padding.wx) / uniforms.cell_size));
+    
+    if (dest_grid_pos.x >= 0 && dest_grid_pos.x < uniforms.grid_size.x &&
+        dest_grid_pos.y >= 0 && dest_grid_pos.y < uniforms.grid_size.y) {
+      int cell_index = dest_grid_pos.y * uniforms.grid_size.x + dest_grid_pos.x;
+      short dest_offset = bg_cells[cell_index].offset_y_fixed;
+      
+      // If dest cell is fixed (offset=0) but this text has offset, clip it
+      if (dest_offset == 0) {
+        discard_fragment();
+      }
+    }
+  }
   
-  // Discard fragments outside the visible viewport (between extra rows)
+  // Legacy clip for terminal scrollback
+  float grid_top = uniforms.grid_padding.x;
+  float grid_bottom = grid_top + float(uniforms.grid_size.y - 2) * uniforms.cell_size.y;
   if (in.screen_pos.y < grid_top || in.screen_pos.y > grid_bottom) {
     discard_fragment();
   }

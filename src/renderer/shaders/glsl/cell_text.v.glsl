@@ -37,11 +37,17 @@ out CellTextVertexOut {
     flat uint atlas;
     flat vec4 color;
     flat vec4 bg_color;
+    flat int pixel_offset_y;  // Pass to fragment shader for clipping check
     vec2 tex_coord;
 } out_data;
 
+struct CellBgData {
+    uint color;
+    int offset_y_fixed;
+};
+
 layout(binding = 1, std430) readonly buffer bg_cells {
-    uint bg_colors[];
+    CellBgData cells[];
 };
 
 void main() {
@@ -124,12 +130,15 @@ void main() {
     // be sampled with pixel coordinate mode.
     out_data.tex_coord = vec2(glyph_pos) + vec2(glyph_size) * corner;
 
+    // Pass the pixel offset to fragment shader for clipping check
+    out_data.pixel_offset_y = pixel_offset_y_fixed;
+
     // Get our color. We always fetch a linearized version to
     // make it easier to handle minimum contrast calculations.
     out_data.color = load_color(color, true);
     // Get the BG color
     out_data.bg_color = load_color(
-            unpack4u8(bg_colors[grid_pos.y * grid_size.x + grid_pos.x]),
+            unpack4u8(cells[grid_pos.y * grid_size.x + grid_pos.x].color),
             true
         );
     // Blend it with the global bg color

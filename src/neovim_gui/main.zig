@@ -243,11 +243,11 @@ pub const NeovimGui = struct {
     }
 
     /// Spawn Neovim in embedded mode (direct pipe communication)
-    pub fn spawn(self: *Self) !void {
-        log.info("Spawning embedded Neovim", .{});
+    pub fn spawn(self: *Self, cwd: ?[]const u8) !void {
+        log.info("Spawning embedded Neovim (cwd: {?s})", .{cwd});
 
         // Create I/O thread for embedded mode
-        self.io = try IoThread.initEmbedded(self.alloc, &self.event_queue);
+        self.io = try IoThread.initEmbedded(self.alloc, &self.event_queue, cwd);
         errdefer {
             self.io.?.deinit();
             self.io = null;
@@ -276,8 +276,8 @@ pub const NeovimGui = struct {
     /// Spawn Neovim with a socket and connect to it
     /// This is the recommended mode - spawns nvim with --listen and connects via socket
     /// Benefits: Full user config loaded, clean separation, can attach other clients
-    pub fn spawnWithSocket(self: *Self) !void {
-        log.info("Spawning Neovim with socket", .{});
+    pub fn spawnWithSocket(self: *Self, cwd: ?[]const u8) !void {
+        log.info("Spawning Neovim with socket (cwd: {?s})", .{cwd});
 
         // Generate a unique socket path using timestamp and random
         const timestamp = std.time.timestamp();
@@ -307,6 +307,7 @@ pub const NeovimGui = struct {
         child.stdin_behavior = .Ignore;
         child.stdout_behavior = .Ignore;
         child.stderr_behavior = .Ignore;
+        child.cwd = cwd;
         try child.spawn();
 
         // Wait for socket to be available (Neovim needs time to start)
@@ -375,6 +376,12 @@ pub const NeovimGui = struct {
             },
             .grid_line => |data| {
                 self.handleGridLine(data.grid, data.row, data.col_start, data.cells);
+                // Force all windows to be marked dirty to trigger full redraw
+                // This ensures floating windows render properly on first open
+                var it = self.windows.valueIterator();
+                while (it.next()) |window_ptr| {
+                    window_ptr.*.dirty = true;
+                }
             },
             .grid_scroll => |data| {
                 self.handleGridScroll(data);
@@ -410,6 +417,7 @@ pub const NeovimGui = struct {
                 }
             },
             .win_close => |grid| {
+                log.err("win_close: grid={}", .{grid});
                 if (self.windows.fetchRemove(grid)) |kv| {
                     kv.value.deinit();
                     self.alloc.destroy(kv.value);
@@ -417,6 +425,7 @@ pub const NeovimGui = struct {
             },
             .grid_destroy => |grid| {
                 // grid_destroy: grid will not be used anymore, remove it
+                log.err("grid_destroy: grid={}", .{grid});
                 if (self.windows.fetchRemove(grid)) |kv| {
                     kv.value.deinit();
                     self.alloc.destroy(kv.value);
@@ -716,17 +725,93 @@ pub const NeovimGui = struct {
     }
 
     fn handleGridResize(self: *Self, grid: u64, width: u64, height: u64) !void {
-        log.info("handleGridResize START: grid={} {}x{}", .{ grid, width, height });
+        const is_new = self.windows.get(grid) == null;
+        log.err("grid_resize: grid={} {}x{} is_new={}", .{ grid, width, height, is_new });
 
         const window = try self.getOrCreateWindow(grid);
         log.info("handleGridResize: got window grid={} old_size={}x{}", .{ grid, window.grid_width, window.grid_height });
         try window.resize(@intCast(width), @intCast(height));
+
+        // If there's a pending anchor (win_float_pos arrived before grid_resize),
+        // recalculate position now that we have the correct dimensions
+        if (window.pending_anchor) |pending| {
+            log.info("handleGridResize: recalculating pending anchor for grid={}", .{grid});
+
+            // Get parent window position (anchor grid)
+            const parent_pos: [2]f32 = if (self.windows.get(pending.anchor_grid)) |parent|
+                parent.grid_position
+            else
+                .{ 0, 0 };
+
+            // Calculate position based on anchor type (like Neovide's modified_top_left)
+            const width_f: f32 = @floatFromInt(window.grid_width);
+            const height_f: f32 = @floatFromInt(window.grid_height);
+
+            var left: f32 = pending.anchor_col;
+            var top: f32 = pending.anchor_row;
+
+            // Adjust position based on anchor type
+            switch (pending.anchor) {
+                .NW => {},
+                .NE => {
+                    // top-right corner: window extends left from anchor
+                    left = pending.anchor_col - width_f;
+                },
+                .SW => {
+                    // bottom-left corner: window extends up from anchor
+                    top = pending.anchor_row - height_f;
+                },
+                .SE => {
+                    // bottom-right corner: window extends up and left from anchor
+                    left = pending.anchor_col - width_f;
+                    top = pending.anchor_row - height_f;
+                },
+            }
+
+            // Add parent position offset
+            left += parent_pos[0];
+            top += parent_pos[1];
+
+            // Clamp to valid range
+            left = @max(0, left);
+            top = @max(0, top);
+
+            const start_row: u64 = @intFromFloat(top);
+            const start_col: u64 = @intFromFloat(left);
+
+            log.info("handleGridResize: anchor recalc - anchor={s} parent_pos=({d:.1},{d:.1}) size={}x{} -> pos=({},{}))", .{
+                @tagName(pending.anchor),
+                parent_pos[0],
+                parent_pos[1],
+                window.grid_width,
+                window.grid_height,
+                start_col,
+                start_row,
+            });
+
+            window.setFloatPosition(start_row, start_col, pending.zindex);
+            window.window_type = .floating;
+
+            // Clear pending anchor - we've processed it
+            window.pending_anchor = null;
+        }
+
         self.dirty = true;
         log.info("handleGridResize DONE: grid={} new_size={}x{}", .{ grid, window.grid_width, window.grid_height });
     }
 
     fn handleGridLine(self: *Self, grid: u64, row: u64, col_start: u64, cells: []const Event.Cell) void {
-        const window = self.windows.get(grid) orelse return;
+        const window = self.windows.get(grid) orelse {
+            log.err("grid_line: DROPPED - window not found for grid={} row={}", .{ grid, row });
+            return;
+        };
+
+        // Debug: log grid_line for high grid IDs (likely Telescope floats) to track content updates
+        if (grid >= 5 and row == 0 and cells.len > 0) {
+            log.err("grid_line: grid={} row={} col_start={} cells={} text='{s}' type={s}", .{
+                grid, row, col_start, cells.len, cells[0].text, @tagName(window.window_type),
+            });
+        }
 
         // Convert Event.Cell to the format expected by RenderedWindow
         var col = col_start;
@@ -779,6 +864,8 @@ pub const NeovimGui = struct {
 
         // Calculate position based on anchor type (like Neovide's modified_top_left)
         // The anchor position is relative to the anchor grid
+        // Note: If grid_resize hasn't arrived yet, width/height will be 0, but we still
+        // store the anchor info so position can be recalculated when resize arrives
         const width_f: f32 = @floatFromInt(window.grid_width);
         const height_f: f32 = @floatFromInt(window.grid_height);
 
@@ -814,6 +901,22 @@ pub const NeovimGui = struct {
         const start_row: u64 = @intFromFloat(top);
         const start_col: u64 = @intFromFloat(left);
 
+        // Store the anchor info for recalculation on resize ONLY if dimensions are currently 0
+        // (meaning grid_resize hasn't arrived yet). This is the case where position is wrong.
+        if (window.grid_width == 0 or window.grid_height == 0) {
+            window.pending_anchor = .{
+                .anchor = data.anchor,
+                .anchor_grid = data.anchor_grid,
+                .anchor_row = data.anchor_row,
+                .anchor_col = data.anchor_col,
+                .zindex = data.zindex,
+            };
+            log.info("handleWinFloatPos: grid={} has no size yet, storing pending_anchor", .{data.grid});
+        } else {
+            // Dimensions are known, clear any pending anchor
+            window.pending_anchor = null;
+        }
+
         window.setFloatPosition(start_row, start_col, data.zindex);
         window.window_type = .floating;
         self.dirty = true;
@@ -821,23 +924,34 @@ pub const NeovimGui = struct {
 
     fn handleWinViewport(self: *Self, data: Event.WinViewport) void {
         const window = self.windows.get(data.grid) orelse return;
+        // Log large scroll deltas that might indicate file navigation
+        if (data.scroll_delta != 0) {
+            log.err("win_viewport: grid={} topline={} botline={} scroll_delta={}", .{
+                data.grid, data.topline, data.botline, data.scroll_delta,
+            });
+        }
         window.setViewport(data.topline, data.botline, data.scroll_delta);
     }
 
     fn handleWinViewportMargins(self: *Self, data: Event.WinViewportMargins) void {
         const window = self.windows.get(data.grid) orelse return;
+        const old_top = window.viewport_margins.top;
+        const old_bottom = window.viewport_margins.bottom;
         window.viewport_margins = .{
             .top = @intCast(data.top),
             .bottom = @intCast(data.bottom),
             .left = @intCast(data.left),
             .right = @intCast(data.right),
         };
-        log.info("win_viewport_margins: grid={} top={} bottom={} left={} right={}", .{
+        log.err("win_viewport_margins: grid={} top={}->{} bottom={}->{} left={} right={} type={s}", .{
             data.grid,
+            old_top,
             data.top,
+            old_bottom,
             data.bottom,
             data.left,
             data.right,
+            @tagName(window.window_type),
         });
         self.dirty = true;
     }
@@ -1000,16 +1114,124 @@ pub const NeovimGui = struct {
         }
     }
 
-    /// Send mouse input to Neovim
-    pub fn sendMouse(self: *Self, button: []const u8, action: []const u8, modifier: []const u8, grid: u64, row: i32, col: i32) !void {
-        _ = self;
-        _ = button;
-        _ = action;
-        _ = modifier;
-        _ = grid;
-        _ = row;
-        _ = col;
-        // TODO: Implement mouse input
+    /// Send mouse input to Neovim using nvim_input_mouse API
+    /// This targets a specific grid (window) by ID and position
+    pub fn sendMouse(self: *Self, button: []const u8, action: []const u8, modifier: []const u8, grid: u64, row: u64, col: u64) !void {
+        if (self.io == null or !self.ready) return;
+        try self.io.?.sendInputMouse(button, action, modifier, grid, row, col);
+    }
+
+    /// Send scroll event to Neovim targeting a specific window
+    /// This is the Neovide-style scroll handling that properly targets the window under cursor
+    /// direction: "up" or "down"
+    /// grid_id: the ID of the window/grid to scroll
+    /// col, row: position within the grid in cells
+    pub fn sendScroll(self: *Self, direction: []const u8, grid_id: u64, col: u64, row: u64) !void {
+        if (self.io == null or !self.ready) return;
+        // nvim_input_mouse("wheel", direction, modifier, grid, row, col)
+        try self.io.?.sendInputMouse("wheel", direction, "", grid_id, row, col);
+    }
+
+    /// Find the window (grid) under the given screen position (in cells)
+    /// Returns the grid_id and the position within that grid
+    /// Checks floating windows first (highest zindex), then normal windows
+    pub fn findWindowAtPosition(self: *Self, screen_col: f32, screen_row: f32) ?struct { grid_id: u64, col: u64, row: u64 } {
+        // Collect all visible windows and sort by zindex (highest first for floating windows)
+        var floating_windows: [32]struct { grid: u64, window: *RenderedWindow } = undefined;
+        var floating_count: usize = 0;
+
+        var normal_windows: [32]struct { grid: u64, window: *RenderedWindow } = undefined;
+        var normal_count: usize = 0;
+
+        var it = self.windows.iterator();
+        while (it.next()) |entry| {
+            const window = entry.value_ptr.*;
+            if (window.hidden) continue;
+            if (!window.has_position and window.id != 1) continue;
+
+            if (window.window_type == .floating or window.window_type == .message) {
+                if (floating_count < 32) {
+                    floating_windows[floating_count] = .{ .grid = entry.key_ptr.*, .window = window };
+                    floating_count += 1;
+                }
+            } else {
+                if (normal_count < 32) {
+                    normal_windows[normal_count] = .{ .grid = entry.key_ptr.*, .window = window };
+                    normal_count += 1;
+                }
+            }
+        }
+
+        // Sort floating windows by zindex (highest first)
+        const FloatingEntry = @TypeOf(floating_windows[0]);
+        const sortFn = struct {
+            fn lessThan(_: void, a: FloatingEntry, b: FloatingEntry) bool {
+                return a.window.zindex > b.window.zindex;
+            }
+        }.lessThan;
+        std.mem.sort(FloatingEntry, floating_windows[0..floating_count], {}, sortFn);
+
+        // Check floating windows first (they're on top)
+        for (floating_windows[0..floating_count]) |entry| {
+            const window = entry.window;
+            const pos = window.grid_position;
+            // For floating windows, use grid dimensions if display dimensions not set
+            // This happens when win_float_pos arrives before win_pos (which sets display_width/height)
+            // setFloatPosition() doesn't set display dimensions, so we fall back to grid dimensions
+            const width: f32 = if (window.display_width > 0)
+                @floatFromInt(window.display_width)
+            else
+                @floatFromInt(window.grid_width);
+            const height: f32 = if (window.display_height > 0)
+                @floatFromInt(window.display_height)
+            else
+                @floatFromInt(window.grid_height);
+
+            // Skip windows with no size yet (grid_resize hasn't arrived)
+            if (width == 0 or height == 0) continue;
+
+            if (screen_col >= pos[0] and screen_col < pos[0] + width and
+                screen_row >= pos[1] and screen_row < pos[1] + height)
+            {
+                const local_col: u64 = @intFromFloat(screen_col - pos[0]);
+                const local_row: u64 = @intFromFloat(screen_row - pos[1]);
+                return .{ .grid_id = entry.grid, .col = local_col, .row = local_row };
+            }
+        }
+
+        // Check normal windows
+        for (normal_windows[0..normal_count]) |entry| {
+            const window = entry.window;
+
+            // Grid 1 is the outer container - use full grid dimensions
+            const pos = if (entry.grid == 1) [2]f32{ 0, 0 } else window.grid_position;
+            // Use display dimensions if set, otherwise fall back to grid dimensions
+            const width: f32 = if (entry.grid == 1)
+                @floatFromInt(self.grid_width)
+            else if (window.display_width > 0)
+                @floatFromInt(window.display_width)
+            else
+                @floatFromInt(window.grid_width);
+            const height: f32 = if (entry.grid == 1)
+                @floatFromInt(self.grid_height)
+            else if (window.display_height > 0)
+                @floatFromInt(window.display_height)
+            else
+                @floatFromInt(window.grid_height);
+
+            // Skip windows with no size yet
+            if (width == 0 or height == 0) continue;
+
+            if (screen_col >= pos[0] and screen_col < pos[0] + width and
+                screen_row >= pos[1] and screen_row < pos[1] + height)
+            {
+                const local_col: u64 = @intFromFloat(screen_col - pos[0]);
+                const local_row: u64 = @intFromFloat(screen_row - pos[1]);
+                return .{ .grid_id = entry.grid, .col = local_col, .row = local_row };
+            }
+        }
+
+        return null;
     }
 
     /// Check if dirty and needs redraw

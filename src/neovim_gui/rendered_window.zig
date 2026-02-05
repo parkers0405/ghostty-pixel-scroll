@@ -17,6 +17,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Animation = @import("animation.zig");
+const io_thread = @import("io_thread.zig");
 
 const log = std.log.scoped(.rendered_window);
 
@@ -221,6 +222,16 @@ pub const AnchorInfo = struct {
     z_index: u64,
 };
 
+/// Pending anchor info for recalculating position after resize
+pub const PendingAnchor = struct {
+    /// Use the same Anchor type as the event to avoid conversion
+    anchor: io_thread.Event.WinFloatPos.Anchor,
+    anchor_grid: u64,
+    anchor_row: f32,
+    anchor_col: f32,
+    zindex: u64,
+};
+
 /// Viewport margins - fixed rows/cols that don't scroll (winbar, borders, etc.)
 pub const ViewportMargins = struct {
     top: u32 = 0,
@@ -288,6 +299,10 @@ pub const RenderedWindow = struct {
 
     /// Anchor info - if not null, this is a floating window
     anchor_info: ?AnchorInfo = null,
+
+    /// Pending anchor info - stored when win_float_pos arrives before grid_resize
+    /// Used to recalculate position when resize happens
+    pending_anchor: ?PendingAnchor = null,
 
     /// The actual lines - current viewport content from Neovim
     /// This is what Neovim sees - rotated by grid_scroll

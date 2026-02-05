@@ -912,14 +912,17 @@ pub fn initNeovimGui(self: *Surface) !void {
     nvim.cell_width = @floatFromInt(self.size.cell.width);
     nvim.cell_height = @floatFromInt(self.size.cell.height);
 
+    // Get the current working directory from the terminal
+    const terminal_cwd = self.io.terminal.getPwd();
+
     // Connect based on mode:
     // - "embed" - spawn nvim --embed (direct pipe communication, loads user config)
     // - "spawn" - spawn nvim --listen on temp socket then connect (best experience)
     // - any path - connect to existing Neovim socket
     if (std.mem.eql(u8, socket_path, "embed")) {
-        try nvim.spawn();
+        try nvim.spawn(terminal_cwd);
     } else if (std.mem.eql(u8, socket_path, "spawn")) {
-        try nvim.spawnWithSocket();
+        try nvim.spawnWithSocket(terminal_cwd);
     } else {
         try nvim.connect(socket_path);
     }
@@ -3597,31 +3600,47 @@ pub fn scrollCallback(
     // Always show the mouse again if it is hidden
     if (self.mouse.hidden) self.showMouse();
 
-    // In Neovim GUI mode, send scroll events to Neovim
+    // In Neovim GUI mode, send scroll events to Neovim using nvim_input_mouse
+    // This properly targets the window under the cursor (like Neovide)
     if (self.nvim_gui) |nvim| {
         if (yoff != 0) {
             // Get cursor position for scroll event
             const pos = try self.rt_surface.getCursorPos();
             const cell_w: f64 = @floatFromInt(self.size.cell.width);
             const cell_h: f64 = @floatFromInt(self.size.cell.height);
-            const col: i32 = @intFromFloat(@max(0, pos.x) / cell_w);
-            const row: i32 = @intFromFloat(@max(0, pos.y) / cell_h);
+            const screen_col: f32 = @floatCast(@max(0, pos.x) / cell_w);
+            const screen_row: f32 = @floatCast(@max(0, pos.y) / cell_h);
+
+            // Find the window under the cursor and get local grid position
+            const window_info = nvim.findWindowAtPosition(screen_col, screen_row);
 
             // Accumulate scroll for smoother mouse wheel handling
             self.mouse.pending_scroll_y += yoff;
 
-            // Send scroll events to Neovim (wheel ticks)
+            // Send scroll events to Neovim using nvim_input_mouse API
+            // This targets the specific grid (window) under the cursor
             // Note: yoff positive = scroll up in Neovim's convention
-            // Natural scroll inverts this at the OS level, so we just pass through
             while (self.mouse.pending_scroll_y >= 1.0) {
                 self.mouse.pending_scroll_y -= 1.0;
-                nvim.sendKey("<ScrollWheelUp>") catch {};
-                _ = row;
-                _ = col;
+                if (window_info) |info| {
+                    nvim.sendScroll("up", info.grid_id, info.col, info.row) catch {};
+                } else {
+                    // Fallback to grid 1 if no window found
+                    const col: u64 = @intFromFloat(screen_col);
+                    const row: u64 = @intFromFloat(screen_row);
+                    nvim.sendScroll("up", 1, col, row) catch {};
+                }
             }
             while (self.mouse.pending_scroll_y <= -1.0) {
                 self.mouse.pending_scroll_y += 1.0;
-                nvim.sendKey("<ScrollWheelDown>") catch {};
+                if (window_info) |info| {
+                    nvim.sendScroll("down", info.grid_id, info.col, info.row) catch {};
+                } else {
+                    // Fallback to grid 1 if no window found
+                    const col: u64 = @intFromFloat(screen_col);
+                    const row: u64 = @intFromFloat(screen_row);
+                    nvim.sendScroll("down", 1, col, row) catch {};
+                }
             }
         }
         try self.queueRender();
@@ -3633,7 +3652,11 @@ pub fn scrollCallback(
 
     // Track if we should use pixel scrolling. Only enabled for precision devices
     // (touchpads) when the config option is on and we're not in mouse reporting mode.
-    const use_pixel_scroll = self.config.pixel_scroll and scroll_mods.precision;
+    // When mouse reporting is active (TUI apps), we need line-based scroll events.
+    const mouse_reporting_active = self.config.mouse_reporting and
+        self.io.terminal.flags.mouse_event != .none;
+    const use_pixel_scroll = self.config.pixel_scroll and scroll_mods.precision and
+        !mouse_reporting_active;
 
     const y: ScrollAmount = if (yoff == 0) .{} else y: {
         // If we have precision scroll, yoff is the number of pixels to scroll. In non-precision
@@ -3765,19 +3788,21 @@ pub fn scrollCallback(
 
         // If we're scrolling up or down, then send a mouse event.
         if (self.isMouseReporting()) {
+            // Invert for TUI apps: the mouse protocol button 4/5 convention
+            // is opposite to what natural scroll produces, so we swap them.
             for (0..@abs(y.delta)) |_| {
                 const pos = try self.rt_surface.getCursorPos();
                 try self.mouseReport(switch (y.direction()) {
-                    .up_right => .four,
-                    .down_left => .five,
+                    .up_right => .five,
+                    .down_left => .four,
                 }, .press, self.mouse.mods, pos);
             }
 
             for (0..@abs(x.delta)) |_| {
                 const pos = try self.rt_surface.getCursorPos();
                 try self.mouseReport(switch (x.direction()) {
-                    .up_right => .six,
-                    .down_left => .seven,
+                    .up_right => .seven,
+                    .down_left => .six,
                 }, .press, self.mouse.mods, pos);
             }
 
@@ -4201,6 +4226,94 @@ pub fn mouseButtonCallback(
 
     // Update our modifiers if they changed
     self.modsChanged(mods);
+
+    // In Neovim GUI mode, send mouse button events to Neovim via nvim_input_mouse API
+    if (self.nvim_gui) |nvim| {
+        // Check if mouse is enabled in Neovim
+        if (!nvim.mouse_enabled) return false;
+
+        // Convert Ghostty button to Neovim button string
+        const nvim_button = neovim_gui.nvim_input.toNeovimMouseButton(button) orelse return false;
+
+        // Get cursor position
+        const pos = try self.rt_surface.getCursorPos();
+
+        // Track multi-clicks for double/triple click support (left button only)
+        var click_count: u8 = 1;
+        if (button == .left and action == .press) {
+            // If we move our cursor too much between clicks then we reset
+            // the multi-click state.
+            if (self.mouse.left_click_count > 0) {
+                const max_distance: f64 = @floatFromInt(self.size.cell.width);
+                const distance = @sqrt(
+                    std.math.pow(f64, pos.x - self.mouse.left_click_xpos, 2) +
+                        std.math.pow(f64, pos.y - self.mouse.left_click_ypos, 2),
+                );
+                if (distance > max_distance) self.mouse.left_click_count = 0;
+            }
+
+            // Setup our click counter and timer
+            if (std.time.Instant.now()) |now| {
+                if (self.mouse.left_click_count > 0) {
+                    const since = now.since(self.mouse.left_click_time);
+                    if (since > self.config.mouse_interval) {
+                        self.mouse.left_click_count = 0;
+                    }
+                }
+                self.mouse.left_click_time = now;
+                self.mouse.left_click_count += 1;
+                if (self.mouse.left_click_count > 3) self.mouse.left_click_count = 1;
+            } else |_| {
+                self.mouse.left_click_count = 1;
+            }
+
+            // Store click position for tracking distance
+            self.mouse.left_click_xpos = pos.x;
+            self.mouse.left_click_ypos = pos.y;
+
+            click_count = self.mouse.left_click_count;
+        }
+
+        // Convert action to Neovim action string
+        const nvim_action = switch (action) {
+            .press => neovim_gui.nvim_input.toNeovimMouseAction(true, click_count),
+            .release => neovim_gui.nvim_input.toNeovimMouseAction(false, 0),
+        };
+
+        // Convert modifiers to Neovim modifier string
+        const nvim_mods = neovim_gui.nvim_input.toNeovimMouseMods(mods);
+
+        // Convert position to grid coordinates
+        const cell_w: f64 = @floatFromInt(self.size.cell.width);
+        const cell_h: f64 = @floatFromInt(self.size.cell.height);
+        const screen_col: f32 = @floatCast(@max(0, pos.x) / cell_w);
+        const screen_row: f32 = @floatCast(@max(0, pos.y) / cell_h);
+
+        // Find the window under the cursor and get grid-local coordinates
+        if (nvim.findWindowAtPosition(screen_col, screen_row)) |window_info| {
+            try nvim.sendMouse(
+                nvim_button,
+                nvim_action,
+                nvim_mods,
+                window_info.grid_id,
+                window_info.row,
+                window_info.col,
+            );
+        } else {
+            // No window found, send to grid 0 with screen coordinates
+            try nvim.sendMouse(
+                nvim_button,
+                nvim_action,
+                nvim_mods,
+                0,
+                @intFromFloat(screen_row),
+                @intFromFloat(screen_col),
+            );
+        }
+
+        try self.queueRender();
+        return true;
+    }
 
     // This is set to true if the terminal is allowed to capture the shift
     // modifier. Note we can do this more efficiently probably with less

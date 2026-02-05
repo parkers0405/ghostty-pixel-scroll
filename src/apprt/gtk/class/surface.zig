@@ -2911,12 +2911,10 @@ pub const Surface = extern struct {
 
         const scaled = self.scaledCoordinates(x, y);
         surface.scrollCallback(
-            // We invert because we apply natural scrolling to the values.
-            // This behavior has existed for years without Linux users complaining
-            // but I suspect we'll have to make this configurable in the future
-            // or read a system setting.
-            scaled.x * -1 * multiplier,
-            scaled.y * -1 * multiplier,
+            // Pass through without inversion - the system's natural scrolling
+            // setting (via libinput/compositor) is already applied to these values.
+            scaled.x * multiplier,
+            scaled.y * multiplier,
             scroll_mods,
         ) catch |err| {
             log.warn("error in scroll callback err={}", .{err});

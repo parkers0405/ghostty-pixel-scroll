@@ -612,6 +612,9 @@ pub const IoThread = struct {
     stdin_file: ?std.fs.File = null,
     stdout_file: ?std.fs.File = null,
 
+    // Working directory for spawning Neovim
+    cwd: ?[]const u8 = null,
+
     // Read buffer for msgpack parsing
     read_buffer: std.ArrayListUnmanaged(u8) = .empty,
 
@@ -651,12 +654,13 @@ pub const IoThread = struct {
     }
 
     /// Initialize for embedded Neovim
-    pub fn initEmbedded(alloc: Allocator, event_queue: *EventQueue) !*Self {
+    pub fn initEmbedded(alloc: Allocator, event_queue: *EventQueue, cwd: ?[]const u8) !*Self {
         const self = try alloc.create(Self);
         self.* = .{
             .alloc = alloc,
             .mode = .embedded,
             .event_queue = event_queue,
+            .cwd = if (cwd) |c| try alloc.dupe(u8, c) else null,
         };
         return self;
     }
@@ -691,6 +695,11 @@ pub const IoThread = struct {
             },
         }
 
+        // Free cwd if allocated
+        if (self.cwd) |c| {
+            self.alloc.free(c);
+        }
+
         // Free write queue
         self.write_mutex.lock();
         for (self.write_queue.items) |msg| {
@@ -723,7 +732,7 @@ pub const IoThread = struct {
                 log.info("Connected to Neovim (non-blocking)", .{});
             },
             .embedded => {
-                log.info("Spawning embedded Neovim with user config", .{});
+                log.info("Spawning embedded Neovim with user config (cwd: {?s})", .{self.cwd});
 
                 // Spawn nvim --headless --embed
                 // Note: --embed mode still loads user config (init.lua/init.vim)
@@ -732,6 +741,7 @@ pub const IoThread = struct {
                 child.stdin_behavior = .Pipe;
                 child.stdout_behavior = .Pipe;
                 child.stderr_behavior = .Inherit;
+                child.cwd = self.cwd;
 
                 try child.spawn();
 
@@ -904,6 +914,43 @@ pub const IoThread = struct {
         };
 
         return try encoder.encodeNotification(self.alloc, notification);
+    }
+
+    /// Send nvim_input_mouse for mouse events with grid targeting (like Neovide)
+    /// This allows scroll events to target specific windows by grid ID and position
+    pub fn sendInputMouse(
+        self: *Self,
+        button: []const u8,
+        action: []const u8,
+        modifier: []const u8,
+        grid: u64,
+        row: u64,
+        col: u64,
+    ) !void {
+        // nvim_input_mouse(button, action, modifier, grid, row, col)
+        const button_val = try msgpack.string(self.alloc, button);
+        const action_val = try msgpack.string(self.alloc, action);
+        const modifier_val = try msgpack.string(self.alloc, modifier);
+
+        const params = try msgpack.array(self.alloc, .{
+            button_val,
+            action_val,
+            modifier_val,
+            grid,
+            row,
+            col,
+        });
+        defer params.free(self.alloc);
+
+        const notification = protocol.message.Notification{
+            .method = "nvim_input_mouse",
+            .params = params,
+        };
+
+        const encoded = try encoder.encodeNotification(self.alloc, notification);
+        defer self.alloc.free(encoded);
+
+        try self.writeData(encoded);
     }
 
     fn ioThreadMain(self: *Self) void {
@@ -1145,52 +1192,83 @@ pub const IoThread = struct {
                 } });
             }
         } else if (std.mem.eql(u8, name, "win_float_pos")) {
-            // win_float_pos: [grid, win, anchor, anchor_grid, anchor_row, anchor_col, focusable, zindex]
+            // win_float_pos: [grid, win, anchor, anchor_grid, anchor_row, anchor_col, focusable, zindex, compindex, screen_row, screen_col]
+            // Newer Neovim versions provide screen_row and screen_col which are the final calculated positions
             if (args.len >= 8) {
                 const grid = extractU64(args[0]) orelse {
                     log.err("win_float_pos: failed to extract grid from args[0]", .{});
                     return;
                 };
-                // Log what type args[1] actually is
-                log.info("win_float_pos: args[1] type = {}", .{@as(@TypeOf(args[1]), args[1])});
                 // Window handle is often an ext type (window handle) that we can't easily parse
-                // Many UIs (including Neovide) ignore it and just use the grid ID
-                // The grid ID is the important identifier for rendering
                 const win = extractU64(args[1]) orelse grid;
-                const anchor_grid = extractU64(args[3]) orelse {
-                    log.err("win_float_pos: failed to extract anchor_grid from args[3], grid={}", .{grid});
-                    return;
-                };
-                const anchor_row = extractF32(args[4]) orelse 0;
-                const anchor_col = extractF32(args[5]) orelse 0;
                 const zindex = extractU64(args[7]) orelse 50;
-                log.info("win_float_pos: grid={} win={} anchor_grid={} row={d:.1} col={d:.1} zindex={}", .{ grid, win, anchor_grid, anchor_row, anchor_col, zindex });
 
-                const anchor_str = switch (args[2]) {
-                    .str => |s| s.value(),
-                    else => "NW",
-                };
-                const anchor: Event.WinFloatPos.Anchor = if (std.mem.eql(u8, anchor_str, "NE"))
-                    .NE
-                else if (std.mem.eql(u8, anchor_str, "SW"))
-                    .SW
-                else if (std.mem.eql(u8, anchor_str, "SE"))
-                    .SE
-                else
-                    .NW;
+                // Try to use screen_row/screen_col if available (args[9] and args[10])
+                // These are the pre-calculated screen positions from Neovim
+                var use_screen_pos = false;
+                var screen_row: f32 = 0;
+                var screen_col: f32 = 0;
 
-                log.info("win_float_pos: PUSHING EVENT TO QUEUE grid={} anchor={s}", .{ grid, anchor_str });
-                try self.event_queue.push(.{ .win_float_pos = .{
-                    .grid = grid,
-                    .win = win,
-                    .anchor = anchor,
-                    .anchor_grid = anchor_grid,
-                    .anchor_row = anchor_row,
-                    .anchor_col = anchor_col,
-                    .focusable = extractBool(args[6]),
-                    .zindex = zindex,
-                } });
-                log.info("win_float_pos: EVENT PUSHED SUCCESSFULLY grid={}", .{grid});
+                if (args.len >= 11) {
+                    if (extractF32(args[9])) |sr| {
+                        if (extractF32(args[10])) |sc| {
+                            screen_row = sr;
+                            screen_col = sc;
+                            use_screen_pos = true;
+                            log.info("win_float_pos: grid={} using screen_pos=({d:.1},{d:.1}) zindex={}", .{ grid, screen_col, screen_row, zindex });
+                        }
+                    }
+                }
+
+                if (use_screen_pos) {
+                    // Use the pre-calculated screen position from Neovim
+                    // This is simpler and more reliable than calculating from anchor
+                    try self.event_queue.push(.{
+                        .win_float_pos = .{
+                            .grid = grid,
+                            .win = win,
+                            .anchor = .NW, // Position is absolute, so anchor doesn't matter
+                            .anchor_grid = 1, // Relative to main grid
+                            .anchor_row = screen_row,
+                            .anchor_col = screen_col,
+                            .focusable = extractBool(args[6]),
+                            .zindex = zindex,
+                        },
+                    });
+                } else {
+                    // Fall back to anchor-based positioning for older Neovim versions
+                    const anchor_grid = extractU64(args[3]) orelse {
+                        log.err("win_float_pos: failed to extract anchor_grid from args[3], grid={}", .{grid});
+                        return;
+                    };
+                    const anchor_row = extractF32(args[4]) orelse 0;
+                    const anchor_col = extractF32(args[5]) orelse 0;
+
+                    const anchor_str = switch (args[2]) {
+                        .str => |s| s.value(),
+                        else => "NW",
+                    };
+                    const anchor: Event.WinFloatPos.Anchor = if (std.mem.eql(u8, anchor_str, "NE"))
+                        .NE
+                    else if (std.mem.eql(u8, anchor_str, "SW"))
+                        .SW
+                    else if (std.mem.eql(u8, anchor_str, "SE"))
+                        .SE
+                    else
+                        .NW;
+
+                    log.info("win_float_pos: grid={} anchor={s} anchor_grid={} row={d:.1} col={d:.1} zindex={}", .{ grid, anchor_str, anchor_grid, anchor_row, anchor_col, zindex });
+                    try self.event_queue.push(.{ .win_float_pos = .{
+                        .grid = grid,
+                        .win = win,
+                        .anchor = anchor,
+                        .anchor_grid = anchor_grid,
+                        .anchor_row = anchor_row,
+                        .anchor_col = anchor_col,
+                        .focusable = extractBool(args[6]),
+                        .zindex = zindex,
+                    } });
+                }
             } else {
                 log.err("win_float_pos: args.len={} < 8, skipping", .{args.len});
             }
@@ -1470,7 +1548,16 @@ pub const IoThread = struct {
         else if (std.mem.eql(u8, name, "tabline_update")) {
             try self.handleTablineUpdate(args);
         }
-        // Silently ignore other events
+        // Log unhandled events to catch any we're missing
+        else {
+            // Only log events that might be relevant (skip very common ones)
+            if (!std.mem.eql(u8, name, "chdir") and
+                !std.mem.eql(u8, name, "busy_start") and
+                !std.mem.eql(u8, name, "busy_stop"))
+            {
+                log.debug("Unhandled event: '{s}' with {} args", .{ name, args.len });
+            }
+        }
     }
 
     fn handleGridLine(self: *Self, args: []const Payload) !void {

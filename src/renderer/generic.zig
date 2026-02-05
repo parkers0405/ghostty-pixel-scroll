@@ -1594,6 +1594,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Each window has its own scroll animation handled via per-cell offsets
             self.uniforms.pixel_scroll_offset_y = 0;
 
+            // Force cells_rebuilt if Neovim has changes
+            // This ensures we render when floating windows appear/disappear
+            // Keep dirty flag set to ensure continuous rendering until content stabilizes
+            if (nvim.dirty) {
+                self.cells_rebuilt = true;
+            }
+
             try self.rebuildCellsFromNeovim(nvim);
 
             const bg = nvim.default_background;
@@ -1683,27 +1690,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     continue;
                 }
 
-                // Allow message/floating windows even if actual_lines is null
-                // They may be populated differently
+                // Determine if this is a floating/message window
                 const is_message_or_float = window.zindex > 0 or window.window_type == .floating or window.window_type == .message;
-                if (window.actual_lines == null and !is_message_or_float) continue;
 
-                // Skip newly created floating windows that have no content yet
-                // This prevents black rectangles appearing before content loads (e.g., nvim-tree opening)
-                if (is_message_or_float and window.actual_lines != null) {
-                    const has_content = blk: {
-                        const actual = &window.actual_lines.?;
-                        var y: u32 = 0;
-                        while (y < window.grid_height) : (y += 1) {
-                            if (actual.getConst(@intCast(y))) |line| {
-                                for (line.cells) |cell| {
-                                    if (cell.text_len > 0) break :blk true;
-                                }
-                            }
-                        }
-                        break :blk false;
-                    };
-                    if (!has_content) continue;
+                // Skip windows that have no content buffer (actual_lines not initialized)
+                // This happens when win_float_pos arrives before grid_resize
+                // Previously we allowed floating windows through, but they render empty without actual_lines
+                if (window.actual_lines == null) continue;
+
+                // Skip windows that have no size yet (grid_resize hasn't arrived or set 0 size)
+                // This prevents rendering 0x0 windows
+                if (window.grid_width == 0 or window.grid_height == 0) {
+                    continue;
                 }
 
                 // Partition: floating windows have zindex > 0 or are explicitly floating/message type
@@ -1744,7 +1742,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 windows_to_render.append(self.alloc, w) catch continue;
             }
 
-            log.debug("rebuildCellsFromNeovim: rendering {} root + {} floating = {} total (skipped {} needs_content)", .{
+            log.err("rebuildCellsFromNeovim: rendering {} root + {} floating = {} total (skipped {} needs_content)", .{
                 root_windows.items.len,
                 floating_windows.items.len,
                 windows_to_render.items.len,
@@ -1752,7 +1750,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             });
             // Debug: log which windows are being rendered
             for (root_windows.items) |w| {
-                log.debug("  root window: grid={} pos=({},{}) size={}x{} display={}x{}", .{
+                log.debug("  root window: grid={} pos=({},{}) size={}x{} display={}x{} margins=({},{},{},{})", .{
                     w.id,
                     @as(i32, @intFromFloat(w.grid_position[0])),
                     @as(i32, @intFromFloat(w.grid_position[1])),
@@ -1760,6 +1758,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     w.grid_height,
                     w.display_width,
                     w.display_height,
+                    w.viewport_margins.top,
+                    w.viewport_margins.bottom,
+                    w.viewport_margins.left,
+                    w.viewport_margins.right,
+                });
+            }
+            for (floating_windows.items) |w| {
+                log.debug("  floating window: grid={} pos=({},{}) size={}x{} zindex={} type={s} has_lines={}", .{
+                    w.id,
+                    @as(i32, @intFromFloat(w.grid_position[0])),
+                    @as(i32, @intFromFloat(w.grid_position[1])),
+                    w.grid_width,
+                    w.grid_height,
+                    w.zindex,
+                    @tagName(w.window_type),
+                    w.actual_lines != null,
                 });
             }
 
@@ -1784,6 +1798,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             @memset(occlusion_map, 0);
 
             // Claim cells from highest z-index to lowest
+            // For text rendering, we need to account for viewport margins
+            // Margins (borders, winbar, statusline) only have backgrounds, not text content
+            // So they shouldn't block text from windows below them
             var i: usize = windows_to_render.items.len;
             while (i > 0) {
                 i -= 1;
@@ -1796,6 +1813,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const render_width = window.getRenderWidth();
                 const render_height = window.getRenderHeight();
 
+                // Get margins for this window to skip border/margin cells in occlusion
+                const margin_top = window.viewport_margins.top;
+                const margin_bottom = window.viewport_margins.bottom;
+
                 var py: u32 = 0;
                 while (py < render_height) : (py += 1) {
                     var px: u32 = 0;
@@ -1804,6 +1825,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         const sx = @as(u16, @intCast(px)) + win_col;
                         if (sy < rows and sx < cols) {
                             if (occlusion_map[sy * cols + sx] == 0) {
+                                // Skip margin rows - they only have backgrounds, no text
+                                // This prevents floating window borders from blocking text below
+                                const is_margin_row = py < margin_top or py >= (render_height -| margin_bottom);
+                                if (is_margin_row) continue;
+
                                 // Message windows only claim cells with actual content
                                 if (is_message) {
                                     const cell = window.getCell(py, px);
@@ -1928,6 +1954,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             if (grid_cell) |cell| {
                                 const text = cell.getText();
                                 if (text.len > 0) self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, 0) catch {};
+                            }
+                        } else if (is_floating and grid_cell != null) {
+                            // Debug: log when floating window text is blocked by occlusion
+                            const text = grid_cell.?.getText();
+                            if (text.len > 0 and text[0] != ' ') {
+                                const blocker = occlusion_map[screen_y * cols + screen_x];
+                                log.err("OCCLUSION BLOCKED: grid={} pos=({},{}) text='{s}' blocked_by_grid={}", .{
+                                    window.id, screen_x, screen_y, text, blocker,
+                                });
                             }
                         }
                     }
@@ -2259,8 +2294,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             pixel_offset_y: f32,
         ) !void {
             // Decode the first codepoint from text
-            var iter = std.unicode.Utf8Iterator{ .bytes = text, .i = 0 };
-            const codepoint = iter.nextCodepoint() orelse return;
+            // Handle invalid UTF-8 gracefully instead of panicking
+            if (text.len == 0) return;
+
+            // Get the byte length of the first UTF-8 sequence
+            const seq_len = std.unicode.utf8ByteSequenceLength(text[0]) catch {
+                // Invalid UTF-8 lead byte - skip this cell
+                return;
+            };
+
+            // Check if we have enough bytes
+            if (text.len < seq_len) return;
+
+            // Decode the codepoint
+            const codepoint = std.unicode.utf8Decode(text[0..seq_len]) catch {
+                // Invalid UTF-8 sequence - skip this cell
+                return;
+            };
 
             // Skip spaces and null
             if (codepoint == ' ' or codepoint == 0) return;
@@ -2514,9 +2564,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // We still need to present the last target again, because the
                 // apprt may be swapping buffers and display an outdated frame
                 // if we don't draw something new.
+                log.err("SKIPPING RENDER: presenting last target (cells_rebuilt={} hasAnim={})", .{
+                    self.cells_rebuilt, self.hasAnimations(),
+                });
                 try self.api.presentLastTarget();
                 return;
             }
+            log.err("RENDERING FRAME: cells_rebuilt={} hasAnim={}", .{
+                self.cells_rebuilt, self.hasAnimations(),
+            });
             self.cells_rebuilt = false;
 
             // Wait for a frame to be available.

@@ -555,7 +555,8 @@ pub const RenderState = struct {
                 row_pins,
                 row_sels,
             ) |pin, *sel_bounds| {
-                const p = s.pages.pointFromPin(.screen, pin).?.screen;
+                // Skip invalid pins (e.g., prev/next rows that don't exist)
+                const p = (s.pages.pointFromPin(.screen, pin) orelse continue).screen;
                 const row_sel = sel.containedRowCached(
                     s,
                     cache.tl_pin,

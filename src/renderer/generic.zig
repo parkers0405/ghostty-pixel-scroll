@@ -1854,10 +1854,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                         // Check if this window owns this cell for TEXT rendering
                         const owns_cell = occlusion_map[screen_y * cols + screen_x] == window.id;
+
+                        // For extra animation row: only draw if we own the cell OR no one owns it (unclaimed)
+                        // This prevents drawing over statusline which is a separate window
                         const is_extra_anim_row = (render_extra_row and inner_row == inner_size);
+                        const cell_unclaimed = occlusion_map[screen_y * cols + screen_x] == 0;
+                        const can_draw_extra = is_extra_anim_row and (owns_cell or cell_unclaimed);
 
                         // For message windows, skip cells we don't own (empty cells)
-                        if (is_message_window and !owns_cell and !is_extra_anim_row) continue;
+                        if (is_message_window and !owns_cell and !can_draw_extra) continue;
+
+                        // Skip extra animation row if another window owns that cell (e.g. statusline)
+                        if (is_extra_anim_row and !owns_cell and !cell_unclaimed) continue;
 
                         // Read from scrollback or actual_lines
                         const grid_cell = if (!is_floating and has_valid_scrollback)
@@ -1921,8 +1929,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             };
                         }
 
-                        // Only render TEXT if this window owns this cell or it's the extra animation row
-                        if (owns_cell or is_extra_anim_row) {
+                        // Only render TEXT if this window owns this cell or can draw extra animation row
+                        if (owns_cell or can_draw_extra) {
                             if (grid_cell) |cell| {
                                 const text = cell.getText();
                                 if (text.len > 0) {

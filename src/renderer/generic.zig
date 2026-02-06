@@ -220,6 +220,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Whether cursor animation is currently active (needs continuous render)
         cursor_animating: bool = false,
 
+        /// Last cursor style for detecting mode changes (insert↔normal) to trigger sonicboom
+        last_cursor_style_for_boom: ?renderer.CursorStyle = null,
+
+        /// Sonicboom VFX state
+        sonicboom_time: f32 = 0, // 0 = inactive, >0 = time since trigger
+        sonicboom_active: bool = false,
+        sonicboom_max_radius: f32 = 60.0, // How far the ring expands
+        sonicboom_duration: f32 = 0.12, // Fast explosion
+        sonicboom_center_x: f32 = 0,
+        sonicboom_center_y: f32 = 0,
+
         /// Scroll animation spring for smooth scrolling (position = offset in pixels from target)
         scroll_spring: animation.Spring = .{},
 
@@ -231,6 +242,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Whether we're currently in the alternate screen (TUI apps like Neovim).
         in_alternate_screen: bool = false,
+
+        /// Scroll region boundaries (row indices) for TUI smooth scrolling.
+        /// Cells within this region get per-cell offset_y_fixed for smooth animation.
+        scroll_region_top: u16 = 0,
+        scroll_region_bottom: u16 = 0,
 
         /// This value is used to force-update swap chain targets in the
         /// event of a config change that requires it (such as blending mode).
@@ -1066,7 +1082,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // In Neovim GUI mode, always run at high refresh rate for
             // smooth cursor, scrolling, and instant visual feedback
             if (self.nvim_gui != null) return true;
-            return self.has_custom_shaders or self.cursor_animating or self.scroll_animating;
+            return self.has_custom_shaders or self.cursor_animating or self.scroll_animating or self.sonicboom_active;
         }
 
         /// True if our renderer is using vsync. If true, the renderer or apprt
@@ -1085,6 +1101,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             assert(self.focused != focus);
 
             self.focused = focus;
+
+            // Clear sonicboom on focus loss to prevent lingering rings
+            if (!focus) {
+                self.sonicboom_active = false;
+                self.uniforms.sonicboom_color = .{ 0, 0, 0, 0 };
+            }
 
             // Flag that we need to update our custom shaders
             self.custom_shader_focused_changed = true;
@@ -1471,15 +1493,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Only trigger the spring animation when:
                 // 1. The viewport is at the bottom (new content pushing, not user scrolling history)
                 // 2. The scroll jump exceeds a threshold (large output, not single lines)
-                // 3. Not in alternate screen (TUI apps handle their own rendering)
-                // This prevents the spring from interfering with mouse/trackpad scrolling
-                // which already has its own smooth pixel offset handling.
+                // Detect large scroll jumps and trigger spring animation.
+                // Works in both primary screen (new output) and alternate screen (TUI scrolling).
+                // For primary screen: requires viewport_at_bottom to avoid interfering with manual scrollback.
+                // For alternate screen: always eligible (TUI apps use insertLines/deleteLines for scrolling).
                 const scroll_jump = self.terminal_state.scroll_jump;
-                const scroll_threshold: f32 = 4.0; // Minimum lines to trigger spring animation
-                if (@abs(scroll_jump) >= scroll_threshold and
-                    critical.viewport_at_bottom and
-                    !self.in_alternate_screen)
-                {
+                const scroll_threshold: f32 = 1.0; // Minimum lines to trigger spring animation
+                const eligible = if (self.in_alternate_screen)
+                    true // TUI apps: always eligible
+                else
+                    critical.viewport_at_bottom; // Primary: only when at bottom
+                if (@abs(scroll_jump) >= scroll_threshold and eligible) {
                     const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
                     // scroll_jump > 0 means viewport moved DOWN (content scrolled up, e.g. new output)
                     // Spring position = pixel offset from target (0 = at target).
@@ -1489,6 +1513,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
                 // Reset scroll_jump so we don't re-apply it next frame
                 self.terminal_state.scroll_jump = 0;
+
+                // Store the scroll region for per-cell offset calculations in alternate screen
+                self.scroll_region_top = self.terminal_state.scroll_region_top;
+                self.scroll_region_bottom = self.terminal_state.scroll_region_bottom;
 
                 // Store the sub-line pixel offset (from mouse/trackpad)
                 self.scroll_pixel_offset = critical.mouse.pixel_scroll_offset_y;
@@ -2238,6 +2266,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .horizontal => .horizontal,
                 };
                 self.corner_cursor.setCursorShape(corner_shape, cell_percentage);
+
+                // Trigger sonicboom on mode change (shape change = insert↔normal)
+                if (self.last_cursor_shape != null) {
+                    const scroll_off = self.uniforms.pixel_scroll_offset_y;
+                    self.sonicboom_center_x = target_pixel_x + cell_width * 0.5;
+                    self.sonicboom_center_y = target_pixel_y + cell_height * 0.5 - scroll_off;
+                    self.sonicboom_time = 0.001;
+                    self.sonicboom_active = true;
+                }
                 self.last_cursor_shape = cursor_shape;
             }
 
@@ -2454,7 +2491,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 break :blk @min(dt_ns / std.time.ns_per_s, 0.1);
             };
 
-            if (self.cursor_animating or self.scroll_animating) {
+            if (self.cursor_animating or self.scroll_animating or self.sonicboom_active) {
                 self.last_frame_time = now;
             } else {
                 self.last_frame_time = null;
@@ -2468,23 +2505,57 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const cursor_zeta = 1.0 - (self.config.cursor_animation_bounciness * 0.6);
                 const floaty_animating = self.cursor_animation.update(dt, cursor_len, cursor_zeta);
 
-                if (self.nvim_gui != null) {
-                    // Neovim mode: also update corner animations
-                    const corner_animating = self.corner_cursor.update(dt, cell_w, cell_h);
-                    self.cursor_animating = floaty_animating or corner_animating;
-                } else {
-                    // Terminal mode: only floaty animation
-                    self.cursor_animating = floaty_animating;
+                // Update corner animations for both Neovim and terminal mode
+                const corner_animating = self.corner_cursor.update(dt, cell_w, cell_h);
+                self.cursor_animating = floaty_animating or corner_animating;
 
-                    const pos = self.cursor_animation.getPosition();
+                if (self.nvim_gui == null) {
+                    // Terminal mode: update corner uniforms from animation state
+                    // Subtract pixel_scroll_offset_y since corner positions are absolute
+                    // but the shader replaces cell_pos entirely (bypassing the scroll offset)
                     const cursor_x = self.uniforms.cursor_pos[0];
                     const cursor_y = self.uniforms.cursor_pos[1];
                     if (cursor_x != std.math.maxInt(u16) and cursor_y != std.math.maxInt(u16)) {
-                        const target_x: f32 = @as(f32, @floatFromInt(cursor_x)) * cell_w;
-                        const target_y: f32 = @as(f32, @floatFromInt(cursor_y)) * cell_h;
-                        self.uniforms.cursor_offset_x = pos.x - target_x;
-                        self.uniforms.cursor_offset_y = pos.y - target_y;
+                        const scroll_off = self.uniforms.pixel_scroll_offset_y;
+                        const floaty_pos = self.cursor_animation.getPosition();
+                        self.corner_cursor.destination = .{
+                            floaty_pos.x + cell_w * 0.5,
+                            floaty_pos.y + cell_h * 0.5,
+                        };
+                        const corners = self.corner_cursor.getCorners();
+                        self.uniforms.cursor_corner_tl = .{ corners[0][0], corners[0][1] - scroll_off };
+                        self.uniforms.cursor_corner_tr = .{ corners[1][0], corners[1][1] - scroll_off };
+                        self.uniforms.cursor_corner_br = .{ corners[2][0], corners[2][1] - scroll_off };
+                        self.uniforms.cursor_corner_bl = .{ corners[3][0], corners[3][1] - scroll_off };
                     }
+                }
+            }
+
+            // Sonicboom VFX is now triggered directly on cursor shape changes
+            // in renderNeovimCursor (Neovim GUI) and cursor_anim block (terminal mode).
+
+            // Update sonicboom animation
+            if (self.sonicboom_active) {
+                self.sonicboom_time += dt;
+                const t = self.sonicboom_time / self.sonicboom_duration;
+                if (t >= 1.0) {
+                    // Effect complete
+                    self.sonicboom_active = false;
+                    self.sonicboom_time = 0;
+                    self.uniforms.sonicboom_color = .{ 0, 0, 0, 0 };
+                } else {
+                    // Fast expanding ring explosion with bright flash
+                    // Use cubic ease-out for fast explosion that slows at the end
+                    const ease_t = 1.0 - std.math.pow(f32, 1.0 - t, 3.0);
+                    self.uniforms.sonicboom_center = .{ self.sonicboom_center_x, self.sonicboom_center_y };
+                    self.uniforms.sonicboom_radius = ease_t * self.sonicboom_max_radius;
+
+                    // Start thick and thin out for explosive shockwave feel
+                    self.uniforms.sonicboom_thickness = 12.0 * (1.0 - t);
+
+                    // Bright white with fast fade (quadratic for punchier disappearance)
+                    const alpha: u8 = @intFromFloat(@max(0, std.math.pow(f32, 1.0 - t, 2.0) * 220.0));
+                    self.uniforms.sonicboom_color = .{ 255, 255, 255, alpha };
                 }
             }
 
@@ -2527,11 +2598,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     cell_h - self.scroll_pixel_offset;
 
                 // Add spring animation offset for smooth content-arrival scrolling.
-                // scroll_spring.position is positive when content just scrolled up (new output),
-                // meaning we need to shift content DOWN to show it sliding up into place.
-                // As the spring decays to 0, the offset vanishes and content reaches its final position.
-                const spring_offset = self.scroll_spring.position;
+                // For primary screen: apply globally via pixel_scroll_offset_y.
+                // For alternate screen (TUI): use tui_scroll_offset_y uniform
+                // so the shader only applies it within the scroll region.
+                const spring_offset = if (self.in_alternate_screen) @as(f32, 0) else self.scroll_spring.position;
                 self.uniforms.pixel_scroll_offset_y = base_offset - spring_offset;
+
+                // Set TUI scroll uniforms for alternate screen smooth scrolling.
+                // The shader uses these to apply the offset only within the scroll region,
+                // keeping status bars, headers, etc. fixed.
+                if (self.in_alternate_screen) {
+                    self.uniforms.tui_scroll_offset_y = -self.scroll_spring.position;
+                    // Offset by 1 for the extra hidden row at top of the grid.
+                    // In alternate screen, pixel_scroll_offset_y = cell_h hides row 0,
+                    // so terminal scroll region row 0 maps to grid row 1 in the shader.
+                    self.uniforms.tui_scroll_region_top = self.scroll_region_top + 1;
+                    self.uniforms.tui_scroll_region_bottom = self.scroll_region_bottom + 1;
+                } else {
+                    self.uniforms.tui_scroll_offset_y = 0;
+                }
             }
 
             // After the graphics API is complete (so we defer) we want to
@@ -3660,14 +3745,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     cursor_color,
                 );
 
-                // If the cursor is visible then we set our uniforms.
-                if (style == .block) {
+                // Set cursor_pos for ALL styles (needed for cursor animation + sonicboom).
+                {
                     const wide = state.cursor.cell.wide;
-
                     self.uniforms.cursor_pos = .{
-                        // If we are a spacer tail of a wide cell, our cursor needs
-                        // to move back one cell. The saturate is to ensure we don't
-                        // overflow but this shouldn't happen with well-formed input.
                         switch (wide) {
                             .narrow, .spacer_head, .wide => cursor_vp.x,
                             .spacer_tail => cursor_vp.x -| 1,
@@ -3675,16 +3756,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         @intCast(cursor_vp.y),
                     };
 
+                    // Set cursor color for sonicboom (use the cursor's own color)
+                    self.uniforms.cursor_color = .{
+                        cursor_color.r,
+                        cursor_color.g,
+                        cursor_color.b,
+                        255,
+                    };
+                }
+
+                // Block-specific: text recoloring under the cursor
+                if (style == .block) {
+                    const wide = state.cursor.cell.wide;
+
                     self.uniforms.bools.cursor_wide = switch (wide) {
                         .narrow, .spacer_head => false,
                         .wide, .spacer_tail => true,
                     };
 
+                    // Override cursor_color with the text-under-cursor color for block style
                     const uniform_color = if (self.config.cursor_text) |txt| blk: {
-                        // If cursor-text is set, then compute the correct color.
-                        // Otherwise, use the background color.
                         if (txt == .color) {
-                            // Use the color set by cursor-text, if any.
                             break :blk txt.color.toTerminalRGB();
                         }
 
@@ -3699,7 +3791,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         ) orelse state.colors.background;
 
                         break :blk switch (txt) {
-                            // If the cell is reversed, use the opposite cell color instead.
                             .@"cell-foreground" => if (cursor_style.flags.inverse)
                                 bg_style
                             else
@@ -3727,11 +3818,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const cursor_y = self.uniforms.cursor_pos[1];
 
                 if (cursor_x == std.math.maxInt(u16) or cursor_y == std.math.maxInt(u16)) {
+                    // Cursor is hidden this frame. Mark last_cursor_grid_pos as
+                    // hidden so the next appearance snaps instead of animating
+                    // from a stale position.
+                    self.last_cursor_grid_pos = .{ std.math.maxInt(u16), std.math.maxInt(u16) };
                     self.cursor_animation.snap();
                     self.uniforms.cursor_offset_x = 0;
                     self.uniforms.cursor_offset_y = 0;
                     self.uniforms.cursor_use_corners = if (@TypeOf(self.uniforms.cursor_use_corners) == bool) false else 0;
                     self.cursor_animating = false;
+                    // Clear sonicboom when cursor disappears
+                    self.sonicboom_active = false;
+                    self.uniforms.sonicboom_color = .{ 0, 0, 0, 0 };
+                    self.last_cursor_style_for_boom = null;
                     break :cursor_anim;
                 }
 
@@ -3742,19 +3841,57 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 const last_x = self.last_cursor_grid_pos[0];
                 const last_y = self.last_cursor_grid_pos[1];
+                const was_hidden = (last_x == std.math.maxInt(u16) or last_y == std.math.maxInt(u16));
 
                 if (cursor_x != last_x or cursor_y != last_y) {
-                    self.cursor_animation.setTarget(target_pixel_x, target_pixel_y, cell_width);
+                    if (was_hidden) {
+                        // Cursor was previously hidden (or first appearance). Snap
+                        // immediately to avoid animating from (0,0) or stale position.
+                        // This is critical for TUI apps where cursor can flicker between
+                        // hidden/visible states across frames.
+                        self.cursor_animation.target_x = target_pixel_x;
+                        self.cursor_animation.target_y = target_pixel_y;
+                        self.cursor_animation.current_x = target_pixel_x;
+                        self.cursor_animation.current_y = target_pixel_y;
+                        self.cursor_animation.spring.reset();
+                        self.corner_cursor.snap(target_pixel_x, target_pixel_y, cell_width, cell_height);
+                    } else {
+                        self.cursor_animation.setTarget(target_pixel_x, target_pixel_y, cell_width);
+                        self.corner_cursor.setTarget(target_pixel_x, target_pixel_y, cell_width, cell_height);
+                        self.cursor_animating = true;
+                    }
                     self.last_cursor_grid_pos = .{ cursor_x, cursor_y };
-                    self.cursor_animating = true;
                 }
 
-                // Simple offset-based animation for terminal mode
-                self.uniforms.cursor_use_corners = if (@TypeOf(self.uniforms.cursor_use_corners) == bool) false else 0;
+                // Map terminal cursor style to corner cursor shape
+                if (cursor_style_) |cs| {
+                    const corner_shape: animation.CornerCursorAnimation.CursorShape = switch (cs) {
+                        .block, .block_hollow, .lock => .block,
+                        .bar => .vertical,
+                        .underline => .horizontal,
+                    };
+                    self.corner_cursor.setCursorShape(corner_shape, 0.25);
+                    // Terminal mode doesn't have Vim modes, so no sonicboom here
+                }
 
-                const pos = self.cursor_animation.getPosition();
-                self.uniforms.cursor_offset_x = pos.x - target_pixel_x;
-                self.uniforms.cursor_offset_y = pos.y - target_pixel_y;
+                // Neovide-style stretchy corner cursor for terminal mode
+                // Must account for pixel_scroll_offset_y since corner positions are
+                // in absolute pixel space but the grid is shifted by the scroll offset.
+                const scroll_off = self.uniforms.pixel_scroll_offset_y;
+                const floaty_pos = self.cursor_animation.getPosition();
+                self.corner_cursor.destination = .{
+                    floaty_pos.x + cell_width * 0.5,
+                    floaty_pos.y + cell_height * 0.5,
+                };
+
+                const corners = self.corner_cursor.getCorners();
+                self.uniforms.cursor_corner_tl = .{ corners[0][0], corners[0][1] - scroll_off };
+                self.uniforms.cursor_corner_tr = .{ corners[1][0], corners[1][1] - scroll_off };
+                self.uniforms.cursor_corner_br = .{ corners[2][0], corners[2][1] - scroll_off };
+                self.uniforms.cursor_corner_bl = .{ corners[3][0], corners[3][1] - scroll_off };
+                self.uniforms.cursor_use_corners = if (@TypeOf(self.uniforms.cursor_use_corners) == bool) true else 1;
+                self.uniforms.cursor_offset_x = 0;
+                self.uniforms.cursor_offset_y = 0;
             }
 
             // Setup our preedit text.

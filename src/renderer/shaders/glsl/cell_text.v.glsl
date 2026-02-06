@@ -38,6 +38,7 @@ out CellTextVertexOut {
     flat vec4 color;
     flat vec4 bg_color;
     flat int pixel_offset_y;  // Pass to fragment shader for clipping check
+    flat uvec2 cell_grid_pos;  // Original grid position for TUI scroll clipping
     vec2 tex_coord;
 } out_data;
 
@@ -88,6 +89,14 @@ void main() {
     // This enables per-window smooth scrolling in Neovim GUI mode
     float per_cell_offset_y = float(pixel_offset_y_fixed) / 256.0;
     cell_pos.y += per_cell_offset_y;
+
+    // Apply TUI scroll offset for cells within the scroll region
+    if (tui_scroll_offset_y != 0.0) {
+        uvec2 tui_region = unpack2u16(tui_scroll_region_packed);
+        if (grid_pos.y >= tui_region.x && grid_pos.y <= tui_region.y) {
+            cell_pos.y += tui_scroll_offset_y;
+        }
+    }
     
     // Apply global pixel scroll offset (base grid alignment)
     // In terminal mode: shifts content up to hide an extra row for smooth scrollback.
@@ -138,6 +147,7 @@ void main() {
 
     // Pass the pixel offset to fragment shader for clipping check
     out_data.pixel_offset_y = pixel_offset_y_fixed;
+    out_data.cell_grid_pos = grid_pos;
 
     // Get our color. We always fetch a linearized version to
     // make it easier to handle minimum contrast calculations.

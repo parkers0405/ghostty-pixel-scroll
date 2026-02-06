@@ -23,8 +23,24 @@ vec4 cell_bg() {
     // Calculate grid position from fragment coordinates
     vec2 adjusted_coord = gl_FragCoord.xy;
     adjusted_coord.y += pixel_scroll_offset_y; // Global scroll offset (terminal mode)
+
+    // Apply TUI scroll offset: shift pixels within the scroll region
+    bool in_tui_scroll_region = false;
+    uvec2 tui_region = unpack2u16(tui_scroll_region_packed);
+    if (tui_scroll_offset_y != 0.0) {
+        ivec2 pre_grid_pos = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
+        if (pre_grid_pos.y >= int(tui_region.x) && pre_grid_pos.y <= int(tui_region.y)) {
+            adjusted_coord.y += tui_scroll_offset_y;
+            in_tui_scroll_region = true;
+        }
+    }
     
     ivec2 grid_pos = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
+
+    // Clamp grid_pos.y to scroll region for shifted pixels
+    if (in_tui_scroll_region) {
+        grid_pos.y = clamp(grid_pos.y, int(tui_region.x), int(tui_region.y));
+    }
     
     // Apply per-cell offset for per-window smooth scrolling
     if (grid_pos.x >= 0 && grid_pos.x < int(grid_size.x) &&
@@ -95,9 +111,36 @@ vec4 cell_bg() {
     // Force alpha to 255 BEFORE load_color to prevent premultiplied alpha issues
     uvec4 raw_color = unpack4u8(cells[grid_pos.y * grid_size.x + grid_pos.x].color);
     raw_color.a = 255u;  // Force full opacity before premultiplication
-    vec4 cell_color = load_color(raw_color, use_linear_blending);
+    vec4 result = load_color(raw_color, use_linear_blending);
 
-    return cell_color;
+    // Sonicboom VFX: expanding double ring explosion
+    uvec4 boom_raw = unpack4u8(sonicboom_color_packed);
+    if (boom_raw.a > 0u && sonicboom_radius > 0.0) {
+        float dist = length(gl_FragCoord.xy - sonicboom_center);
+        
+        // Primary expanding ring
+        float ring_inner = sonicboom_radius - sonicboom_thickness;
+        float ring_outer = sonicboom_radius + sonicboom_thickness;
+        float ring1 = smoothstep(ring_inner - 2.0, ring_inner + 1.0, dist) *
+                      (1.0 - smoothstep(ring_outer - 1.0, ring_outer + 2.0, dist));
+        
+        // Secondary ring at 70% radius for double shockwave effect
+        float ring2_radius = sonicboom_radius * 0.7;
+        float ring2_inner = ring2_radius - sonicboom_thickness * 0.6;
+        float ring2_outer = ring2_radius + sonicboom_thickness * 0.6;
+        float ring2 = smoothstep(ring2_inner - 1.5, ring2_inner + 0.5, dist) *
+                      (1.0 - smoothstep(ring2_outer - 0.5, ring2_outer + 1.5, dist));
+
+        float combined = max(ring1, ring2 * 0.5);
+
+        if (combined > 0.001) {
+            vec4 boom_color = load_color(boom_raw, use_linear_blending);
+            float alpha = boom_color.a * combined;
+            result = mix(result, vec4(boom_color.rgb, 1.0), alpha);
+        }
+    }
+
+    return result;
 }
 
 void main() {

@@ -21,6 +21,7 @@ in CellTextVertexOut {
     flat vec4 color;
     flat vec4 bg_color;
     flat int pixel_offset_y;  // From vertex shader for clipping check
+    flat uvec2 cell_grid_pos;  // Original grid position for TUI scroll clipping
     vec2 tex_coord;
 } in_data;
 
@@ -53,6 +54,21 @@ void main() {
             }
         }
     }
+    // Clip TUI scrolling text at scroll region boundaries
+    if (tui_scroll_offset_y != 0.0) {
+        uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
+        uvec2 tui_region = unpack2u16(tui_scroll_region_packed);
+        vec2 adj = gl_FragCoord.xy;
+        adj.y += pixel_scroll_offset_y;
+        ivec2 frag_grid = ivec2(floor((adj - grid_padding.wx) / cell_size));
+        if (in_data.cell_grid_pos.y >= tui_region.x &&
+            in_data.cell_grid_pos.y <= tui_region.y) {
+            if (frag_grid.y < int(tui_region.x) || frag_grid.y > int(tui_region.y)) {
+                discard;
+            }
+        }
+    }
+
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
     bool use_linear_correction = (bools & USE_LINEAR_CORRECTION) != 0;
 

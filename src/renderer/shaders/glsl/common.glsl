@@ -32,6 +32,14 @@ layout(binding = 1, std140) uniform Globals {
     uniform vec2 cursor_corner_br;  // Bottom-right corner
     uniform vec2 cursor_corner_bl;  // Bottom-left corner
     uniform uint cursor_use_corners;  // Whether to use corner-based rendering (as uint for alignment)
+    // Sonicboom VFX
+    uniform vec2 sonicboom_center;     // Pixel position of ring center
+    uniform float sonicboom_radius;    // Current ring radius in pixels
+    uniform float sonicboom_thickness; // Ring thickness in pixels
+    uniform uint sonicboom_color_packed; // Packed RGBA color
+    // TUI smooth scrolling
+    uniform float tui_scroll_offset_y;     // Pixel offset for scroll region cells
+    uniform uint tui_scroll_region_packed; // Packed 2x u16: top (low 16), bottom (high 16)
 };
 
 // Bools

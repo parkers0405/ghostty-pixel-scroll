@@ -33,6 +33,17 @@ struct Uniforms {
   float2 cursor_corner_br;  // Bottom-right corner pixel position
   float2 cursor_corner_bl;  // Bottom-left corner pixel position
   bool cursor_use_corners;  // Whether to use corner-based rendering
+
+  // Sonicboom VFX
+  float2 sonicboom_center;     // Pixel position of ring center
+  float sonicboom_radius;      // Current ring radius in pixels
+  float sonicboom_thickness;   // Ring thickness in pixels
+  uchar4 sonicboom_color;      // Ring color with alpha
+
+  // TUI smooth scrolling
+  float tui_scroll_offset_y;      // Pixel offset for scroll region cells
+  ushort tui_scroll_region_top;   // Top row of scroll region (inclusive)
+  ushort tui_scroll_region_bottom; // Bottom row of scroll region (inclusive)
 };
 
 //-------------------------------------------------------------------
@@ -471,9 +482,29 @@ fragment float4 cell_bg_fragment(
   // Apply global pixel scroll offset for smooth scrolling (terminal mode)
   float2 adjusted_pos = in.position.xy;
   adjusted_pos.y += uniforms.pixel_scroll_offset_y;
+
+  // Apply TUI scroll offset: shift pixels within the scroll region
+  // This makes content in the scroll region slide smoothly while
+  // status bars, headers, etc. outside the region stay fixed.
+  bool in_tui_scroll_region = false;
+  if (uniforms.tui_scroll_offset_y != 0.0) {
+    int2 pre_grid_pos = int2(floor((adjusted_pos - uniforms.grid_padding.wx) / uniforms.cell_size));
+    if (pre_grid_pos.y >= int(uniforms.tui_scroll_region_top) &&
+        pre_grid_pos.y <= int(uniforms.tui_scroll_region_bottom)) {
+      adjusted_pos.y += uniforms.tui_scroll_offset_y;
+      in_tui_scroll_region = true;
+    }
+  }
+
   int2 grid_pos = int2(floor((adjusted_pos - uniforms.grid_padding.wx) / uniforms.cell_size));
+
+  // Clamp grid_pos.y to scroll region for shifted pixels so they
+  // don't sample from header/status bar rows
+  if (in_tui_scroll_region) {
+    grid_pos.y = clamp(grid_pos.y, int(uniforms.tui_scroll_region_top), int(uniforms.tui_scroll_region_bottom));
+  }
   
-  // Apply per-cell offset for per-window smooth scrolling
+  // Apply per-cell offset for per-window smooth scrolling (Neovim GUI mode)
   if (grid_pos.x >= 0 && grid_pos.x < uniforms.grid_size.x &&
       grid_pos.y >= 0 && grid_pos.y < uniforms.grid_size.y) {
     int cell_index = grid_pos.y * uniforms.grid_size.x + grid_pos.x;
@@ -551,11 +582,44 @@ fragment float4 cell_bg_fragment(
   //       a bunch of work converting the cell color in every
   //       fragment of each cell. It's not the most epxensive
   //       operation, but it is still wasted work.
-  return load_color(
+  float4 result = load_color(
     cell_color,
     uniforms.use_display_p3,
     uniforms.use_linear_blending
   );
+
+  // Sonicboom VFX: expanding double ring explosion
+  if (uniforms.sonicboom_color.a > 0 && uniforms.sonicboom_radius > 0.0) {
+    float2 frag_pos = in.position.xy;
+    float dist = length(frag_pos - uniforms.sonicboom_center);
+    
+    // Primary expanding ring
+    float ring_inner = uniforms.sonicboom_radius - uniforms.sonicboom_thickness;
+    float ring_outer = uniforms.sonicboom_radius + uniforms.sonicboom_thickness;
+    float ring1 = smoothstep(ring_inner - 2.0, ring_inner + 1.0, dist) *
+                  (1.0 - smoothstep(ring_outer - 1.0, ring_outer + 2.0, dist));
+    
+    // Secondary ring at 70% radius for double shockwave effect
+    float ring2_radius = uniforms.sonicboom_radius * 0.7;
+    float ring2_inner = ring2_radius - uniforms.sonicboom_thickness * 0.6;
+    float ring2_outer = ring2_radius + uniforms.sonicboom_thickness * 0.6;
+    float ring2 = smoothstep(ring2_inner - 1.5, ring2_inner + 0.5, dist) *
+                  (1.0 - smoothstep(ring2_outer - 0.5, ring2_outer + 1.5, dist));
+
+    float combined = max(ring1, ring2 * 0.5);
+
+    if (combined > 0.001) {
+      float4 boom_color = load_color(
+        uniforms.sonicboom_color,
+        uniforms.use_display_p3,
+        uniforms.use_linear_blending
+      );
+      float alpha = boom_color.a * combined;
+      result = mix(result, float4(boom_color.rgb, 1.0), alpha);
+    }
+  }
+
+  return result;
 }
 
 //-------------------------------------------------------------------
@@ -608,6 +672,7 @@ struct CellTextVertexOut {
   float4 color [[flat]];
   float4 bg_color [[flat]];
   short pixel_offset_y [[flat]];  // For statusline clipping
+  ushort2 grid_pos [[flat]];  // Original grid position for TUI scroll clipping
   float2 tex_coord;
   float2 screen_pos;  // For clipping during scroll
 };
@@ -681,6 +746,13 @@ vertex CellTextVertexOut cell_text_vertex(
   // This enables per-window smooth scrolling in Neovim GUI mode
   float per_cell_offset_y = float(in.pixel_offset_y_fixed) / 256.0f;
   cell_pos.y += per_cell_offset_y;
+
+  // Apply TUI scroll offset for cells within the scroll region
+  if (uniforms.tui_scroll_offset_y != 0.0 &&
+      in.grid_pos.y >= uniforms.tui_scroll_region_top &&
+      in.grid_pos.y <= uniforms.tui_scroll_region_bottom) {
+    cell_pos.y += uniforms.tui_scroll_offset_y;
+  }
   
   // Apply global pixel scroll offset for smooth scrolling
   cell_pos.y -= uniforms.pixel_scroll_offset_y;
@@ -722,6 +794,7 @@ vertex CellTextVertexOut cell_text_vertex(
   
   // Pass screen position for edge clipping in fragment shader
   out.screen_pos = cell_pos;
+  out.grid_pos = in.grid_pos;
 
   // Calculate the texture coordinate in pixels. This is NOT normalized
   // (between 0.0 and 1.0), and does not need to be, since the texture will
@@ -807,6 +880,25 @@ fragment float4 cell_text_fragment(
     }
   }
   
+  // Clip TUI scrolling text at scroll region boundaries
+  // When tui_scroll_offset_y is active, text within the scroll region may
+  // slide into the fixed header/status rows. Clip fragments that land outside
+  // the scroll region pixel bounds.
+  if (uniforms.tui_scroll_offset_y != 0.0) {
+    float2 adj = in.position.xy;
+    adj.y += uniforms.pixel_scroll_offset_y;
+    int2 frag_grid = int2(floor((adj - uniforms.grid_padding.wx) / uniforms.cell_size));
+    // Check if the grid_pos (original row) is within the scroll region
+    // but the fragment landed outside it
+    if (in.grid_pos.y >= uniforms.tui_scroll_region_top &&
+        in.grid_pos.y <= uniforms.tui_scroll_region_bottom) {
+      if (frag_grid.y < int(uniforms.tui_scroll_region_top) ||
+          frag_grid.y > int(uniforms.tui_scroll_region_bottom)) {
+        discard_fragment();
+      }
+    }
+  }
+
   // Legacy clip for terminal scrollback
   float grid_top = uniforms.grid_padding.x;
   float grid_bottom = grid_top + float(uniforms.grid_size.y - 2) * uniforms.cell_size.y;

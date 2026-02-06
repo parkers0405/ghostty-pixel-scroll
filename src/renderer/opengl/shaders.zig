@@ -215,6 +215,17 @@ pub const Uniforms = extern struct {
     /// Whether to use corner-based cursor rendering (as u32 for GLSL std140 alignment)
     cursor_use_corners: u32 align(4) = 0,
 
+    /// Sonicboom VFX: expanding ring effect on cursor arrival
+    sonicboom_center: [2]f32 align(8) = .{ -100, -100 },
+    sonicboom_radius: f32 align(4) = 0,
+    sonicboom_thickness: f32 align(4) = 3.0,
+    sonicboom_color: [4]u8 align(4) = .{ 255, 255, 255, 0 },
+
+    /// TUI smooth scrolling: pixel offset for cells within the scroll region.
+    tui_scroll_offset_y: f32 align(4) = 0,
+    tui_scroll_region_top: u16 align(2) = 0,
+    tui_scroll_region_bottom: u16 align(2) = 0,
+
     const Bools = packed struct(u32) {
         /// Whether the cursor is 2 cells wide.
         cursor_wide: bool,

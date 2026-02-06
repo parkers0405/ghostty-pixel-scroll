@@ -94,6 +94,12 @@ pub const RenderState = struct {
     scroll_jump: f32 = 0,
     last_scroll_tracker: isize = 0,
 
+    /// Scroll region boundaries (row indices, inclusive).
+    /// Used by the renderer to apply smooth scroll offset only within
+    /// the scroll region for TUI apps in alternate screen.
+    scroll_region_top: u16 = 0,
+    scroll_region_bottom: u16 = 0,
+
     pub const empty: RenderState = .{
         .rows = 0,
         .cols = 0,
@@ -409,6 +415,8 @@ pub const RenderState = struct {
         self.last_scroll_tracker = s.scroll_tracker;
 
         self.viewport_pin = viewport_pin;
+        self.scroll_region_top = @intCast(t.scrolling_region.top);
+        self.scroll_region_bottom = @intCast(t.scrolling_region.bottom);
         self.cursor.active = .{ .x = s.cursor.x, .y = s.cursor.y };
         self.cursor.cell = s.cursor.page_cell.*;
         self.cursor.style = s.cursor.style;

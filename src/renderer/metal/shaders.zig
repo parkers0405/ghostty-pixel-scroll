@@ -269,6 +269,20 @@ pub const Uniforms = extern struct {
     /// Whether to use corner-based cursor rendering
     cursor_use_corners: bool align(1) = false,
 
+    /// Sonicboom VFX: expanding ring effect on cursor arrival
+    /// center = pixel position, radius = current expansion, alpha = fade (0-1)
+    sonicboom_center: [2]f32 align(8) = .{ -100, -100 },
+    sonicboom_radius: f32 align(4) = 0,
+    sonicboom_thickness: f32 align(4) = 3.0,
+    sonicboom_color: [4]u8 align(4) = .{ 255, 255, 255, 0 },
+
+    /// TUI smooth scrolling: pixel offset for cells within the scroll region.
+    /// Only used in alternate screen mode. The shader applies this offset
+    /// conditionally based on whether the cell row is within the scroll region.
+    tui_scroll_offset_y: f32 align(4) = 0,
+    tui_scroll_region_top: u16 align(2) = 0,
+    tui_scroll_region_bottom: u16 align(2) = 0,
+
     const PaddingExtend = packed struct(u8) {
         left: bool = false,
         right: bool = false,

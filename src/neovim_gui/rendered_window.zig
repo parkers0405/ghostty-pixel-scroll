@@ -322,6 +322,11 @@ pub const RenderedWindow = struct {
     /// Used to disable smooth scroll for windows like nvim-tree that don't really scroll
     has_scrolled: bool = false,
 
+    /// Set to true when a far-scroll snap occurs in flush().
+    /// The renderer should snap the cursor to its new position instead of animating.
+    /// Cleared after the renderer reads it.
+    far_scroll_snapped: bool = false,
+
     /// Fixed rows/cols at edges (winbar, borders, etc.)
     viewport_margins: ViewportMargins = .{},
 
@@ -891,14 +896,29 @@ pub const RenderedWindow = struct {
             }
         }
 
-        // Update scroll animation (Neovide-style: simple accumulation, no capping)
+        // Update scroll animation (Neovide-style with far-scroll capping)
         if (scroll_delta != 0) {
-            const current_pos = self.scroll_animation.position;
             const delta_f: f32 = @floatFromInt(scroll_delta);
-            const new_delta = -delta_f; // scroll_delta > 0 -> position goes negative
+            var new_delta = -delta_f; // scroll_delta > 0 -> position goes negative
+
+            // Far-scroll capping: when the scroll is larger than the viewport,
+            // only animate the last N lines and snap the rest instantly.
+            // This prevents slow animations for huge jumps (gg, G, 100j).
+            const far_lines: f32 = @floatFromInt(self.scroll_settings.scroll_animation_far_lines);
+            const inner_f: f32 = @floatFromInt(inner_size);
+            if (@abs(new_delta) > inner_f and far_lines < @abs(new_delta)) {
+                // Snap most of the distance instantly by resetting the spring,
+                // then animate only the last far_lines worth of distance
+                self.scroll_animation.reset();
+                new_delta = if (new_delta < 0) -far_lines else far_lines;
+                // Signal to the renderer that cursor should also snap
+                self.far_scroll_snapped = true;
+            }
+
+            const current_pos = self.scroll_animation.position;
             const new_pos = current_pos + new_delta;
 
-            const max_delta: f32 = @floatFromInt(inner_size);
+            const max_delta: f32 = inner_f;
             self.scroll_animation.position = std.math.clamp(new_pos, -max_delta, max_delta);
         }
 
@@ -910,12 +930,24 @@ pub const RenderedWindow = struct {
     pub fn animate(self: *Self, dt: f32) bool {
         var animating = false;
 
-        // Animate scroll using critically damped spring (Neovide-style)
-        // Use constant animation length - no catchup logic like Neovide
-        const anim_length = self.scroll_settings.animation_length;
+        // Animate scroll using critically damped spring (Neovide-style with catchup)
+        // When the spring position is far from 0 (i.e. we're behind), shorten the
+        // animation length so it catches up faster. This prevents lag during rapid
+        // scrolling (holding j/k, Ctrl+D spam, etc.).
+        const base_length = self.scroll_settings.animation_length;
+        const scroll_dist = @abs(self.scroll_animation.position);
+        const anim_length = if (scroll_dist > 1.0) blk: {
+            // Scale animation length inversely with distance.
+            // At 1 line behind: full animation_length
+            // At 5+ lines behind: much shorter (snappier catchup)
+            // Formula matches Neovide: length / (1 + excess_distance * factor)
+            const catchup_factor: f32 = 0.3;
+            break :blk base_length / (1.0 + (scroll_dist - 1.0) * catchup_factor);
+        } else base_length;
 
         if (self.scroll_animation.update(dt, anim_length, 0)) {
             animating = true;
+            self.dirty = true;
         }
 
         // Animate opacity for floating window fade-in/fade-out
@@ -923,6 +955,7 @@ pub const RenderedWindow = struct {
         if (self.opacity_spring.update(dt, opacity_anim_length, 1.0)) {
             self.opacity = std.math.clamp(self.target_opacity + self.opacity_spring.position, 0.0, 1.0);
             animating = true;
+            self.dirty = true;
         } else {
             self.opacity = self.target_opacity;
             // Fade-out complete: actually hide the window now
@@ -940,9 +973,11 @@ pub const RenderedWindow = struct {
 
         if (self.position_spring_x.update(dt, pos_len, pos_zeta)) {
             animating = true;
+            self.dirty = true;
         }
         if (self.position_spring_y.update(dt, pos_len, pos_zeta)) {
             animating = true;
+            self.dirty = true;
         }
 
         // grid_position = target + spring offset (decays to target as spring settles)
@@ -953,13 +988,13 @@ pub const RenderedWindow = struct {
     }
 
     /// Get a cell from the scrollback buffer for rendering during scroll animation.
-    /// This reads from scrollback_lines[trunc(scroll_pos) + row] where row is
+    /// This reads from scrollback_lines[floor(scroll_pos) + row] where row is
     /// relative to the inner (scrollable) region.
     ///
     /// Returns null if the position is outside the scrollback buffer or if
     /// this is a margin row (which should be read from actual_lines instead).
     ///
-    /// NOTE: Uses @trunc to match getScrollbackCellByInnerRowSigned and getSubLineOffset.
+    /// NOTE: Uses @trunc to match getSubLineOffset.
     pub fn getScrollbackCell(self: *const Self, row: u32, col: u32) ?*const GridCell {
         if (self.scrollback_lines == null) return null;
         if (col >= self.grid_width) return null;
@@ -971,7 +1006,7 @@ pub const RenderedWindow = struct {
         // Convert to inner row index
         const inner_row: isize = @as(isize, @intCast(row)) - @as(isize, @intCast(self.viewport_margins.top));
 
-        // Get the scroll offset in lines (use trunc for cell lookup)
+        // Get the scroll offset in lines (use trunc for cell lookup, matching getSubLineOffset)
         const scroll_offset_lines: isize = @intFromFloat(@trunc(self.scroll_animation.position));
 
         // Calculate the scrollback index
@@ -999,9 +1034,7 @@ pub const RenderedWindow = struct {
         if (self.scrollback_lines == null) return null;
         if (col >= self.grid_width) return null;
 
-        // Use trunc (round toward zero) for cell lookup
-        // This ensures we read from the correct row during animation
-        // The pixel offset uses floor for smooth sub-pixel animation
+        // Use trunc (round toward zero) for cell lookup, matching getSubLineOffset.
         const scroll_offset_lines: isize = @intFromFloat(@trunc(self.scroll_animation.position));
         const scrollback_idx: isize = scroll_offset_lines + @as(isize, inner_row);
 
@@ -1031,7 +1064,7 @@ pub const RenderedWindow = struct {
         const pos = self.scroll_animation.position;
         if (pos == 0) return true; // No animation, first row check passed
 
-        // Use trunc to match getScrollbackCellByInnerRowSigned
+        // Use trunc to match getScrollbackCellByInnerRowSigned and getSubLineOffset
         const trunc_pos: isize = @intFromFloat(@trunc(pos));
 
         // For scroll animation, we read scrollback[trunc_pos + row] for each inner row
@@ -1046,12 +1079,13 @@ pub const RenderedWindow = struct {
     /// Get the sub-line pixel offset for smooth scrolling.
     /// Uses @trunc to match cell lookup (getScrollbackCellByInnerRowSigned).
     ///
-    /// Example: position = -1.5 (scrolling down, animation in progress)
-    /// - scroll_offset_lines = trunc(-1.5) = -1
-    /// - scroll_offset = -1 - (-1.5) = 0.5
-    /// - pixel_offset = 0.5 * 51 = +25.5 pixels (shift content DOWN)
+    /// Example: position = -0.8 (scrolling down, 80% through animation)
+    /// - scroll_offset_lines = trunc(-0.8) = 0
+    /// - scroll_offset = 0 - (-0.8) = 0.8
+    /// - pixel_offset = 0.8 * 51 = +40.8 pixels (shift content DOWN)
     ///
-    /// When scrolling DOWN, we show new content shifting DOWN into place.
+    /// The caller rounds this to the nearest whole pixel before sending
+    /// to the GPU (both text and bg get the same rounded value).
     pub fn getSubLineOffset(self: *const Self, cell_height: f32) f32 {
         const pos = self.scroll_animation.position;
         const scroll_offset_lines = @trunc(pos);

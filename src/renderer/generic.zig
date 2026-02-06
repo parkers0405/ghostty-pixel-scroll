@@ -237,6 +237,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Whether scroll animation is currently active
         scroll_animating: bool = false,
 
+        /// Animation timing state (Neovide-style frame catchup).
+        /// `animation_start` is the wall-clock time when the current animation
+        /// burst began. `animation_time` accumulates how far the animation
+        /// clock has advanced.  When the real clock drifts ahead we catch up
+        /// smoothly (over 10 frames if < 1 frame behind, instantly if more).
+        animation_start: ?std.time.Instant = null,
+        animation_time: u64 = 0, // nanoseconds
+
+        /// Estimated display refresh period in nanoseconds.  On macOS this
+        /// comes from CVDisplayLink; elsewhere we fall back to a default.
+        display_refresh_ns: u64 = 6_060_606, // ~165 Hz default
+
         /// Accumulated scroll offset in pixels (for sub-line input)
         scroll_pixel_offset: f32 = 0,
 
@@ -591,10 +603,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             font_thicken: bool,
             pixel_scroll: bool,
+            text_gamma: f32,
+            text_contrast: f32,
             cursor_animation_duration: f32,
             cursor_animation_bounciness: f32,
             scroll_animation_duration: f32,
             scroll_animation_bounciness: f32,
+            neovim_corner_radius: f32,
+            neovim_gap_color: [3]u8,
+            matte_rendering: f32,
             font_thicken_strength: u8,
             font_features: std.ArrayListUnmanaged([:0]const u8),
             font_styles: font.CodepointResolver.StyleStatus,
@@ -666,10 +683,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .background_opacity_cells = config.@"background-opacity-cells",
                     .font_thicken = config.@"font-thicken",
                     .pixel_scroll = config.@"pixel-scroll",
+                    .text_gamma = config.@"text-gamma",
+                    .text_contrast = @max(0, @min(1, config.@"text-contrast")),
                     .cursor_animation_duration = config.@"cursor-animation-duration",
                     .cursor_animation_bounciness = config.@"cursor-animation-bounciness",
                     .scroll_animation_duration = config.@"scroll-animation-duration",
                     .scroll_animation_bounciness = config.@"scroll-animation-bounciness",
+                    .neovim_corner_radius = config.@"neovim-corner-radius",
+                    .neovim_gap_color = .{ config.@"neovim-gap-color".r, config.@"neovim-gap-color".g, config.@"neovim-gap-color".b },
+                    .matte_rendering = @max(0, @min(1, config.@"matte-rendering")),
                     .font_thicken_strength = config.@"font-thicken-strength",
                     .font_features = font_features.list,
                     .font_styles = font_styles,
@@ -969,6 +991,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 &thr.draw_now,
             );
             display_link.start() catch {};
+
+            // Query the display's nominal refresh rate and store it so that
+            // both the animation timing and the software draw timer use the
+            // correct period for this monitor.
+            self.updateDisplayRefreshRate();
         }
 
         /// Called by renderer.Thread when it exits the main loop.
@@ -1074,15 +1101,46 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             display_link.setCurrentCGDisplay(id) catch |err| {
                 log.warn("error setting display link display id err={}", .{err});
             };
+            // The display may have a different refresh rate, update.
+            self.updateDisplayRefreshRate();
+        }
+
+        /// Query the display link for the nominal refresh period and store it.
+        /// Falls back to the current value if the query fails.
+        fn updateDisplayRefreshRate(self: *Self) void {
+            if (comptime DisplayLink == void) return;
+            const display_link = self.display_link orelse return;
+            if (display_link.getNominalRefreshPeriodNs()) |ns| {
+                self.display_refresh_ns = ns;
+                log.info("display refresh period: {}ns ({d:.1} Hz)", .{
+                    ns,
+                    @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(ns)),
+                });
+            }
         }
 
         /// True if our renderer has animations so that a higher frequency
         /// timer is used.
         pub fn hasAnimations(self: *const Self) bool {
-            // In Neovim GUI mode, always run at high refresh rate for
-            // smooth cursor, scrolling, and instant visual feedback
-            if (self.nvim_gui != null) return true;
-            return self.has_custom_shaders or self.cursor_animating or self.scroll_animating or self.sonicboom_active;
+            // Check actual animation state -- both Neovim GUI and terminal
+            // modes only keep the timer running while something is actually
+            // animating. This avoids burning CPU/GPU when idle.
+            return self.has_custom_shaders or
+                self.cursor_animating or
+                self.scroll_animating or
+                self.sonicboom_active or
+                // In Neovim GUI mode we also need to keep running while
+                // events are pending (dirty flag means content changed)
+                (self.nvim_gui != null and self.nvim_gui.?.dirty);
+        }
+
+        /// Return the ideal draw timer interval in milliseconds based on the
+        /// display refresh rate.  On macOS the DisplayLink provides precise
+        /// timing; elsewhere we estimate from the configured/default rate.
+        pub fn getRefreshRateMs(self: *const Self) u64 {
+            // Convert ns period to ms, clamped to [1, 33] (30-1000 Hz)
+            const ms = self.display_refresh_ns / std.time.ns_per_ms;
+            return @max(1, @min(ms, 33));
         }
 
         /// True if our renderer is using vsync. If true, the renderer or apprt
@@ -1570,25 +1628,60 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// 2. prepare_and_animate() → animate()
         /// 3. redraw_requested() → render()
         fn updateFrameNeovim(self: *Self, nvim: *neovim_gui.NeovimGui) !void {
-            // Calculate time delta for smooth scroll animation
+            // --- Neovide-style frame timing with catchup ---
+            //
+            // We maintain a virtual animation clock that tracks real wall-clock
+            // time.  Each frame we compute how far behind the animation clock
+            // is and catch up:
+            //   - >= 1 frame behind → catch up immediately (all at once)
+            //   - < 1 frame behind  → smooth over 10 frames (reduce jitter)
+            //   - > 1 second behind → reset (we were suspended / huge lag)
+            //
+            // The base frame period comes from the display refresh rate.
             const now = std.time.Instant.now() catch {
                 self.last_frame_time = null;
                 return;
             };
-            // Calculate frame delta time
-            const frame_dt: f32 = if (self.last_frame_time) |last| blk: {
-                if (now.order(last) == .lt) {
-                    break :blk 1.0 / 60.0;
-                }
-                const ns: f32 = @floatFromInt(now.since(last));
-                break :blk ns / std.time.ns_per_s;
-            } else 1.0 / 60.0;
             self.last_frame_time = now;
+
+            // Initialise animation clock on first frame
+            if (self.animation_start == null) {
+                self.animation_start = now;
+                self.animation_time = 0;
+            }
+
+            const refresh_ns = self.display_refresh_ns;
+            const target_animation_time_ns = now.since(self.animation_start.?);
+
+            // How far behind are we?
+            var delta_ns: u64 = if (target_animation_time_ns > self.animation_time)
+                target_animation_time_ns - self.animation_time
+            else
+                0;
+
+            // Safety: if we lagged by > 1 second, reset the clock
+            if (delta_ns > std.time.ns_per_s) {
+                self.animation_start = now;
+                self.animation_time = 0;
+                delta_ns = refresh_ns;
+            }
+
+            // Neovide-style catchup: if behind by >= 1 frame, catch up
+            // all at once. If < 1 frame, smooth over 10 frames.
+            const catchup_ns: u64 = if (delta_ns >= refresh_ns)
+                delta_ns
+            else
+                delta_ns / 10;
+
+            const total_dt_ns: u64 = refresh_ns + catchup_ns;
+            self.animation_time += total_dt_ns;
+
+            const frame_dt: f32 = @as(f32, @floatFromInt(total_dt_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
 
             // Step 1: Process events FIRST (includes flush which updates scrollback and position)
             nvim.processEvents() catch {};
 
-            // Step 2: Animate with Neovide's subdivision approach
+            // Step 2: Animate with subdivision approach
             // Subdivide large dt values to prevent animation jumps from inconsistent frame timing
             const MAX_ANIMATION_DT: f32 = 1.0 / 120.0; // 8.33ms max per animation step
             const num_steps: u32 = @max(1, @as(u32, @intFromFloat(@ceil(frame_dt / MAX_ANIMATION_DT))));
@@ -1610,20 +1703,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Update cursor animations (Neovide-style)
                 // MUST be in same timing as scroll to stay in sync
-                // Always call update() unconditionally - it's cheap and ensures animations
-                // continue even if cursor_animating flag gets out of sync
                 {
                     const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
                     const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
 
-                    // 1. Update the floaty spring animation (smooth cursor center movement)
                     const floaty_animating = self.cursor_animation.update(dt, 0.13, 1.0);
-
-                    // 2. Update the stretchy corner animation
                     const corner_animating = self.corner_cursor.update(dt, cell_width, cell_height);
 
                     self.cursor_animating = floaty_animating or corner_animating;
                 }
+            }
+
+            // If nothing is animating any more, reset the animation clock
+            // so the next animation start doesn't see stale accumulated time.
+            if (!self.cursor_animating and !self.scroll_animating and !self.sonicboom_active) {
+                self.animation_start = null;
+                self.animation_time = 0;
             }
 
             // Step 3: Render with current position and updated scrollback
@@ -1634,14 +1729,42 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Each window has its own scroll animation handled via per-cell offsets
             self.uniforms.pixel_scroll_offset_y = 0;
 
-            // Force cells_rebuilt if Neovim has changes
-            // This ensures we render when floating windows appear/disappear
-            // Keep dirty flag set to ensure continuous rendering until content stabilizes
-            if (nvim.dirty) {
+            // Determine if we actually need a full cell rebuild.
+            // Content-dirty: Neovim sent new grid lines, window show/hide, etc.
+            // Scroll-dirty:  a window's scroll offset changed (sub-pixel or integer boundary)
+            // If neither, we can skip the expensive rebuild entirely.
+            const content_dirty = nvim.dirty;
+            var scroll_dirty = self.scroll_animating or self.cursor_animating or self.sonicboom_active;
+
+            // Also check individual window dirty flags
+            if (!content_dirty and !scroll_dirty) {
+                var win_iter = nvim.windows.valueIterator();
+                while (win_iter.next()) |wp| {
+                    if (wp.*.dirty) {
+                        scroll_dirty = true;
+                        break;
+                    }
+                }
+            }
+
+            const needs_rebuild = content_dirty or scroll_dirty;
+
+            if (needs_rebuild) {
+                try self.rebuildCellsFromNeovim(nvim);
                 self.cells_rebuilt = true;
             }
 
-            try self.rebuildCellsFromNeovim(nvim);
+            // Clear dirty flags after consuming them
+            if (content_dirty) {
+                nvim.clearDirty();
+            }
+            // Clear per-window dirty flags too
+            {
+                var win_iter = nvim.windows.valueIterator();
+                while (win_iter.next()) |wp| {
+                    wp.*.dirty = false;
+                }
+            }
 
             const bg = nvim.default_background;
             self.uniforms.bg_color = .{
@@ -1650,8 +1773,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 @intCast(bg & 0xFF),
                 @intFromFloat(@round(self.config.background_opacity * 255.0)),
             };
-
-            self.cells_rebuilt = true;
             self.font_shaper.endFrame();
         }
 
@@ -1834,6 +1955,51 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
+            // Build window rect array for SDF rounded corners
+            // Each window gets an index (1-based, max 16). The shader uses these
+            // to compute SDF distance to the rounded rect boundary.
+            const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
+            const pad_left = self.uniforms.grid_padding[3]; // grid_padding: top, right, bottom, left
+            const pad_top = self.uniforms.grid_padding[0];
+            var window_id_map = std.AutoHashMap(u64, u8).init(self.alloc);
+            defer window_id_map.deinit();
+            var next_window_id: u8 = 1;
+
+            // Set config uniforms
+            self.uniforms.corner_radius = self.config.neovim_corner_radius;
+            // Use the actual Neovim default background as gap color so the
+            // SDF rounding blends seamlessly into the background
+            self.uniforms.gap_color = .{
+                @intCast((default_bg >> 16) & 0xFF),
+                @intCast((default_bg >> 8) & 0xFF),
+                @intCast(default_bg & 0xFF),
+                0xFF,
+            };
+            self.uniforms.matte_intensity = self.config.matte_rendering;
+            self.uniforms.text_gamma = self.config.text_gamma;
+            self.uniforms.text_contrast = self.config.text_contrast;
+
+            for (windows_to_render.items) |w| {
+                if (next_window_id > 16) break;
+
+                const win_col_f: f32 = w.grid_position[0];
+                const win_row_f: f32 = w.grid_position[1];
+                const rw: f32 = @floatFromInt(w.getRenderWidth());
+                const rh: f32 = @floatFromInt(w.getRenderHeight());
+
+                // Convert grid coords to pixel coords
+                const px_x = pad_left + win_col_f * cell_w;
+                const px_y = pad_top + win_row_f * cell_h;
+                const px_w = rw * cell_w;
+                const px_h = rh * cell_h;
+
+                const wid = next_window_id;
+                window_id_map.put(w.id, wid) catch {};
+                self.uniforms.window_rects[wid - 1] = .{ px_x, px_y, px_w, px_h };
+                next_window_id += 1;
+            }
+            self.uniforms.window_rect_count = next_window_id - 1;
+
             // RENDERING STRATEGY:
             //
             // We use painter's algorithm (back to front) for BACKGROUNDS but need occlusion for TEXT.
@@ -1914,6 +2080,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const win_col: u16 = @intFromFloat(window.grid_position[0]);
                 const win_row: u16 = @intFromFloat(window.grid_position[1]);
 
+                // Window ID for SDF rounding (0 = no rounding)
+                const cur_window_id: u8 = window_id_map.get(window.id) orelse 0;
+
                 // Use render dimensions (from win_pos) to avoid artifacts during resize
                 // win_pos arrives before grid_resize, so these may be smaller than grid dimensions
                 const render_width = window.getRenderWidth();
@@ -1931,10 +2100,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Floating windows get entirely new content from Neovim on each update,
                 // so scrollback rotation doesn't work for them (causes black rows).
                 const has_valid_scrollback = if (!is_floating) window.hasValidScrollbackData() else false;
-                const scroll_pixel_offset: f32 = if (has_valid_scrollback)
+
+                // Neovide-style scroll offset computation:
+                //
+                //   raw_offset  = the sub-pixel float from the spring (for deciding
+                //                 whether animation is active / extra row needed)
+                //   scroll_pixel_offset = round(raw_offset) — the whole-pixel value
+                //                 that BOTH text and bg cells use (eliminates shimmer)
+                //
+                // The raw offset drives "is animation happening?" and "do we need an
+                // extra row?", while the rounded offset is what actually goes to the
+                // GPU.  This keeps motion smooth (sub-pixel spring drives scrollback
+                // line selection) while keeping text crisp (whole-pixel shift).
+                const raw_scroll_offset: f32 = if (has_valid_scrollback)
                     window.getSubLineOffset(cell_h)
                 else
                     0;
+                const scroll_pixel_offset: f32 = @round(raw_scroll_offset);
+
+                // If rounding pushed us to a full cell height, the scrollback line
+                // lookup already advanced past this boundary via floor(), so the
+                // effective pixel offset wraps back to 0.  This keeps the rounded
+                // offset consistent with the line selection.
+                // (In practice this only fires when raw is very close to ±cell_h.)
 
                 const margin_top = window.viewport_margins.top;
                 const margin_bottom = window.viewport_margins.bottom;
@@ -1976,6 +2164,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 win_opacity,
                             },
                             .offset_y_fixed = 0, // Margins don't scroll
+                            .window_id = cur_window_id,
                         };
 
                         // Text: always render (no occlusion check for margin rows)
@@ -1986,10 +2175,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }
                 }
 
-                // Render scrollable region
-                // Render extra row during scroll so content can scroll into view from below
-                const bg_offset_fixed: i16 = @intFromFloat(scroll_pixel_offset * 256.0);
-                const render_extra_row = (!is_floating and has_valid_scrollback and scroll_pixel_offset != 0);
+                // Render scrollable region.
+                // During scroll animation, always render inner_size + 1 rows
+                // (matching Neovide's iter_scrollable_lines which iterates 0..=inner_size).
+                // The extra row at the bottom allows content to scroll into view smoothly.
+                // Use RAW (pre-round) offset to decide whether animation is active.
+                const bg_offset_fixed: i16 = @intFromFloat(std.math.clamp(scroll_pixel_offset * 256.0, -32768.0, 32767.0));
+                const is_scroll_animating = (!is_floating and has_valid_scrollback and raw_scroll_offset != 0);
+                const render_extra_row = is_scroll_animating;
                 const render_rows = if (render_extra_row) inner_size + 1 else inner_size;
                 var inner_row: u32 = 0;
                 while (inner_row < render_rows) : (inner_row += 1) {
@@ -2054,6 +2247,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                     win_opacity,
                                 },
                                 .offset_y_fixed = 0,
+                                .window_id = cur_window_id,
                             };
                         } else if (hl_attr.blend > 0) {
                             const blend_alpha = 255 - (@as(u16, hl_attr.blend) * 255 / 100);
@@ -2073,6 +2267,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             self.cells.bgCell(screen_y, screen_x).* = .{
                                 .color = .{ final_r, final_g, final_b, 255 },
                                 .offset_y_fixed = bg_offset_fixed,
+                                .window_id = cur_window_id,
                             };
                         } else {
                             self.cells.bgCell(screen_y, screen_x).* = .{
@@ -2083,6 +2278,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                     255,
                                 },
                                 .offset_y_fixed = bg_offset_fixed,
+                                .window_id = cur_window_id,
                             };
                         }
 
@@ -2146,6 +2342,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                 win_opacity,
                             },
                             .offset_y_fixed = 0,
+                            .window_id = cur_window_id,
                         };
 
                         // Only render TEXT if this window owns this cell (occlusion check)
@@ -2213,9 +2410,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const pos_changed = screen_col != last_x or screen_row != last_y;
 
             if (pos_changed or scroll_changed) {
-                // Set new target - target_pixel_y already includes scroll offset
-                self.cursor_animation.setTarget(target_pixel_x, target_pixel_y, cell_width);
-                self.corner_cursor.setTarget(target_pixel_x, target_pixel_y, cell_width, cell_height);
+                // Check if the cursor's window had a far-scroll snap.
+                // If so, snap the cursor instantly instead of animating.
+                if (cursor_window.far_scroll_snapped) {
+                    // Snap cursor to new position (no animation)
+                    self.cursor_animation.target_x = target_pixel_x;
+                    self.cursor_animation.target_y = target_pixel_y;
+                    self.cursor_animation.current_x = target_pixel_x;
+                    self.cursor_animation.current_y = target_pixel_y;
+                    self.cursor_animation.spring.reset();
+                    self.corner_cursor.snap(target_pixel_x, target_pixel_y, cell_width, cell_height);
+                    cursor_window.far_scroll_snapped = false;
+                } else {
+                    // Normal smooth animation to new target
+                    self.cursor_animation.setTarget(target_pixel_x, target_pixel_y, cell_width);
+                    self.corner_cursor.setTarget(target_pixel_x, target_pixel_y, cell_width, cell_height);
+                }
 
                 self.last_cursor_grid_pos = .{ screen_col, screen_row };
                 self.last_cursor_scroll_pos = scroll_pos;
@@ -2480,39 +2690,80 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 log.debug("drawFrame: reinit complete, continuing with frame", .{});
             }
 
-            // Unified timing
+            // --- Terminal mode timing with sub-stepping & proper fallback ---
             const now = std.time.Instant.now() catch return;
-            const last = self.last_frame_time orelse now;
-            // Safety: Check if time went backwards (can happen with system clock adjustments)
-            const dt: f32 = if (now.order(last) == .lt) blk: {
-                break :blk 1.0 / 60.0; // Default to 60fps if time went backwards
-            } else blk: {
-                const dt_ns: f32 = @floatFromInt(now.since(last));
-                break :blk @min(dt_ns / std.time.ns_per_s, 0.1);
-            };
+            const any_anim = self.cursor_animating or self.scroll_animating or self.sonicboom_active;
 
-            if (self.cursor_animating or self.scroll_animating or self.sonicboom_active) {
+            // Use display refresh period as fallback dt (first frame / time went backwards)
+            const fallback_dt_ns: f32 = @floatFromInt(self.display_refresh_ns);
+            const fallback_dt: f32 = fallback_dt_ns / @as(f32, @floatFromInt(std.time.ns_per_s));
+
+            const raw_dt: f32 = if (self.last_frame_time) |last| blk: {
+                if (now.order(last) == .lt) {
+                    break :blk fallback_dt;
+                }
+                const dt_ns: f32 = @floatFromInt(now.since(last));
+                break :blk @min(dt_ns / @as(f32, @floatFromInt(std.time.ns_per_s)), 0.1);
+            } else fallback_dt;
+
+            if (any_anim) {
                 self.last_frame_time = now;
             } else {
                 self.last_frame_time = null;
             }
 
-            // Update cursor animation if active
-            if (self.cursor_animating) {
-                const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
-                const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
-                const cursor_len = self.config.cursor_animation_duration;
-                const cursor_zeta = 1.0 - (self.config.cursor_animation_bounciness * 0.6);
-                const floaty_animating = self.cursor_animation.update(dt, cursor_len, cursor_zeta);
+            // Sub-step animations to keep spring simulation stable at any frame rate.
+            // For Neovim GUI mode, cursor/scroll were already updated in updateFrameNeovim --
+            // we only handle sonicboom here.  For terminal mode, all animations are updated.
+            if (any_anim) {
+                const MAX_ANIMATION_DT: f32 = 1.0 / 120.0;
+                const num_steps: u32 = @max(1, @as(u32, @intFromFloat(@ceil(raw_dt / MAX_ANIMATION_DT))));
+                const dt: f32 = raw_dt / @as(f32, @floatFromInt(num_steps));
+                const is_terminal = self.nvim_gui == null;
 
-                // Update corner animations for both Neovim and terminal mode
-                const corner_animating = self.corner_cursor.update(dt, cell_w, cell_h);
-                self.cursor_animating = floaty_animating or corner_animating;
+                var step_i: u32 = 0;
+                while (step_i < num_steps) : (step_i += 1) {
+                    // Cursor animations (terminal mode only -- nvim GUI handles these in updateFrameNeovim)
+                    if (is_terminal and self.cursor_animating) {
+                        const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
+                        const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                        const cursor_len = self.config.cursor_animation_duration;
+                        const cursor_zeta = 1.0 - (self.config.cursor_animation_bounciness * 0.6);
+                        const floaty_animating = self.cursor_animation.update(dt, cursor_len, cursor_zeta);
+                        const corner_animating = self.corner_cursor.update(dt, cell_w, cell_h);
+                        self.cursor_animating = floaty_animating or corner_animating;
+                    }
 
-                if (self.nvim_gui == null) {
-                    // Terminal mode: update corner uniforms from animation state
-                    // Subtract pixel_scroll_offset_y since corner positions are absolute
-                    // but the shader replaces cell_pos entirely (bypassing the scroll offset)
+                    // Scroll spring animation (terminal mode only)
+                    if (is_terminal and self.scroll_animating) {
+                        const scroll_len = self.config.scroll_animation_duration;
+                        const scroll_zeta = 1.0 - (self.config.scroll_animation_bounciness * 0.6);
+                        self.scroll_animating = self.scroll_spring.update(dt, scroll_len, scroll_zeta);
+                    }
+
+                    // Sonicboom VFX (both modes)
+                    if (self.sonicboom_active) {
+                        self.sonicboom_time += dt;
+                        const t = self.sonicboom_time / self.sonicboom_duration;
+                        if (t >= 1.0) {
+                            self.sonicboom_active = false;
+                            self.sonicboom_time = 0;
+                            self.uniforms.sonicboom_color = .{ 0, 0, 0, 0 };
+                        } else {
+                            const ease_t = 1.0 - std.math.pow(f32, 1.0 - t, 3.0);
+                            self.uniforms.sonicboom_center = .{ self.sonicboom_center_x, self.sonicboom_center_y };
+                            self.uniforms.sonicboom_radius = ease_t * self.sonicboom_max_radius;
+                            self.uniforms.sonicboom_thickness = 12.0 * (1.0 - t);
+                            const alpha: u8 = @intFromFloat(@max(0, std.math.pow(f32, 1.0 - t, 2.0) * 220.0));
+                            self.uniforms.sonicboom_color = .{ 255, 255, 255, alpha };
+                        }
+                    }
+                }
+
+                // After all sub-steps, update terminal mode corner uniforms
+                if (is_terminal and self.cursor_animating) {
+                    const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
+                    const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
                     const cursor_x = self.uniforms.cursor_pos[0];
                     const cursor_y = self.uniforms.cursor_pos[1];
                     if (cursor_x != std.math.maxInt(u16) and cursor_y != std.math.maxInt(u16)) {
@@ -2531,43 +2782,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            // Sonicboom VFX is now triggered directly on cursor shape changes
-            // in renderNeovimCursor (Neovim GUI) and cursor_anim block (terminal mode).
-
-            // Update sonicboom animation
-            if (self.sonicboom_active) {
-                self.sonicboom_time += dt;
-                const t = self.sonicboom_time / self.sonicboom_duration;
-                if (t >= 1.0) {
-                    // Effect complete
-                    self.sonicboom_active = false;
-                    self.sonicboom_time = 0;
-                    self.uniforms.sonicboom_color = .{ 0, 0, 0, 0 };
-                } else {
-                    // Fast expanding ring explosion with bright flash
-                    // Use cubic ease-out for fast explosion that slows at the end
-                    const ease_t = 1.0 - std.math.pow(f32, 1.0 - t, 3.0);
-                    self.uniforms.sonicboom_center = .{ self.sonicboom_center_x, self.sonicboom_center_y };
-                    self.uniforms.sonicboom_radius = ease_t * self.sonicboom_max_radius;
-
-                    // Start thick and thin out for explosive shockwave feel
-                    self.uniforms.sonicboom_thickness = 12.0 * (1.0 - t);
-
-                    // Bright white with fast fade (quadratic for punchier disappearance)
-                    const alpha: u8 = @intFromFloat(@max(0, std.math.pow(f32, 1.0 - t, 2.0) * 220.0));
-                    self.uniforms.sonicboom_color = .{ 255, 255, 255, alpha };
-                }
-            }
-
-            // NOTE: For Neovim GUI mode, scroll animations are updated in updateFrameNeovim
-            // along with event processing, so they stay perfectly in sync (like Neovide).
-            // We don't duplicate animation updates here to avoid race conditions.
-
-            // Update terminal scroll spring animation (not for Neovim GUI mode)
-            if (self.nvim_gui == null and self.scroll_animating) {
-                const scroll_len = self.config.scroll_animation_duration;
-                const scroll_zeta = 1.0 - (self.config.scroll_animation_bounciness * 0.6);
-                self.scroll_animating = self.scroll_spring.update(dt, scroll_len, scroll_zeta);
+            // Set rendering uniforms for terminal mode too
+            // (For Neovim GUI mode, these are set in rebuildCellsFromNeovim)
+            if (self.nvim_gui == null) {
+                self.uniforms.matte_intensity = self.config.matte_rendering;
+                self.uniforms.text_gamma = self.config.text_gamma;
+                self.uniforms.text_contrast = self.config.text_contrast;
             }
 
             // Pixel scroll offset for smooth scrolling

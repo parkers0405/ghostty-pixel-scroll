@@ -963,6 +963,39 @@ palette: Palette = .{},
 ///     Then set: neovim-gui = /tmp/nvim.sock
 ///
 /// When not set (empty string), Ghostty runs in normal terminal mode.
+/// The color of the gap between Neovim windows (splits, nvim-tree, etc.).
+/// This fills the space where separators would normally appear, creating
+/// a visual gap that makes rounded corners visible. Only applies in
+/// Neovim GUI mode when neovim-corner-radius > 0.
+@"neovim-gap-color": Color = .{ .r = 0x0a, .g = 0x0a, .b = 0x0a },
+
+/// Corner radius in pixels for SDF-based rounded corners on Neovim windows.
+/// This applies rounded corners to all Neovim GUI windows (nvim-tree, splits,
+/// floating windows). Set to 0.0 to disable rounded corners. Only applies in
+/// Neovim GUI mode.
+@"neovim-corner-radius": f32 = 8.0,
+
+/// Matte/ink color post-processing intensity (0.0 = off, 1.0 = full effect).
+/// When enabled, applies a subtle post-processing effect that gives colors
+/// a matte, physical-ink quality similar to modern design tools (Linear, Arc,
+/// Vercel). This includes slight desaturation, shadow lift, highlight
+/// compression, and cool-tinted shadows. Works with any colorscheme.
+@"matte-rendering": f32 = 0.5,
+
+/// Text gamma adjustment for glyph rendering weight.
+/// 0.0 = standard sRGB gamma (2.2), which is the default.
+/// Positive values (e.g. 0.8) make text appear thicker/darker.
+/// Negative values make text thinner/lighter.
+/// To emulate Alacritty-style text: text-gamma=0.8, text-contrast=0.1
+@"text-gamma": f32 = 0.0,
+
+/// Text contrast adjustment for glyph edge sharpness.
+/// 0.0 = no adjustment (default).
+/// Higher values (e.g. 0.5) sharpen glyph edges by steepening
+/// the alpha curve, making text appear crisper.
+/// Neovide default is 0.5.
+@"text-contrast": f32 = 0.0,
+
 @"neovim-gui": []const u8 = "",
 
 /// The opacity level (opposite of transparency) of the background. A value of

@@ -283,6 +283,32 @@ pub const Uniforms = extern struct {
     tui_scroll_region_top: u16 align(2) = 0,
     tui_scroll_region_bottom: u16 align(2) = 0,
 
+    /// SDF rounded corner radius in pixels (0 = disabled)
+    corner_radius: f32 align(4) = 0,
+
+    /// Gap color for SDF rounding (what shows between rounded windows)
+    gap_color: [4]u8 align(4) = .{ 0x0a, 0x0a, 0x0a, 0xFF },
+
+    /// Matte/ink color post-processing intensity (0.0 = off, 1.0 = full)
+    matte_intensity: f32 align(4) = 0,
+
+    /// Text gamma adjustment. 0.0 = standard sRGB (gamma 2.2).
+    /// Positive values make text thicker/darker, negative thinner.
+    /// Matches Neovide's text_gamma (applied as pow to glyph alpha).
+    text_gamma: f32 align(4) = 0,
+
+    /// Text contrast adjustment. 0.0 = no change, 1.0 = maximum contrast.
+    /// Sharpens glyph edges by steepening the alpha curve.
+    /// Matches Neovide's text_contrast (default 0.5 in Neovide).
+    text_contrast: f32 align(4) = 0,
+
+    /// Number of active window rects for SDF rounding
+    window_rect_count: u32 align(4) = 0,
+
+    /// Window rectangles for SDF rounding: {x, y, w, h} in pixel coords
+    /// Max 16 windows. The index into this array matches the window_id in CellBg.
+    window_rects: [16][4]f32 align(16) = [_][4]f32{.{ 0, 0, 0, 0 }} ** 16,
+
     const PaddingExtend = packed struct(u8) {
         left: bool = false,
         right: bool = false,
@@ -329,7 +355,9 @@ pub const CellBg = extern struct {
     /// Per-cell Y offset in pixels for smooth scrolling
     /// Stored as 8.8 fixed point (i16): value = pixels * 256
     offset_y_fixed: i16 = 0,
-    _padding: [2]u8 = .{ 0, 0 }, // Align to 8 bytes for GPU buffer
+    /// Window index for SDF rounding (0 = no window/default, 1-16 = window rect index)
+    window_id: u8 = 0,
+    _padding: [1]u8 = .{0}, // Align to 8 bytes for GPU buffer
 };
 
 /// Single parameter for the image shader. See shader for field details.

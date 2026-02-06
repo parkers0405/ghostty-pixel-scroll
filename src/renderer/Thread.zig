@@ -16,7 +16,10 @@ const App = @import("../App.zig");
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.renderer_thread);
 
-const DRAW_INTERVAL = 6; // ~165 FPS for high refresh rate monitors
+/// Default draw interval in ms when we can't determine the monitor refresh rate.
+/// 6ms ≈ 165Hz. This is overridden at runtime when the renderer reports
+/// actual refresh rate information.
+const DEFAULT_DRAW_INTERVAL: u64 = 6;
 const CURSOR_BLINK_INTERVAL = 600;
 
 /// Whether calls to `drawFrame` must be done from the app thread.
@@ -61,6 +64,11 @@ render_c: xev.Completion = .{},
 draw_h: xev.Timer,
 draw_c: xev.Completion = .{},
 draw_active: bool = false,
+
+/// Dynamic draw interval in milliseconds, derived from the renderer's
+/// reported refresh rate. Defaults to DEFAULT_DRAW_INTERVAL and is
+/// updated whenever the renderer can provide actual monitor info.
+draw_interval: u64 = DEFAULT_DRAW_INTERVAL,
 
 /// This async is used to force a draw immediately. This does not
 /// coalesce like the wakeup does.
@@ -327,11 +335,14 @@ fn syncDrawTimer(self: *Thread) void {
     // If our draw timer is already active, then we don't have to do anything.
     if (self.draw_c.state() == .active) return;
 
+    // Update draw interval from renderer's refresh rate knowledge
+    self.updateDrawInterval();
+
     // Start the timer which loops
     self.draw_h.run(
         &self.loop,
         &self.draw_c,
-        DRAW_INTERVAL,
+        self.draw_interval,
         Thread,
         self,
         drawCallback,
@@ -507,6 +518,17 @@ fn changeConfig(self: *Thread, config: *const DerivedConfig) !void {
     self.config = config.*;
 }
 
+/// Update the draw interval based on the renderer's knowledge of the
+/// display refresh rate. On macOS with vsync the DisplayLink handles
+/// frame pacing, but the software timer still fires for non-vsync
+/// paths and for Linux. We query the renderer for a refresh rate hint
+/// and compute the interval from that.
+fn updateDrawInterval(self: *Thread) void {
+    if (@hasDecl(rendererpkg.Renderer, "getRefreshRateMs")) {
+        self.draw_interval = self.renderer.getRefreshRateMs();
+    }
+}
+
 /// Trigger a draw. This will not update frame data or anything, it will
 /// just trigger a draw/paint.
 fn drawFrame(self: *Thread, now: bool) void {
@@ -611,7 +633,7 @@ fn drawCallback(
 
     // Only continue if we're still active
     if (t.draw_active) {
-        t.draw_h.run(&t.loop, &t.draw_c, DRAW_INTERVAL, Thread, t, drawCallback);
+        t.draw_h.run(&t.loop, &t.draw_c, t.draw_interval, Thread, t, drawCallback);
     }
 
     return .disarm;

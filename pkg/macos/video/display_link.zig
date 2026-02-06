@@ -47,6 +47,19 @@ pub const DisplayLink = opaque {
             return error.InvalidOperation;
     }
 
+    /// Returns the nominal refresh period of the display in nanoseconds,
+    /// or null if it cannot be determined (e.g. display link not associated
+    /// with a display yet).
+    pub fn getNominalRefreshPeriodNs(self: *DisplayLink) ?u64 {
+        const time = c.CVDisplayLinkGetNominalOutputVideoRefreshPeriod(@ptrCast(self));
+        // CVTime with flags containing kCVTimeIsIndefinite means no valid data
+        if (time.flags & c.kCVTimeIsIndefinite != 0) return null;
+        if (time.timeScale == 0 or time.timeValue == 0) return null;
+        // Convert CVTime to nanoseconds: (timeValue / timeScale) * 1e9
+        const ns = @as(u64, @intCast(time.timeValue)) * std.time.ns_per_s / @as(u64, @intCast(time.timeScale));
+        return if (ns > 0) ns else null;
+    }
+
     // Note: this purposely throws away a ton of arguments I didn't need.
     // It would be trivial to refactor this into Zig types and properly
     // pass this through.

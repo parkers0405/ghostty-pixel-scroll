@@ -410,18 +410,11 @@ pub const NeovimGui = struct {
             },
             .win_hide => |grid| {
                 if (self.windows.get(grid)) |window| {
-                    // For floating windows, start fade-out animation instead of instant hide.
-                    // The window stays visible during the fade; once opacity reaches 0,
-                    // the renderer will skip it (opacity check).
-                    if (window.window_type == .floating or window.window_type == .message) {
-                        window.target_opacity = 0.0;
-                        window.opacity_spring.position = window.opacity; // fade from current opacity to 0
-                        window.opacity_spring.velocity = 0;
-                        window.fading_out = true;
-                        // Don't set hidden=true yet — let the animation finish first
-                    } else {
-                        window.hidden = true;
-                    }
+                    // Hide windows instantly. Fade-out animations on win_hide cause
+                    // visible grey rectangle artifacts when closing buffers because
+                    // the semi-transparent window lingers for the fade duration.
+                    window.hidden = true;
+                    window.fading_out = false;
                 }
             },
             .win_close => |grid| {

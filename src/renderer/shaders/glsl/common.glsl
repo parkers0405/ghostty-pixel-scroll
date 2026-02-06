@@ -40,6 +40,14 @@ layout(binding = 1, std140) uniform Globals {
     // TUI smooth scrolling
     uniform float tui_scroll_offset_y;     // Pixel offset for scroll region cells
     uniform uint tui_scroll_region_packed; // Packed 2x u16: top (low 16), bottom (high 16)
+    // SDF rounded corners
+    uniform float corner_radius;           // Corner radius in pixels (0 = disabled)
+    uniform uint gap_color_packed;         // Gap color between rounded windows (packed RGBA)
+    uniform float matte_intensity;         // Matte/ink post-processing (0 = off, 1 = full)
+    uniform float text_gamma;              // Text gamma adjustment (0 = standard sRGB)
+    uniform float text_contrast;           // Text contrast adjustment (0 = no change)
+    uniform uint window_rect_count;        // Number of active window rects
+    uniform vec4 window_rects[16];         // Window pixel rects: {x, y, w, h}
 };
 
 // Bools

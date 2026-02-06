@@ -44,7 +44,7 @@ out CellTextVertexOut {
 
 struct CellBgData {
     uint color;
-    int offset_y_fixed;
+    int offset_and_winid;
 };
 
 layout(binding = 1, std430) readonly buffer bg_cells {
@@ -86,8 +86,9 @@ void main() {
     cell_pos = cell_pos + size * corner + offset;
     
     // Apply per-cell pixel scroll offset (8.8 fixed-point -> float)
-    // This enables per-window smooth scrolling in Neovim GUI mode
-    float per_cell_offset_y = float(pixel_offset_y_fixed) / 256.0;
+    // Round to whole pixels so all glyphs jump simultaneously (no inter-line shimmer).
+    // Backgrounds use the fractional offset for smooth sub-pixel sliding.
+    float per_cell_offset_y = round(float(pixel_offset_y_fixed) / 256.0);
     cell_pos.y += per_cell_offset_y;
 
     // Apply TUI scroll offset for cells within the scroll region

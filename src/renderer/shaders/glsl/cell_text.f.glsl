@@ -9,7 +9,7 @@ layout(binding = 1) uniform sampler2DRect atlas_color;
 // Per-cell background data for checking if fragment falls into fixed (statusline) region
 struct CellBgData {
     uint color;
-    int offset_y_fixed;
+    int offset_and_winid;
 };
 
 layout(binding = 1, std430) readonly buffer bg_cells {
@@ -44,7 +44,7 @@ void main() {
         if (dest_grid_pos.x >= 0 && dest_grid_pos.x < int(grid_size.x) &&
             dest_grid_pos.y >= 0 && dest_grid_pos.y < int(grid_size.y)) {
             int cell_index = dest_grid_pos.y * int(grid_size.x) + dest_grid_pos.x;
-            int offset_raw = cells[cell_index].offset_y_fixed;
+            int offset_raw = cells[cell_index].offset_and_winid;
             int offset_i16 = (offset_raw << 16) >> 16;
             
             // If dest cell is fixed (offset=0) but this text has offset, clip it
@@ -65,6 +65,30 @@ void main() {
             in_data.cell_grid_pos.y <= tui_region.y) {
             if (frag_grid.y < int(tui_region.x) || frag_grid.y > int(tui_region.y)) {
                 discard;
+            }
+        }
+    }
+
+    // SDF Rounded Corners: clip text fragments outside rounded rect
+    if (corner_radius > 0.0) {
+        uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
+        ivec2 text_grid = ivec2(in_data.cell_grid_pos);
+        if (text_grid.x >= 0 && text_grid.x < int(grid_size.x) &&
+            text_grid.y >= 0 && text_grid.y < int(grid_size.y)) {
+            int ci = text_grid.y * int(grid_size.x) + text_grid.x;
+            uint wid = uint(cells[ci].offset_and_winid >> 16) & 0xFFu;
+            if (wid > 0u && wid <= window_rect_count) {
+                vec4 wrect = window_rects[wid - 1u];
+                vec2 win_pos = wrect.xy;
+                vec2 win_size = wrect.zw;
+                vec2 center = win_pos + win_size * 0.5;
+                vec2 half_size = win_size * 0.5;
+                float r = corner_radius;
+                vec2 d = abs(gl_FragCoord.xy - center) - half_size + vec2(r);
+                float dist = length(max(d, vec2(0.0))) + min(max(d.x, d.y), 0.0) - r;
+                if (dist > 0.0) {
+                    discard;
+                }
             }
         }
     }
@@ -92,6 +116,18 @@ void main() {
 
             // Fetch our alpha mask for this pixel.
             float a = texture(atlas_grayscale, in_data.tex_coord).r;
+
+            // Text gamma/contrast adjustment (matches Neovide's text_gamma/text_contrast).
+            if (text_gamma != 0.0 || text_contrast != 0.0) {
+                if (text_gamma != 0.0) {
+                    float gamma_exp = 1.0 / (1.0 + text_gamma);
+                    a = pow(a, gamma_exp);
+                }
+                if (text_contrast > 0.0) {
+                    float k = 1.0 + text_contrast * 4.0;
+                    a = clamp((a - 0.5) * k + 0.5, 0.0, 1.0);
+                }
+            }
 
             // Linear blending weight correction corrects the alpha value to
             // produce blending results which match gamma-incorrect blending.

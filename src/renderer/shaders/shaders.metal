@@ -44,6 +44,13 @@ struct Uniforms {
   float tui_scroll_offset_y;      // Pixel offset for scroll region cells
   ushort tui_scroll_region_top;   // Top row of scroll region (inclusive)
   ushort tui_scroll_region_bottom; // Bottom row of scroll region (inclusive)
+
+  // SDF rounded corners
+  float corner_radius;            // Corner radius in pixels (0 = disabled)
+  uchar4 gap_color;               // Gap color between rounded windows
+  float matte_intensity;          // Matte/ink post-processing (0 = off, 1 = full)
+  uint window_rect_count;         // Number of active window rects
+  float4 window_rects[16];        // Window pixel rects: {x, y, w, h}
 };
 
 //-------------------------------------------------------------------
@@ -471,7 +478,8 @@ fragment float4 bg_image_fragment(
 struct CellBgData {
   uchar4 color;
   short offset_y_fixed;  // 8.8 fixed point Y offset
-  uchar2 padding;
+  uchar window_id;       // Window index for SDF rounding (0 = none, 1-16 = window)
+  uchar padding;
 };
 
 fragment float4 cell_bg_fragment(
@@ -513,7 +521,7 @@ fragment float4 cell_bg_fragment(
     // Only apply offset to cells that have one (non-zero)
     // Cells with offset=0 are statuslines/margins - they stay fixed and opaque
     if (per_cell_offset_fixed != 0) {
-      float per_cell_offset_y = float(per_cell_offset_fixed) / 256.0;
+      float per_cell_offset_y = round(float(per_cell_offset_fixed) / 256.0);
       adjusted_pos.y -= per_cell_offset_y;
       int2 new_grid_pos = int2(floor((adjusted_pos - uniforms.grid_padding.wx) / uniforms.cell_size));
       
@@ -569,24 +577,80 @@ fragment float4 cell_bg_fragment(
   }
 
   // Load the color for the cell from the struct
-  uchar4 cell_color = cells[grid_pos.y * uniforms.grid_size.x + grid_pos.x].color;
+  int cell_index_final = grid_pos.y * uniforms.grid_size.x + grid_pos.x;
+  uchar4 cell_color = cells[cell_index_final].color;
+  uchar cell_window_id = cells[cell_index_final].window_id;
   
   // Force alpha to 255 - backgrounds should always be opaque
   // This prevents transparency issues during smooth scrolling
   cell_color.a = 255;
 
   // Convert the color and return it.
-  //
-  // TODO: It might be a good idea to do a pass before this
-  //       to convert all of the bg colors, so we don't waste
-  //       a bunch of work converting the cell color in every
-  //       fragment of each cell. It's not the most epxensive
-  //       operation, but it is still wasted work.
   float4 result = load_color(
     cell_color,
     uniforms.use_display_p3,
     uniforms.use_linear_blending
   );
+
+  // SDF Rounded Corners: apply rounded rectangle clipping per-window
+  if (uniforms.corner_radius > 0.0 && cell_window_id > 0 &&
+      cell_window_id <= uniforms.window_rect_count) {
+    float4 wrect = uniforms.window_rects[cell_window_id - 1];
+    float2 win_pos = wrect.xy;
+    float2 win_size = wrect.zw;
+
+    // Position relative to window center
+    float2 frag_pos = in.position.xy;
+    float2 center = win_pos + win_size * 0.5;
+    float2 half_size = win_size * 0.5;
+    float r = uniforms.corner_radius;
+
+    // SDF for rounded rectangle: distance from point to nearest edge
+    float2 d = abs(frag_pos - center) - half_size + float2(r);
+    float dist = length(max(d, float2(0.0))) + min(max(d.x, d.y), 0.0) - r;
+
+    // Anti-aliased edge: smoothstep over ~1.5px for crisp AA
+    float alpha = 1.0 - smoothstep(-1.0, 0.5, dist);
+
+    // Outside the rounded rect: show the gap color
+    if (alpha < 1.0) {
+      float4 gap_bg = load_color(
+        uniforms.gap_color,
+        uniforms.use_display_p3,
+        uniforms.use_linear_blending
+      );
+      result = mix(gap_bg, result, alpha);
+    }
+  }
+
+  // Matte/ink color post-processing
+  if (uniforms.matte_intensity > 0.0) {
+    float t = uniforms.matte_intensity;
+
+    // Work in gamma space for perceptual correctness
+    float4 color_gamma = uniforms.use_linear_blending ? unlinearize(result) : result;
+
+    // 1. Slight desaturation (5-15% scaled by intensity) - makes colors less "digital"
+    float lum = dot(color_gamma.rgb, float3(0.2126, 0.7152, 0.0722));
+    color_gamma.rgb = mix(color_gamma.rgb, float3(lum), 0.12 * t);
+
+    // 2. Shadow lift + highlight compression - gives "matte" feel
+    //    No real surface is pure black or pure white
+    float lift = 0.02 * t;      // Lift shadows slightly
+    float compress = 0.97 + 0.03 * (1.0 - t);  // Compress highlights
+    color_gamma.rgb = color_gamma.rgb * compress + float3(lift);
+
+    // 3. Cool-tint shadows - subtle blue shift in dark areas
+    //    Gives the "designed" look of Linear/Vercel/Arc
+    float shadow_strength = (1.0 - lum) * t;
+    color_gamma.rgb += float3(-0.003, -0.001, 0.008) * shadow_strength;
+
+    // Clamp to valid range
+    color_gamma.rgb = saturate(color_gamma.rgb);
+
+    result = uniforms.use_linear_blending ? linearize(color_gamma) : color_gamma;
+    result.a = 1.0;  // Ensure fully opaque after processing
+  }
 
   // Sonicboom VFX: expanding double ring explosion
   if (uniforms.sonicboom_color.a > 0 && uniforms.sonicboom_radius > 0.0) {
@@ -743,8 +807,9 @@ vertex CellTextVertexOut cell_text_vertex(
   cell_pos = cell_pos + size * corner + offset;
   
   // Apply per-cell pixel scroll offset (8.8 fixed-point -> float)
-  // This enables per-window smooth scrolling in Neovim GUI mode
-  float per_cell_offset_y = float(in.pixel_offset_y_fixed) / 256.0f;
+  // Round to whole pixels so all glyphs jump simultaneously (no inter-line shimmer).
+  // Backgrounds use the fractional offset for smooth sub-pixel sliding.
+  float per_cell_offset_y = round(float(in.pixel_offset_y_fixed) / 256.0f);
   cell_pos.y += per_cell_offset_y;
 
   // Apply TUI scroll offset for cells within the scroll region
@@ -899,6 +964,30 @@ fragment float4 cell_text_fragment(
     }
   }
 
+  // SDF Rounded Corners: clip text fragments that fall outside rounded rect
+  if (uniforms.corner_radius > 0.0) {
+    // Look up window_id from bg cell data
+    int2 text_grid = int2(in.grid_pos);
+    if (text_grid.x >= 0 && text_grid.x < uniforms.grid_size.x &&
+        text_grid.y >= 0 && text_grid.y < uniforms.grid_size.y) {
+      int ci = text_grid.y * uniforms.grid_size.x + text_grid.x;
+      uchar wid = bg_cells[ci].window_id;
+      if (wid > 0 && wid <= uniforms.window_rect_count) {
+        float4 wrect = uniforms.window_rects[wid - 1];
+        float2 win_pos = wrect.xy;
+        float2 win_size = wrect.zw;
+        float2 center = win_pos + win_size * 0.5;
+        float2 half_size = win_size * 0.5;
+        float r = uniforms.corner_radius;
+        float2 d = abs(in.position.xy - center) - half_size + float2(r);
+        float dist = length(max(d, float2(0.0))) + min(max(d.x, d.y), 0.0) - r;
+        if (dist > 0.0) {
+          discard_fragment();
+        }
+      }
+    }
+  }
+
   // Legacy clip for terminal scrollback
   float grid_top = uniforms.grid_padding.x;
   float grid_bottom = grid_top + float(uniforms.grid_size.y - 2) * uniforms.cell_size.y;
@@ -931,6 +1020,22 @@ fragment float4 cell_text_fragment(
 
       // Fetch our alpha mask for this pixel.
       float a = textureGrayscale.sample(textureSampler, in.tex_coord).r;
+
+      // Text gamma/contrast adjustment (matches Neovide's text_gamma/text_contrast).
+      // Gamma: adjusts overall glyph weight. Positive = thicker, negative = thinner.
+      // Contrast: sharpens glyph edges by steepening the alpha curve.
+      if (uniforms.text_gamma != 0.0 || uniforms.text_contrast != 0.0) {
+        // Gamma: remap alpha through pow curve
+        if (uniforms.text_gamma != 0.0) {
+          float gamma_exp = 1.0 / (1.0 + uniforms.text_gamma);
+          a = pow(a, gamma_exp);
+        }
+        // Contrast: steepen alpha around 0.5 midpoint
+        if (uniforms.text_contrast > 0.0) {
+          float k = 1.0 + uniforms.text_contrast * 4.0; // 0→1, 4→5
+          a = clamp((a - 0.5) * k + 0.5, 0.0, 1.0);
+        }
+      }
 
       // Linear blending weight correction corrects the alpha value to
       // produce blending results which match gamma-incorrect blending.

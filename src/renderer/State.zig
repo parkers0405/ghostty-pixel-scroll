@@ -56,6 +56,9 @@ pub const Mouse = struct {
     /// this is set to N so the renderer can animate from old to new position.
     /// Positive = scrolled down into history (content moves up).
     scroll_delta_lines: f32 = 0,
+
+    /// One-shot wheel glide kick (pixels). Used to smooth discrete wheel steps.
+    wheel_glide_kick: f32 = 0,
 };
 
 /// The pre-edit state. See Surface.preeditCallback for more information.

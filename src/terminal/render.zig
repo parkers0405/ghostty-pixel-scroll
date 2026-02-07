@@ -92,6 +92,10 @@ pub const RenderState = struct {
 
     /// Initial state.
     scroll_jump: f32 = 0,
+    /// Scroll jump from viewport pin changes (user scrollback navigation).
+    scroll_jump_viewport: f32 = 0,
+    /// Scroll jump from scrollback growth (output arrival).
+    scroll_jump_output: f32 = 0,
     last_scroll_tracker: isize = 0,
 
     /// Scroll region boundaries (row indices, inclusive).
@@ -390,28 +394,31 @@ pub const RenderState = struct {
         self.rows = s.pages.rows + 2;
         self.cols = s.pages.cols;
 
-        // Calculate scroll jump
+        // Calculate scroll jump components
         self.scroll_jump = 0;
+        self.scroll_jump_viewport = 0;
+        self.scroll_jump_output = 0;
         if (self.viewport_pin) |old| {
             if (old.node == viewport_pin.node) {
                 const old_y = @as(f32, @floatFromInt(old.y));
                 const new_y = @as(f32, @floatFromInt(viewport_pin.y));
-                self.scroll_jump = old_y - new_y;
+                self.scroll_jump_viewport = old_y - new_y;
             } else if (old.node.next == viewport_pin.node) {
                 const page_rows = @as(f32, @floatFromInt(old.node.data.size.rows));
                 const old_y = @as(f32, @floatFromInt(old.y));
                 const new_y = @as(f32, @floatFromInt(viewport_pin.y));
-                self.scroll_jump = old_y - (page_rows + new_y);
+                self.scroll_jump_viewport = old_y - (page_rows + new_y);
             } else if (old.node.prev == viewport_pin.node) {
                 const prev_rows = @as(f32, @floatFromInt(viewport_pin.node.data.size.rows));
                 const old_y = @as(f32, @floatFromInt(old.y));
                 const new_y = @as(f32, @floatFromInt(viewport_pin.y));
-                self.scroll_jump = (prev_rows + old_y) - new_y;
+                self.scroll_jump_viewport = (prev_rows + old_y) - new_y;
             }
         }
 
         const tracker_diff = s.scroll_tracker - self.last_scroll_tracker;
-        self.scroll_jump += @floatFromInt(tracker_diff);
+        self.scroll_jump_output = @floatFromInt(tracker_diff);
+        self.scroll_jump = self.scroll_jump_viewport + self.scroll_jump_output;
         self.last_scroll_tracker = s.scroll_tracker;
 
         self.viewport_pin = viewport_pin;

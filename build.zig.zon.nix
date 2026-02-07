@@ -363,6 +363,22 @@ in
       };
     }
     {
+      name = "znvim-1.0.0-M-MdgsUFDAA2r8zQbdbghZNktEZT79aAvdqJBb4ctwVS";
+      path = fetchZigArtifact {
+        name = "znvim";
+        url = "https://github.com/jinzhongjia/znvim/archive/main.tar.gz";
+        hash = "sha256-O26Q5eLTAHX1HH7EU/8Axjfn5e1aTide+hoyDX+orsM=";
+      };
+    }
+    {
+      name = "zig_msgpack-0.0.14-evvueBpfAwBSXibTQiU8q43njtWmdnHKPguZASsrZz7k";
+      path = fetchZigArtifact {
+        name = "zig_msgpack";
+        url = "https://github.com/zigcc/zig-msgpack/archive/refs/tags/0.0.14.tar.gz";
+        hash = "sha256-eDsYUuZ0D4MZZHiCUK8s8Wj+CswtpDWQn6cPLcFa8f8=";
+      };
+    }
+    {
       name = "N-V-__8AAB0eQwD-0MdOEBmz7intriBReIsIDNlukNVoNu6o";
       path = fetchZigArtifact {
         name = "zlib";

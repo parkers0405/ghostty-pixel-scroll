@@ -42,6 +42,7 @@ vec4 cell_bg() {
     }
     
     // Apply per-cell offset for per-window smooth scrolling
+    bool allow_fixed_overlap = (window_rect_count == 0u);
     if (grid_pos.x >= 0 && grid_pos.x < int(grid_size.x) &&
         grid_pos.y >= 0 && grid_pos.y < int(grid_size.y)) {
         int cell_index = grid_pos.y * int(grid_size.x) + grid_pos.x;
@@ -65,7 +66,7 @@ vec4 cell_bg() {
                 int new_offset_i16 = (new_offset_raw << 16) >> 16;
                 
                 // Only use the new position if it's also a scrolling cell (not fixed)
-                if (new_offset_i16 != 0) {
+                if (new_offset_i16 != 0 || allow_fixed_overlap) {
                     grid_pos = new_grid_pos;
                 }
                 // If new cell is fixed (offset=0), keep original grid_pos

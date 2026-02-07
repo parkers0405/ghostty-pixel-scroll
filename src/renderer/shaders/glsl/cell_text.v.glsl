@@ -86,8 +86,7 @@ void main() {
     cell_pos = cell_pos + size * corner + offset;
     
     // Apply per-cell pixel scroll offset (8.8 fixed-point -> float)
-    // Round to whole pixels so all glyphs jump simultaneously (no inter-line shimmer).
-    // Backgrounds use the fractional offset for smooth sub-pixel sliding.
+    // Round to whole pixels to keep text crisp.
     float per_cell_offset_y = round(float(pixel_offset_y_fixed) / 256.0);
     cell_pos.y += per_cell_offset_y;
 
@@ -103,10 +102,7 @@ void main() {
     // In terminal mode: shifts content up to hide an extra row for smooth scrollback.
     cell_pos.y -= pixel_scroll_offset_y;
 
-    // Snap text glyph Y position to nearest integer pixel to prevent shimmer/blur
-    // during smooth scrolling. Backgrounds still scroll at sub-pixel precision for
-    // visual smoothness, but text must be pixel-aligned since glyph atlases use
-    // nearest-neighbor sampling and were rasterized at integer positions.
+    // Snap text glyph Y position to nearest integer pixel.
     cell_pos.y = round(cell_pos.y);
     
     // Apply cursor animation offset if this is the cursor glyph

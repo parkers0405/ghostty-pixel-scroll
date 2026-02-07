@@ -3652,13 +3652,13 @@ pub fn scrollCallback(
     // We use cell height to determine if we have accumulated enough to trigger a scroll
     const cell_height: f64 = @floatFromInt(self.size.cell.height);
 
-    // Track if we should use pixel scrolling. Only enabled for precision devices
-    // (touchpads) when the config option is on and we're not in mouse reporting mode.
+    // Track if we should use pixel scrolling. Enabled when the config option is on
+    // and we're not in mouse reporting mode. This applies to both precision devices
+    // (touchpads) and discrete wheels, for smooth scrolling in terminal mode.
     // When mouse reporting is active (TUI apps), we need line-based scroll events.
     const mouse_reporting_active = self.config.mouse_reporting and
         self.io.terminal.flags.mouse_event != .none;
-    const use_pixel_scroll = self.config.pixel_scroll and scroll_mods.precision and
-        !mouse_reporting_active;
+    const use_pixel_scroll = self.config.pixel_scroll and !mouse_reporting_active;
 
     const y: ScrollAmount = if (yoff == 0) .{} else y: {
         // If we have precision scroll, yoff is the number of pixels to scroll. In non-precision
@@ -3819,7 +3819,15 @@ pub fn scrollCallback(
             // 2. Set scroll_delta_lines so renderer can animate visually
             // 3. Renderer animates from old position to new position
 
-            const yoff_adjusted = yoff * self.config.mouse_scroll_multiplier.precision;
+            const yoff_adjusted: f64 = if (scroll_mods.precision)
+                yoff * self.config.mouse_scroll_multiplier.precision
+            else yoff_adjusted: {
+                const yoff_max: f64 = if (yoff > 0)
+                    @max(yoff, 1)
+                else
+                    @min(yoff, -1);
+                break :yoff_adjusted yoff_max * cell_height * self.config.mouse_scroll_multiplier.discrete;
+            };
 
             // Check if we can scroll
             const is_main_screen = self.io.terminal.screens.active_key == .primary;
@@ -3868,6 +3876,12 @@ pub fn scrollCallback(
 
                 // Update renderer state
                 self.renderer_state.mouse.pixel_scroll_offset_y = @floatCast(self.mouse.pixel_scroll_offset);
+
+                // Add a small glide kick for discrete wheels to smooth out step-y scrolling.
+                if (!scroll_mods.precision) {
+                    const kick = std.math.clamp(-yoff_adjusted * 0.2, -cell_height * 0.6, cell_height * 0.6);
+                    self.renderer_state.mouse.wheel_glide_kick += @floatCast(kick);
+                }
             } else {
                 self.mouse.pixel_scroll_offset = 0;
                 self.renderer_state.mouse.pixel_scroll_offset_y = 0;

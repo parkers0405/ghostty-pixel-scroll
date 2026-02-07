@@ -252,6 +252,30 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         scroll_glide_time: f32 = 0,
         scroll_glide_active: bool = false,
 
+        /// Output-only glide for terminal primary screen.
+        /// Applies only to the bottom N rows to avoid global "bounce".
+        output_glide_start: f32 = 0,
+        output_glide_offset: f32 = 0,
+        output_glide_duration: f32 = 0.08,
+        output_glide_time: f32 = 0,
+        output_glide_active: bool = false,
+        output_glide_lines: u16 = 0,
+        output_glide_exclude_row: ?terminal.size.CellCountInt = null,
+
+        /// Alternate screen (TUI) glide for small jumps.
+        tui_glide_start: f32 = 0,
+        tui_glide_offset: f32 = 0,
+        tui_glide_duration: f32 = 0.05,
+        tui_glide_time: f32 = 0,
+        tui_glide_active: bool = false,
+
+        /// Discrete wheel smoothing glide (primary screen).
+        wheel_glide_start: f32 = 0,
+        wheel_glide_offset: f32 = 0,
+        wheel_glide_duration: f32 = 0.05,
+        wheel_glide_time: f32 = 0,
+        wheel_glide_active: bool = false,
+
         /// Whether scroll animation is currently active
         scroll_animating: bool = false,
 
@@ -262,6 +286,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Smoothed interval between scroll events (seconds). EMA with alpha ~0.3.
         /// Used to scale glide duration: long interval → long glide, short → short.
         scroll_interval_ema: f32 = 1.0,
+
+        /// User scroll rate tracking for velocity-adaptive glide duration.
+        last_user_scroll_time: ?std.time.Instant = null,
+        /// Smoothed interval between user scroll events (seconds).
+        user_scroll_interval_ema: f32 = 1.0,
 
         /// Animation timing state (Neovide-style frame catchup).
         /// `animation_start` is the wall-clock time when the current animation
@@ -280,6 +309,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// Whether we're currently in the alternate screen (TUI apps like Neovim).
         in_alternate_screen: bool = false,
+
+        /// Track viewport pin state to detect user recenter events.
+        prev_viewport_at_bottom: bool = true,
 
         /// Scroll region boundaries (row indices) for TUI smooth scrolling.
         /// Cells within this region get per-cell offset_y_fixed for smooth animation.
@@ -1176,6 +1208,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // here would cause the draw timer to spin forever.
             return self.cursor_animating or
                 self.scroll_animating or
+                self.output_glide_active or
+                self.tui_glide_active or
+                self.wheel_glide_active or
                 self.sonicboom_active or
                 // In Neovim GUI mode we also need to keep running while
                 // events are pending (dirty flag means content changed)
@@ -1352,6 +1387,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.last_cursor_grid_pos = .{ std.math.maxInt(u16), std.math.maxInt(u16) };
                     // Continue to regular terminal rendering below
                 } else {
+                    self.output_glide_active = false;
+                    self.output_glide_offset = 0;
+                    self.output_glide_start = 0;
+                    self.output_glide_time = 0;
+                    self.output_glide_lines = 0;
+                    self.scroll_animating = false;
+                    self.scroll_glide_active = false;
+                    self.scroll_glide_offset = 0;
+                    self.scroll_glide_start = 0;
+                    self.scroll_glide_time = 0;
+                    self.scroll_spring.reset();
+                    self.tui_glide_active = false;
+                    self.tui_glide_offset = 0;
+                    self.tui_glide_start = 0;
+                    self.tui_glide_time = 0;
+                    self.wheel_glide_active = false;
+                    self.wheel_glide_offset = 0;
+                    self.wheel_glide_start = 0;
+                    self.wheel_glide_time = 0;
                     try self.updateFrameNeovim(nvim);
                     return;
                 }
@@ -1383,6 +1437,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 overlay_features: []const Overlay.Feature,
                 tui_in_alternate: bool,
                 viewport_at_bottom: bool,
+                just_recentered: bool,
             };
 
             // Update all our data as tightly as possible within the mutex.
@@ -1474,9 +1529,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const mouse_copy = state.mouse;
                 // Reset scroll delta (we're consuming it)
                 state.mouse.scroll_delta_lines = 0;
+                state.mouse.wheel_glide_kick = 0;
 
                 const tui_in_alternate = state.terminal.screens.active_key == .alternate;
                 const viewport_at_bottom = state.terminal.screens.active.viewportIsBottom();
+                const just_recentered = !self.prev_viewport_at_bottom and viewport_at_bottom;
+                self.prev_viewport_at_bottom = viewport_at_bottom;
 
                 break :critical .{
                     .links = links,
@@ -1486,6 +1544,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .overlay_features = overlay_features,
                     .tui_in_alternate = tui_in_alternate,
                     .viewport_at_bottom = viewport_at_bottom,
+                    .just_recentered = just_recentered,
                 };
             };
 
@@ -1570,6 +1629,213 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.draw_mutex.lock();
                 defer self.draw_mutex.unlock();
 
+                // Smooth scroll animations for output (content arrival) and user scroll.
+                //
+                // Output: glide only on the bottom rows (no global bounce).
+                // User scroll: glide for small deltas, spring for big recenter jumps.
+                // TUI apps (alternate screen): tiny glide for small jumps, spring only for big dumps.
+                const scroll_threshold: f32 = 1.0;
+                const scroll_jump_total = self.terminal_state.scroll_jump;
+                const scroll_jump_viewport = self.terminal_state.scroll_jump_viewport;
+                const scroll_jump_output = self.terminal_state.scroll_jump_output;
+
+                if (self.config.scroll_animation_duration <= 0) {
+                    // If scroll animation is disabled, always snap.
+                    self.scroll_spring.reset();
+                    self.scroll_glide_active = false;
+                    self.scroll_glide_offset = 0;
+                    self.scroll_glide_start = 0;
+                    self.scroll_glide_time = 0;
+                    self.output_glide_active = false;
+                    self.output_glide_offset = 0;
+                    self.output_glide_start = 0;
+                    self.output_glide_time = 0;
+                    self.output_glide_lines = 0;
+                    self.tui_glide_active = false;
+                    self.tui_glide_offset = 0;
+                    self.tui_glide_start = 0;
+                    self.tui_glide_time = 0;
+                    self.wheel_glide_active = false;
+                    self.wheel_glide_offset = 0;
+                    self.wheel_glide_start = 0;
+                    self.wheel_glide_time = 0;
+                    self.scroll_animating = false;
+                } else {
+                    const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                    const in_alternate = critical.tui_in_alternate;
+
+                    if (in_alternate) {
+                        // Alternate screen (TUI): spring only.
+                        self.output_glide_active = false;
+                        self.output_glide_offset = 0;
+                        self.output_glide_start = 0;
+                        self.output_glide_time = 0;
+                        self.output_glide_lines = 0;
+                        self.scroll_glide_active = false;
+                        self.scroll_glide_offset = 0;
+                        self.scroll_glide_start = 0;
+                        self.scroll_glide_time = 0;
+                        self.wheel_glide_active = false;
+                        self.wheel_glide_offset = 0;
+                        self.wheel_glide_start = 0;
+                        self.wheel_glide_time = 0;
+                        if (@abs(scroll_jump_total) >= scroll_threshold) {
+                            const now_scroll = std.time.Instant.now() catch null;
+                            if (now_scroll) |now_s| {
+                                if (self.last_scroll_time) |last_t| {
+                                    const elapsed_ns = now_s.since(last_t);
+                                    const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+                                    const clamped = @min(elapsed_s, 2.0);
+                                    self.scroll_interval_ema = self.scroll_interval_ema * 0.7 + clamped * 0.3;
+                                } else {
+                                    self.scroll_interval_ema = 1.0;
+                                }
+                                self.last_scroll_time = now_s;
+                            }
+
+                            const abs_jump = @abs(scroll_jump_total);
+                            const use_spring = abs_jump >= 32.0;
+
+                            if (use_spring) {
+                                self.scroll_spring.position += scroll_jump_total * cell_h;
+                                self.scroll_animating = true;
+                                self.tui_glide_active = false;
+                                self.tui_glide_offset = 0;
+                                self.tui_glide_start = 0;
+                                self.tui_glide_time = 0;
+                            } else {
+                                const max_dur = @min(self.config.scroll_animation_duration, 0.12);
+                                const base_dur = self.scroll_interval_ema * 0.22;
+                                const glide_dur = @max(0.03, @min(max_dur, base_dur));
+
+                                const delta = scroll_jump_total * cell_h;
+                                const new_start = self.tui_glide_offset + delta;
+                                self.tui_glide_start = new_start;
+                                self.tui_glide_offset = new_start;
+                                self.tui_glide_time = 0;
+                                self.tui_glide_duration = glide_dur;
+                                self.tui_glide_active = true;
+                                self.scroll_animating = true;
+                            }
+                        } else {
+                            self.tui_glide_active = false;
+                            self.tui_glide_offset = 0;
+                            self.tui_glide_start = 0;
+                            self.tui_glide_time = 0;
+                        }
+                    } else {
+                        // Primary screen: handle output + user scroll separately.
+
+                        if (!critical.viewport_at_bottom) {
+                            self.output_glide_active = false;
+                            self.output_glide_offset = 0;
+                            self.output_glide_start = 0;
+                            self.output_glide_time = 0;
+                            self.output_glide_lines = 0;
+                        }
+
+                        if (critical.mouse.wheel_glide_kick != 0) {
+                            const max_dur = @min(self.config.scroll_animation_duration, 0.08);
+                            const base_dur = self.user_scroll_interval_ema * 0.12;
+                            const glide_dur = @max(0.015, @min(max_dur, base_dur));
+
+                            const delta = critical.mouse.wheel_glide_kick;
+                            const new_start = self.wheel_glide_offset + delta;
+                            self.wheel_glide_start = new_start;
+                            self.wheel_glide_offset = new_start;
+                            self.wheel_glide_time = 0;
+                            self.wheel_glide_duration = glide_dur;
+                            self.wheel_glide_active = true;
+                            self.scroll_animating = true;
+                        }
+
+                        // Output scroll (content arrival) - glide only on bottom rows.
+                        if (scroll_jump_output >= scroll_threshold and critical.viewport_at_bottom and !critical.just_recentered) {
+                            const output_abs = @abs(scroll_jump_output);
+                            const max_dur = @min(self.config.scroll_animation_duration, 0.35);
+                            const glide_dur = @max(0.12, max_dur);
+
+                            const rows_f: f32 = @floatFromInt(self.terminal_state.rows);
+                            const rows_u16: u16 = @intFromFloat(@min(rows_f, @as(f32, @floatFromInt(std.math.maxInt(u16)))));
+                            const jump_lines: u16 = @intFromFloat(@min(output_abs, rows_f));
+                            const max_lines_cap: u16 = 18;
+                            const max_lines: u16 = @min(max_lines_cap, rows_u16);
+                            const min_lines: u16 = 1;
+                            const computed_glide_lines: u16 = @min(@max(jump_lines, min_lines), max_lines);
+                            var glide_lines: u16 = computed_glide_lines;
+                            if (self.output_glide_active) {
+                                glide_lines = @max(glide_lines, self.output_glide_lines);
+                            }
+
+                            if (glide_lines > 0) {
+                                const sign: f32 = if (scroll_jump_output < 0) -1 else 1;
+                                const delta_lines: f32 = @min(output_abs, @as(f32, @floatFromInt(glide_lines)));
+                                const delta = sign * delta_lines * cell_h;
+                                const new_start = self.output_glide_offset + delta;
+                                self.output_glide_start = new_start;
+                                self.output_glide_offset = new_start;
+                                self.output_glide_time = 0;
+                                self.output_glide_duration = @max(self.output_glide_duration, glide_dur);
+                                self.output_glide_active = true;
+                                self.output_glide_lines = glide_lines;
+                                self.scroll_animating = true;
+                            }
+                        }
+
+                        // User scroll (viewport movement) - glide for small jumps, spring for big recenter.
+                        // If output just arrived at bottom, ignore the viewport jump to avoid false "pop".
+                        const effective_viewport_jump: f32 = if (
+                            critical.viewport_at_bottom and
+                            @abs(scroll_jump_output) >= scroll_threshold
+                        ) 0 else scroll_jump_viewport;
+                        if (@abs(effective_viewport_jump) >= scroll_threshold) {
+                            const abs_jump = @abs(effective_viewport_jump);
+                            const use_spring = abs_jump >= 32.0;
+                            const pixel_scrolling_active = critical.mouse.pixel_scroll_offset_y != 0;
+
+                            if (use_spring) {
+                                self.scroll_spring.position += effective_viewport_jump * cell_h;
+                                self.scroll_animating = true;
+                            } else if (!pixel_scrolling_active) {
+                                const now_scroll = std.time.Instant.now() catch null;
+                                if (now_scroll) |now_s| {
+                                    if (self.last_user_scroll_time) |last_t| {
+                                        const elapsed_ns = now_s.since(last_t);
+                                        const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
+                                        const clamped = @min(elapsed_s, 2.0);
+                                        self.user_scroll_interval_ema = self.user_scroll_interval_ema * 0.7 + clamped * 0.3;
+                                    } else {
+                                        self.user_scroll_interval_ema = 1.0;
+                                    }
+                                    self.last_user_scroll_time = now_s;
+                                }
+
+                                const max_dur = @min(self.config.scroll_animation_duration, 0.12);
+                                const base_dur = self.user_scroll_interval_ema * 0.16;
+                                const min_dur = @min(0.012, max_dur);
+                                const glide_dur = @max(min_dur, @min(max_dur, base_dur));
+
+                                const delta = effective_viewport_jump * cell_h;
+                                const new_start = self.scroll_glide_offset + delta;
+                                self.scroll_glide_start = new_start;
+                                self.scroll_glide_offset = new_start;
+                                self.scroll_glide_time = 0;
+                                self.scroll_glide_duration = glide_dur;
+                                self.scroll_glide_active = true;
+                                self.scroll_animating = true;
+                            } else {
+                                self.scroll_glide_active = false;
+                                self.scroll_glide_offset = 0;
+                                self.scroll_glide_start = 0;
+                                self.scroll_glide_time = 0;
+                            }
+                        }
+                    }
+                }
+
+                // Track alternate screen state before rebuilding cells (affects row offsets).
+                self.in_alternate_screen = critical.tui_in_alternate;
+
                 // Build our GPU cells
                 self.rebuildCells(
                     critical.preedit,
@@ -1595,103 +1861,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.scrollbar_dirty = true;
                 }
 
-                // Velocity-adaptive scroll animation for content arrival.
-                //
-                // Every scroll event gets animated — nothing ever teleports.
-                // The glide duration auto-adapts to output rate:
-                //   - Isolated output (single command): ~80ms ease-out, satisfying
-                //   - Streaming logs: ~8-15ms ease-out, subtle conveyor belt feel
-                //   - Massive one-shot dump (10+ lines, low rate): spring drop
-                //
-                // This eliminates the earthquake problem: during streaming, each
-                // line gets such a short glide that the total visible displacement
-                // is tiny. Content feels like it's flowing, not jerking.
-                //
-                // TUI apps (alternate screen) always use spring (deliberate navigation).
-                const scroll_jump = self.terminal_state.scroll_jump;
-                const scroll_threshold: f32 = 1.0;
-                const eligible = if (self.in_alternate_screen)
-                    true
-                else
-                    critical.viewport_at_bottom;
-
-                if (@abs(scroll_jump) >= scroll_threshold and eligible) {
-                    // If scroll animation is disabled, always snap
-                    if (self.config.scroll_animation_duration <= 0) {
-                        self.scroll_spring.reset();
-                        self.scroll_glide_active = false;
-                        self.scroll_glide_offset = 0;
-                        self.scroll_glide_start = 0;
-                        self.scroll_glide_time = 0;
-                        self.scroll_animating = false;
-                    } else {
-                        const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
-                        const abs_jump = @abs(scroll_jump);
-
-                        // For alternate screen (TUI), always animate with spring
-                        if (self.in_alternate_screen) {
-                            self.scroll_spring.position += scroll_jump * cell_h;
-                            self.scroll_animating = true;
-                        } else {
-                            // Primary screen: velocity-adaptive animation.
-                            // Update the scroll rate EMA to know how fast output is flowing.
-                            const now_scroll = std.time.Instant.now() catch null;
-                            if (now_scroll) |now_s| {
-                                if (self.last_scroll_time) |last_t| {
-                                    const elapsed_ns = now_s.since(last_t);
-                                    const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
-                                    // Clamp to avoid huge values from long pauses
-                                    const clamped = @min(elapsed_s, 2.0);
-                                    // EMA: alpha=0.3 gives ~3-event smoothing
-                                    self.scroll_interval_ema = self.scroll_interval_ema * 0.7 + clamped * 0.3;
-                                } else {
-                                    // First event — assume isolated
-                                    self.scroll_interval_ema = 1.0;
-                                }
-                                self.last_scroll_time = now_s;
-                            }
-
-                            // Decide: spring drop vs glide.
-                            // Spring only for large ISOLATED jumps (10+ lines AND output
-                            // rate is slow, meaning this isn't part of a streaming burst).
-                            // "Slow" = interval EMA > 300ms (less than ~3 events/sec).
-                            const is_streaming = self.scroll_interval_ema < 0.3;
-                            const use_spring = abs_jump >= 10.0 and !is_streaming;
-
-                            if (use_spring) {
-                                // Big one-shot dump: satisfying spring drop
-                                self.scroll_spring.position += scroll_jump * cell_h;
-                                self.scroll_animating = true;
-                            } else {
-                                // Velocity-adaptive glide: everything else.
-                                // Duration scales with output rate:
-                                //   interval_ema >= 0.5s (slow) → 80ms glide
-                                //   interval_ema ~= 0.1s (moderate) → ~30ms glide
-                                //   interval_ema <= 0.03s (fast streaming) → 8ms glide
-                                //
-                                // Formula: duration = clamp(interval_ema * 0.15, 0.008, 0.08)
-                                // This maps the output rate to a proportional glide speed.
-                                // Fast output = tiny glide = no earthquake.
-                                // Slow output = longer glide = satisfying flow.
-                                const base_dur = self.scroll_interval_ema * 0.15;
-                                const glide_dur = @max(0.008, @min(0.08, base_dur));
-
-                                const delta = scroll_jump * cell_h;
-                                // If already gliding, combine current offset + new delta
-                                // for smooth re-targeting
-                                const new_start = self.scroll_glide_offset + delta;
-                                self.scroll_glide_start = new_start;
-                                self.scroll_glide_offset = new_start;
-                                self.scroll_glide_time = 0;
-                                self.scroll_glide_duration = glide_dur;
-                                self.scroll_glide_active = true;
-                                self.scroll_animating = true;
-                            }
-                        }
-                    }
-                }
-                // Reset scroll_jump so we don't re-apply it next frame
+                // Reset scroll jumps so we don't re-apply them next frame
                 self.terminal_state.scroll_jump = 0;
+                self.terminal_state.scroll_jump_viewport = 0;
+                self.terminal_state.scroll_jump_output = 0;
 
                 // Store the scroll region for per-cell offset calculations in alternate screen
                 self.scroll_region_top = self.terminal_state.scroll_region_top;
@@ -1699,10 +1872,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Store the sub-line pixel offset (from mouse/trackpad)
                 self.scroll_pixel_offset = critical.mouse.pixel_scroll_offset_y;
-
-                // Track alternate screen state - this determines whether to apply
-                // terminal scrollback offset (alternate screen = no scrollback = no offset)
-                self.in_alternate_screen = critical.tui_in_alternate;
 
                 // Update our background color
                 self.uniforms.bg_color = .{
@@ -2854,7 +3023,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // --- Terminal mode timing with sub-stepping & proper fallback ---
             const now = std.time.Instant.now() catch return;
-            const any_anim = self.cursor_animating or self.scroll_animating or self.sonicboom_active;
+            const any_anim = self.cursor_animating or self.scroll_animating or self.output_glide_active or self.tui_glide_active or self.wheel_glide_active or self.sonicboom_active;
 
             // Use display refresh period as fallback dt (first frame / time went backwards)
             const fallback_dt_ns: f32 = @floatFromInt(self.display_refresh_ns);
@@ -2898,7 +3067,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     // Scroll animation (terminal mode only)
                     // Two systems: spring for large jumps, linear glide for small arrivals
-                    if (is_terminal and self.scroll_animating) {
+                    if (is_terminal and (self.scroll_animating or self.output_glide_active or self.tui_glide_active)) {
                         var any_scroll_anim = false;
 
                         // Spring animation (large jumps)
@@ -2911,7 +3080,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         }
 
                         // Glide animation (small arrivals: 1-3 lines)
-                        // Clean ease-out cubic: offset = start * (1-t)^3
+                        // Smoothstep (ease-in-out) to avoid a "pop" on the first frame.
                         // Frame-rate independent — same result at 60hz or 165hz.
                         if (self.scroll_glide_active) {
                             self.scroll_glide_time += dt;
@@ -2924,9 +3093,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             } else {
                                 // t goes 0→1 over the duration
                                 const t = self.scroll_glide_time / self.scroll_glide_duration;
-                                // Ease-out cubic: (1-t)^3 — fast start, gentle landing
-                                const inv = 1.0 - t;
-                                const ease = inv * inv * inv;
+                                // Smoothstep: 3t^2 - 2t^3 (slow start, smooth end)
+                                const smooth = t * t * (3.0 - 2.0 * t);
+                                const ease = 1.0 - smooth;
                                 self.scroll_glide_offset = self.scroll_glide_start * ease;
                                 if (@abs(self.scroll_glide_offset) < 0.5) {
                                     self.scroll_glide_offset = 0;
@@ -2939,7 +3108,71 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             }
                         }
 
-                        self.scroll_animating = any_scroll_anim or self.scroll_glide_active;
+                        // Output glide (bottom rows only)
+                        if (self.output_glide_active) {
+                            self.output_glide_time += dt;
+                            if (self.output_glide_time >= self.output_glide_duration) {
+                                self.output_glide_active = false;
+                                self.output_glide_offset = 0;
+                                self.output_glide_time = 0;
+                                self.output_glide_start = 0;
+                                self.output_glide_lines = 0;
+                            } else {
+                                const t = self.output_glide_time / self.output_glide_duration;
+                                const smooth = t * t * (3.0 - 2.0 * t);
+                                const ease = 1.0 - smooth;
+                                self.output_glide_offset = self.output_glide_start * ease;
+                                any_scroll_anim = true;
+                            }
+                        }
+
+                        if (self.tui_glide_active) {
+                            self.tui_glide_time += dt;
+                            if (self.tui_glide_time >= self.tui_glide_duration) {
+                                self.tui_glide_active = false;
+                                self.tui_glide_offset = 0;
+                                self.tui_glide_time = 0;
+                                self.tui_glide_start = 0;
+                            } else {
+                                const t = self.tui_glide_time / self.tui_glide_duration;
+                                const smooth = t * t * (3.0 - 2.0 * t);
+                                const ease = 1.0 - smooth;
+                                self.tui_glide_offset = self.tui_glide_start * ease;
+                                if (@abs(self.tui_glide_offset) < 0.5) {
+                                    self.tui_glide_offset = 0;
+                                    self.tui_glide_active = false;
+                                    self.tui_glide_time = 0;
+                                    self.tui_glide_start = 0;
+                                } else {
+                                    any_scroll_anim = true;
+                                }
+                            }
+                        }
+
+                        if (self.wheel_glide_active) {
+                            self.wheel_glide_time += dt;
+                            if (self.wheel_glide_time >= self.wheel_glide_duration) {
+                                self.wheel_glide_active = false;
+                                self.wheel_glide_offset = 0;
+                                self.wheel_glide_time = 0;
+                                self.wheel_glide_start = 0;
+                            } else {
+                                const t = self.wheel_glide_time / self.wheel_glide_duration;
+                                const smooth = t * t * (3.0 - 2.0 * t);
+                                const ease = 1.0 - smooth;
+                                self.wheel_glide_offset = self.wheel_glide_start * ease;
+                                if (@abs(self.wheel_glide_offset) < 0.5) {
+                                    self.wheel_glide_offset = 0;
+                                    self.wheel_glide_active = false;
+                                    self.wheel_glide_time = 0;
+                                    self.wheel_glide_start = 0;
+                                } else {
+                                    any_scroll_anim = true;
+                                }
+                            }
+                        }
+
+                        self.scroll_animating = any_scroll_anim or self.scroll_glide_active or self.output_glide_active or self.tui_glide_active or self.wheel_glide_active;
                     }
 
                     // Sonicboom VFX (both modes)
@@ -2968,7 +3201,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const cursor_x = self.uniforms.cursor_pos[0];
                     const cursor_y = self.uniforms.cursor_pos[1];
                     if (cursor_x != std.math.maxInt(u16) and cursor_y != std.math.maxInt(u16)) {
-                        const scroll_off = self.uniforms.pixel_scroll_offset_y;
+                        const cursor_row_offset = self.outputGlideOffsetForRow(@intCast(cursor_y));
+                        const scroll_off = self.uniforms.pixel_scroll_offset_y - cursor_row_offset;
                         const floaty_pos = self.cursor_animation.getPosition();
                         self.corner_cursor.destination = .{
                             floaty_pos.x + cell_w * 0.5,
@@ -2989,6 +3223,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.uniforms.matte_intensity = self.config.matte_rendering;
                 self.uniforms.text_gamma = self.config.text_gamma;
                 self.uniforms.text_contrast = self.config.text_contrast;
+                self.uniforms.window_rect_count = 0;
+                self.uniforms.corner_radius = 0;
             }
 
             // Pixel scroll offset for smooth scrolling
@@ -3011,12 +3247,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // For alternate screen (TUI apps like Neovim), there's no mouse-driven scrollback,
                 // but we STILL need the cell_h shift to align content correctly with the viewport.
                 // The difference is we don't apply scroll_pixel_offset (mouse scroll) in alternate screen.
+                const smooth_pixel_offset: f32 = if (self.in_alternate_screen)
+                    // Alternate screen: fixed cell_h shift for grid alignment (no mouse scroll offset)
+                    0
+                else
+                    // Primary screen: cell_h shift minus mouse scroll offset for smooth scrollback
+                    self.scroll_pixel_offset + self.wheel_glide_offset;
+
                 const base_offset: f32 = if (self.in_alternate_screen)
                     // Alternate screen: fixed cell_h shift for grid alignment (no mouse scroll offset)
                     cell_h
                 else
                     // Primary screen: cell_h shift minus mouse scroll offset for smooth scrollback
-                    cell_h - self.scroll_pixel_offset;
+                    cell_h - smooth_pixel_offset;
 
                 // Add content-arrival animation offset.
                 // Spring (large jumps) + glide (small arrivals) both contribute.
@@ -3025,16 +3268,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // so the shader only applies it within the scroll region.
                 const spring_offset = if (self.in_alternate_screen) @as(f32, 0) else self.scroll_spring.position;
                 const glide_offset = if (self.in_alternate_screen) @as(f32, 0) else self.scroll_glide_offset;
-                // Round to whole pixels: text and background move in lockstep
-                // on integer pixel boundaries. At 165hz with ~20px cells this gives
-                // ~20 discrete steps per cell — plenty smooth, zero blur.
-                self.uniforms.pixel_scroll_offset_y = @round(base_offset - spring_offset - glide_offset);
+                const scroll_offset = base_offset - spring_offset - glide_offset;
+                // Keep glyphs crisp by aligning to whole pixels.
+                self.uniforms.pixel_scroll_offset_y = @round(scroll_offset);
 
                 // Set TUI scroll uniforms for alternate screen smooth scrolling.
                 // The shader uses these to apply the offset only within the scroll region,
                 // keeping status bars, headers, etc. fixed.
                 if (self.in_alternate_screen) {
-                    self.uniforms.tui_scroll_offset_y = -self.scroll_spring.position;
+                    self.uniforms.tui_scroll_offset_y = -(self.scroll_spring.position + self.tui_glide_offset);
                     // Offset by 1 for the extra hidden row at top of the grid.
                     // In alternate screen, pixel_scroll_offset_y = cell_h hides row 0,
                     // so terminal scroll region row 0 maps to grid row 1 in the shader.
@@ -3042,6 +3284,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.uniforms.tui_scroll_region_bottom = self.scroll_region_bottom + 1;
                 } else {
                     self.uniforms.tui_scroll_offset_y = 0;
+                    self.tui_glide_active = false;
+                    self.tui_glide_offset = 0;
+                    self.tui_glide_start = 0;
+                    self.tui_glide_time = 0;
+                    self.wheel_glide_active = false;
+                    self.wheel_glide_offset = 0;
+                    self.wheel_glide_start = 0;
+                    self.wheel_glide_time = 0;
                 }
             }
 
@@ -3957,6 +4207,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cp_offset: usize,
         };
 
+        fn outputGlideOffsetForRow(self: *const Self, y: terminal.size.CellCountInt) f32 {
+            if (!self.output_glide_active) return 0;
+            if (self.output_glide_lines == 0) return 0;
+            if (self.in_alternate_screen) return 0;
+            if (self.output_glide_exclude_row) |exclude| {
+                if (y == exclude) return 0;
+            }
+
+            const rows: usize = self.cells.size.rows;
+            if (rows == 0) return 0;
+            const lines: usize = @min(@as(usize, self.output_glide_lines), rows);
+            const start_row: usize = rows - lines;
+            if (@as(usize, y) < start_row) return 0;
+
+            return self.output_glide_offset;
+        }
+
         /// Convert the terminal state to GPU cells stored in CPU memory. These
         /// are then synced to the GPU in the next frame. This only updates CPU
         /// memory and doesn't touch the GPU.
@@ -4049,6 +4316,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const row_selection = row_data.items(.selection);
             const row_highlights = row_data.items(.highlights);
 
+            self.output_glide_exclude_row = null;
+            if (self.output_glide_active and !self.in_alternate_screen) {
+                if (state.cursor.viewport) |cursor_vp| {
+                    self.output_glide_exclude_row = cursor_vp.y;
+                }
+            }
+
+            if (self.output_glide_active) {
+                const rows_active: usize = @min(state.rows, self.cells.size.rows);
+                const lines: usize = @min(@as(usize, self.output_glide_lines), rows_active);
+                if (lines > 0) {
+                    const start_row: usize = rows_active - lines;
+                    var i: usize = start_row;
+                    while (i < rows_active) : (i += 1) {
+                        row_dirty[i] = true;
+                    }
+                    if (self.terminal_state.dirty == .false) {
+                        self.terminal_state.dirty = .partial;
+                    }
+                }
+            }
+
             // If our cell contents buffer is shorter than the screen viewport,
             // we render the rows that fit, starting from the bottom. If instead
             // the viewport is shorter than the cell contents buffer, we align
@@ -4086,6 +4375,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     selection,
                     highlights,
                     links,
+                    self.outputGlideOffsetForRow(y),
                 ) catch |err| {
                     // This should never happen except under exceptional
                     // scenarios. In this case, we don't want to corrupt
@@ -4164,10 +4454,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     break :cursor_color state.colors.foreground;
                 };
 
+                const cursor_row_offset = self.outputGlideOffsetForRow(@intCast(cursor_vp.y));
                 self.addCursor(
                     &state.cursor,
                     style,
                     cursor_color,
+                    cursor_row_offset,
                 );
 
                 // Set cursor_pos for ALL styles (needed for cursor animation + sonicboom).
@@ -4310,7 +4602,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Neovide-style stretchy corner cursor for terminal mode
                 // Must account for pixel_scroll_offset_y since corner positions are
                 // in absolute pixel space but the grid is shifted by the scroll offset.
-                const scroll_off = self.uniforms.pixel_scroll_offset_y;
+                const cursor_row_offset = self.outputGlideOffsetForRow(@intCast(cursor_y));
+                const scroll_off = self.uniforms.pixel_scroll_offset_y - cursor_row_offset;
                 const floaty_pos = self.cursor_animation.getPosition();
                 self.corner_cursor.destination = .{
                     floaty_pos.x + cell_width * 0.5,
@@ -4367,8 +4660,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             selection: ?[2]terminal.size.CellCountInt,
             highlights: *const std.ArrayList(terminal.RenderState.Highlight),
             links: *const terminal.RenderState.CellSet,
+            row_offset_y: f32,
         ) !void {
             const state = &self.terminal_state;
+            const row_offset_fixed: i16 = @intFromFloat(std.math.clamp(row_offset_y * 256.0, -32768.0, 32767.0));
 
             // If our viewport is wider than our cell contents buffer,
             // we still only process cells up to the width of the buffer.
@@ -4663,7 +4958,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                     self.cells.bgCell(y, x).* = .{
                         .color = .{ rgb.r, rgb.g, rgb.b, bg_alpha },
-                        .offset_y_fixed = 0,
+                        .offset_y_fixed = row_offset_fixed,
                     };
                 }
 
@@ -4704,7 +4999,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     underline,
                     style.underlineColor(&state.colors.palette) orelse fg,
                     alpha,
-                    0, // No scroll offset in terminal mode
+                    row_offset_y,
                 ) catch |err| {
                     log.warn(
                         "error adding underline to cell, will be invalid x={} y={}, err={}",
@@ -4712,7 +5007,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     );
                 };
 
-                if (style.flags.overline) self.addOverline(@intCast(x), @intCast(y), fg, alpha) catch |err| {
+                if (style.flags.overline) self.addOverline(@intCast(x), @intCast(y), fg, alpha, row_offset_y) catch |err| {
                     log.warn(
                         "error adding overline to cell, will be invalid x={} y={}, err={}",
                         .{ x, y, err },
@@ -4784,6 +5079,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             shaper_run.?,
                             fg,
                             alpha,
+                            row_offset_y,
                         ) catch |err| {
                             log.warn(
                                 "error adding glyph to cell, will be invalid x={} y={}, err={}",
@@ -4799,7 +5095,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(y),
                     fg,
                     alpha,
-                    0, // No scroll offset in terminal mode
+                    row_offset_y,
                 ) catch |err| {
                     log.warn(
                         "error adding strikethrough to cell, will be invalid x={} y={}, err={}",
@@ -4861,6 +5157,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             y: terminal.size.CellCountInt,
             color: terminal.color.RGB,
             alpha: u8,
+            pixel_offset_y: f32,
         ) !void {
             const render = try self.font_grid.renderGlyph(
                 self.alloc,
@@ -4872,6 +5169,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 },
             );
 
+            const fixed_offset: i16 = @intFromFloat(std.math.clamp(pixel_offset_y * 256.0, -32768.0, 32767.0));
+
             try self.cells.add(self.alloc, .overline, .{
                 .atlas = .grayscale,
                 .grid_pos = .{ @intCast(x), @intCast(y) },
@@ -4882,7 +5181,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_x),
                     @intCast(render.glyph.offset_y),
                 },
-                .pixel_offset_y = 0, // Overline is terminal-only, no scroll offset
+                .pixel_offset_y = fixed_offset,
             });
         }
 
@@ -4932,6 +5231,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             shaper_run: font.shape.TextRun,
             color: terminal.color.RGB,
             alpha: u8,
+            pixel_offset_y: f32,
         ) !void {
             const cell = cell_raws[x];
             const cp = cell.codepoint();
@@ -4967,6 +5267,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 return;
             }
 
+            const fixed_offset: i16 = @intFromFloat(std.math.clamp(pixel_offset_y * 256.0, -32768.0, 32767.0));
+
             try self.cells.add(self.alloc, .text, .{
                 .atlas = switch (render.presentation) {
                     .emoji => .color,
@@ -4981,7 +5283,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_x + shaper_cell.x_offset),
                     @intCast(render.glyph.offset_y + shaper_cell.y_offset),
                 },
-                .pixel_offset_y = 0, // Terminal mode doesn't use per-cell scroll offset
+                .pixel_offset_y = fixed_offset,
             });
         }
 
@@ -4990,6 +5292,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cursor_state: *const terminal.RenderState.Cursor,
             cursor_style: renderer.CursorStyle,
             cursor_color: terminal.color.RGB,
+            pixel_offset_y: f32,
         ) void {
             const cursor_vp = cursor_state.viewport orelse return;
 
@@ -5060,6 +5363,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 },
             };
 
+            const fixed_offset: i16 = @intFromFloat(std.math.clamp(pixel_offset_y * 256.0, -32768.0, 32767.0));
+
             self.cells.setCursor(.{
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
@@ -5071,7 +5376,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_x),
                     @intCast(render.glyph.offset_y),
                 },
-                .pixel_offset_y = 0, // Terminal mode cursor doesn't have per-cell scroll
+                .pixel_offset_y = fixed_offset,
             }, cursor_style);
         }
 
@@ -5082,6 +5387,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             screen_bg: terminal.color.RGB,
             screen_fg: terminal.color.RGB,
         ) !void {
+            const row_offset_y = self.outputGlideOffsetForRow(@intCast(coord.y));
+            const row_offset_fixed: i16 = @intFromFloat(std.math.clamp(row_offset_y * 256.0, -32768.0, 32767.0));
+
             // Render the glyph for our preedit text
             const render_ = self.font_grid.renderCodepoint(
                 self.alloc,
@@ -5101,12 +5409,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Add our opaque background cell
             self.cells.bgCell(coord.y, coord.x).* = .{
                 .color = .{ screen_bg.r, screen_bg.g, screen_bg.b, 255 },
-                .offset_y_fixed = 0,
+                .offset_y_fixed = row_offset_fixed,
             };
             if (cp.wide and coord.x < self.cells.size.columns - 1) {
                 self.cells.bgCell(coord.y, coord.x + 1).* = .{
                     .color = .{ screen_bg.r, screen_bg.g, screen_bg.b, 255 },
-                    .offset_y_fixed = 0,
+                    .offset_y_fixed = row_offset_fixed,
                 };
             }
 
@@ -5121,11 +5429,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(render.glyph.offset_x),
                     @intCast(render.glyph.offset_y),
                 },
-                .pixel_offset_y = 0, // Preedit text doesn't scroll
+                .pixel_offset_y = row_offset_fixed,
             });
 
             // Add underline
-            try self.addUnderline(@intCast(coord.x), @intCast(coord.y), .single, screen_fg, 255, 0);
+            try self.addUnderline(@intCast(coord.x), @intCast(coord.y), .single, screen_fg, 255, row_offset_y);
             if (cp.wide and coord.x < self.cells.size.columns - 1) {
                 try self.addUnderline(@intCast(coord.x + 1), @intCast(coord.y), .single, screen_fg, 255, 0);
             }

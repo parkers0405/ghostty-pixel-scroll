@@ -513,6 +513,7 @@ fragment float4 cell_bg_fragment(
   }
   
   // Apply per-cell offset for per-window smooth scrolling (Neovim GUI mode)
+  bool allow_fixed_overlap = (uniforms.window_rect_count == 0);
   if (grid_pos.x >= 0 && grid_pos.x < uniforms.grid_size.x &&
       grid_pos.y >= 0 && grid_pos.y < uniforms.grid_size.y) {
     int cell_index = grid_pos.y * uniforms.grid_size.x + grid_pos.x;
@@ -533,7 +534,7 @@ fragment float4 cell_bg_fragment(
         short new_offset_fixed = cells[new_cell_index].offset_y_fixed;
         
         // Only use the new position if it's also a scrolling cell (not fixed)
-        if (new_offset_fixed != 0) {
+        if (new_offset_fixed != 0 || allow_fixed_overlap) {
           grid_pos = new_grid_pos;
         }
         // If new cell is fixed (offset=0), keep original grid_pos
@@ -807,8 +808,7 @@ vertex CellTextVertexOut cell_text_vertex(
   cell_pos = cell_pos + size * corner + offset;
   
   // Apply per-cell pixel scroll offset (8.8 fixed-point -> float)
-  // Round to whole pixels so all glyphs jump simultaneously (no inter-line shimmer).
-  // Backgrounds use the fractional offset for smooth sub-pixel sliding.
+  // Round to whole pixels so all glyphs stay crisp.
   float per_cell_offset_y = round(float(in.pixel_offset_y_fixed) / 256.0f);
   cell_pos.y += per_cell_offset_y;
 
@@ -822,10 +822,7 @@ vertex CellTextVertexOut cell_text_vertex(
   // Apply global pixel scroll offset for smooth scrolling
   cell_pos.y -= uniforms.pixel_scroll_offset_y;
 
-  // Snap text glyph Y position to nearest integer pixel to prevent shimmer/blur
-  // during smooth scrolling. Backgrounds still scroll at sub-pixel precision for
-  // visual smoothness, but text must be pixel-aligned since glyph atlases use
-  // nearest-neighbor sampling and were rasterized at integer positions.
+  // Snap text glyph Y position to nearest integer pixel to prevent shimmer/blur.
   cell_pos.y = round(cell_pos.y);
   
   // Apply cursor animation for cursor glyph
@@ -928,7 +925,7 @@ fragment float4 cell_text_fragment(
 ) {
   // Check if this fragment is scrolling text that landed in a fixed cell (statusline)
   // Only clip if: this text HAS an offset AND lands in a cell with offset=0
-  if (in.pixel_offset_y != 0) {
+  if (in.pixel_offset_y != 0 && uniforms.window_rect_count != 0) {
     float2 adjusted_pos = in.position.xy;
     adjusted_pos.y += uniforms.pixel_scroll_offset_y;
     int2 dest_grid_pos = int2(floor((adjusted_pos - uniforms.grid_padding.wx) / uniforms.cell_size));
@@ -1182,4 +1179,3 @@ fragment float4 image_fragment(
 
   return rgba;
 }
-

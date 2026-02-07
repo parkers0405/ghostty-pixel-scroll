@@ -271,7 +271,6 @@ pub const Uniforms = extern struct {
 
         /// Whether to exclude cursor glyphs from rendering (used for scroll animation)
         exclude_cursor: bool = false,
-
         _padding: u27 = 0,
     };
 

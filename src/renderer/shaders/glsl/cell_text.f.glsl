@@ -35,7 +35,7 @@ layout(location = 0) out vec4 out_FragColor;
 void main() {
     // Check if this fragment is scrolling text that landed in a fixed cell (statusline)
     // Only clip if: this text HAS an offset AND lands in a cell with offset=0
-    if (in_data.pixel_offset_y != 0) {
+    if (in_data.pixel_offset_y != 0 && window_rect_count != 0u) {
         uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
         vec2 adjusted_coord = gl_FragCoord.xy;
         adjusted_coord.y += pixel_scroll_offset_y;

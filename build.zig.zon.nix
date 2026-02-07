@@ -339,6 +339,14 @@ in
       };
     }
     {
+      name = "zig_msgpack-0.0.14-evvueBpfAwBSXibTQiU8q43njtWmdnHKPguZASsrZz7k";
+      path = fetchZigArtifact {
+        name = "zig_msgpack";
+        url = "https://github.com/zigcc/zig-msgpack/archive/refs/tags/0.0.14.tar.gz";
+        hash = "sha256-eDsYUuZ0D4MZZHiCUK8s8Wj+CswtpDWQn6cPLcFa8f8=";
+      };
+    }
+    {
       name = "zig_objc-0.0.0-Ir_Sp5gTAQCvxxR7oVIrPXxXwsfKgVP7_wqoOQrZjFeK";
       path = fetchZigArtifact {
         name = "zig_objc";
@@ -368,6 +376,14 @@ in
         name = "zlib";
         url = "https://deps.files.ghostty.org/zlib-1220fed0c74e1019b3ee29edae2051788b080cd96e90d56836eea857b0b966742efb.tar.gz";
         hash = "sha256-F+iIY/NgBnKrSRgvIXKBtvxNPHYr3jYZNeQ2qVIU0Fw=";
+      };
+    }
+    {
+      name = "znvim-1.0.0-M-MdgsUFDAA2r8zQbdbghZNktEZT79aAvdqJBb4ctwVS";
+      path = fetchZigArtifact {
+        name = "znvim";
+        url = "https://github.com/jinzhongjia/znvim/archive/main.tar.gz";
+        hash = "sha256-O26Q5eLTAHX1HH7EU/8Axjfn5e1aTide+hoyDX+orsM=";
       };
     }
   ]

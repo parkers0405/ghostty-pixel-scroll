@@ -922,6 +922,13 @@ palette: Palette = .{},
 /// The default value is "3" for discrete devices and "1" for precision devices.
 @"mouse-scroll-multiplier": MouseScrollMultiplier = .default,
 
+/// Invert scroll direction for precision scrolling devices (touchpads).
+///
+/// This only affects high-precision scroll sources (touchpads). It does not
+/// change mouse wheel direction. Useful if your compositor applies "natural"
+/// scrolling but Ghostty feels reversed.
+@"invert-touchpad-scroll": bool = false,
+
 /// Enable per-pixel scrolling for high precision input devices (for example
 /// touchpads). When enabled, scrollback can move by sub-line increments
 /// instead of only whole lines. This provides a much smoother scrolling

@@ -2930,9 +2930,19 @@ pub const Surface = extern struct {
         // setting (via libinput/compositor) is already applied to these
         // values by GTK for both touchpad and discrete sources.
         const scaled = self.scaledCoordinates(x, y);
+        var scaled_x = scaled.x * multiplier;
+        var scaled_y = scaled.y * multiplier;
+        if (precision) {
+            if (priv.config) |config| {
+                if (config.get().@"invert-touchpad-scroll") {
+                    scaled_x = -scaled_x;
+                    scaled_y = -scaled_y;
+                }
+            }
+        }
         surface.scrollCallback(
-            scaled.x * multiplier,
-            scaled.y * multiplier,
+            scaled_x,
+            scaled_y,
             scroll_mods,
         ) catch |err| {
             log.warn("error in scroll callback err={}", .{err});

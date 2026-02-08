@@ -3886,6 +3886,11 @@ pub fn scrollCallback(
                 if (self.io.terminal.screens.active.viewportIsBottom()) {
                     self.mouse.pixel_scroll_offset = 0;
                 }
+                // Same idea at the top of scrollback: if we can't move any further,
+                // don't leave a sub-cell offset lingering.
+                if (screen_pages.viewport == .top) {
+                    self.mouse.pixel_scroll_offset = 0;
+                }
 
                 // Offset is in range (-cell_height, 0] for the renderer.
                 // Negate so renderer gets positive value for the sub-cell shift.

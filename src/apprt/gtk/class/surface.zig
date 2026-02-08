@@ -2891,10 +2891,16 @@ pub const Surface = extern struct {
         self: *Self,
     ) callconv(.c) void {
         self.private().precision_scroll = false;
+
+        // Notify the core surface that precision scroll ended so it can
+        // inject kinetic momentum velocity into the renderer.
+        if (self.private().core_surface) |surface| {
+            surface.scrollEndCallback();
+        }
     }
 
     fn ecMouseScroll(
-        _: *gtk.EventControllerScroll,
+        ec: *gtk.EventControllerScroll,
         x: f64,
         y: f64,
         self: *Self,
@@ -2902,17 +2908,29 @@ pub const Surface = extern struct {
         const priv = self.private();
         const surface = priv.core_surface orelse return 0;
 
+        // Detect input source directly from the device. This is more reliable
+        // than scroll-begin/scroll-end signals which may not fire on all
+        // backends (e.g. X11 without kinetic flag). A touchpad source means
+        // precision (sub-line) scroll data; anything else is discrete.
+        const is_touchpad = if (ec.as(gtk.EventController).getCurrentEventDevice()) |dev|
+            dev.getSource() == .touchpad
+        else
+            false;
+        const precision = priv.precision_scroll or is_touchpad;
+
         // Multiply precision scrolls by 10 to get a better response from
-        // touchpad scrolling
-        const multiplier: f64 = if (priv.precision_scroll) 10.0 else 1.0;
+        // touchpad scrolling. GTK reports touchpad deltas as small fractions
+        // of a line; scaling up makes them usable as pixel offsets.
+        const multiplier: f64 = if (precision) 10.0 else 1.0;
         const scroll_mods: input.ScrollMods = .{
-            .precision = priv.precision_scroll,
+            .precision = precision,
         };
 
+        // Pass through without inversion — the system's natural scrolling
+        // setting (via libinput/compositor) is already applied to these
+        // values by GTK for both touchpad and discrete sources.
         const scaled = self.scaledCoordinates(x, y);
         surface.scrollCallback(
-            // Pass through without inversion - the system's natural scrolling
-            // setting (via libinput/compositor) is already applied to these values.
             scaled.x * multiplier,
             scaled.y * multiplier,
             scroll_mods,

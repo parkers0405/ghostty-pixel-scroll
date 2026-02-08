@@ -276,6 +276,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         wheel_glide_time: f32 = 0,
         wheel_glide_active: bool = false,
 
+        /// Momentum-based scroll velocity for mouse wheel (pixels/sec conceptual).
+        /// Each wheel tick adds velocity; friction decays it each frame.
+        /// This gives iOS-like momentum scrolling - flick to scroll fast,
+        /// gentle ticks for slow browsing, natural deceleration to stop.
+        scroll_momentum_velocity: f32 = 0,
+        scroll_momentum_offset: f32 = 0,
+
         /// Whether scroll animation is currently active
         scroll_animating: bool = false,
 
@@ -1530,6 +1537,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Reset scroll delta (we're consuming it)
                 state.mouse.scroll_delta_lines = 0;
                 state.mouse.wheel_glide_kick = 0;
+                state.mouse.kinetic_velocity = 0;
 
                 const tui_in_alternate = state.terminal.screens.active_key == .alternate;
                 const viewport_at_bottom = state.terminal.screens.active.viewportIsBottom();
@@ -1659,6 +1667,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.wheel_glide_offset = 0;
                     self.wheel_glide_start = 0;
                     self.wheel_glide_time = 0;
+                    self.scroll_momentum_velocity = 0;
+                    self.scroll_momentum_offset = 0;
                     self.scroll_animating = false;
                 } else {
                     const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
@@ -1726,6 +1736,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     } else {
                         // Primary screen: handle output + user scroll separately.
 
+                        // Reset all scroll animations when viewport returns to bottom
+                        // (e.g. after `clear`, or user scrolls back to active).
+                        // This prevents stale momentum/spring from pushing content off-screen.
+                        if (critical.just_recentered or (critical.viewport_at_bottom and critical.mouse.pixel_scroll_offset_y == 0)) {
+                            self.scroll_spring.reset();
+                            self.scroll_momentum_velocity = 0;
+                            self.scroll_momentum_offset = 0;
+                            self.scroll_glide_active = false;
+                            self.scroll_glide_offset = 0;
+                            self.scroll_glide_start = 0;
+                            self.scroll_glide_time = 0;
+                        }
+
                         if (!critical.viewport_at_bottom) {
                             self.output_glide_active = false;
                             self.output_glide_offset = 0;
@@ -1749,85 +1772,37 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             self.scroll_animating = true;
                         }
 
-                        // Output scroll (content arrival) - glide only on bottom rows.
-                        if (scroll_jump_output >= scroll_threshold and critical.viewport_at_bottom and !critical.just_recentered) {
-                            const output_abs = @abs(scroll_jump_output);
-                            const max_dur = @min(self.config.scroll_animation_duration, 0.35);
-                            const glide_dur = @max(0.12, max_dur);
+                        // Content arrival at bottom: NO animation. Just snap.
+                        // Animating every line of output is distracting for logs,
+                        // CLI usage, and streaming content. Let it appear instantly.
+                        // (scroll_jump_output is intentionally ignored here.)
 
-                            const rows_f: f32 = @floatFromInt(self.terminal_state.rows);
-                            const rows_u16: u16 = @intFromFloat(@min(rows_f, @as(f32, @floatFromInt(std.math.maxInt(u16)))));
-                            const jump_lines: u16 = @intFromFloat(@min(output_abs, rows_f));
-                            const max_lines_cap: u16 = 18;
-                            const max_lines: u16 = @min(max_lines_cap, rows_u16);
-                            const min_lines: u16 = 1;
-                            const computed_glide_lines: u16 = @min(@max(jump_lines, min_lines), max_lines);
-                            var glide_lines: u16 = computed_glide_lines;
-                            if (self.output_glide_active) {
-                                glide_lines = @max(glide_lines, self.output_glide_lines);
-                            }
-
-                            if (glide_lines > 0) {
-                                const sign: f32 = if (scroll_jump_output < 0) -1 else 1;
-                                const delta_lines: f32 = @min(output_abs, @as(f32, @floatFromInt(glide_lines)));
-                                const delta = sign * delta_lines * cell_h;
-                                const new_start = self.output_glide_offset + delta;
-                                self.output_glide_start = new_start;
-                                self.output_glide_offset = new_start;
-                                self.output_glide_time = 0;
-                                self.output_glide_duration = @max(self.output_glide_duration, glide_dur);
-                                self.output_glide_active = true;
-                                self.output_glide_lines = glide_lines;
-                                self.scroll_animating = true;
-                            }
-                        }
-
-                        // User scroll (viewport movement) - glide for small jumps, spring for big recenter.
+                        // User scroll (viewport movement via mouse wheel, page-up, etc.)
                         // If output just arrived at bottom, ignore the viewport jump to avoid false "pop".
-                        const effective_viewport_jump: f32 = if (
-                            critical.viewport_at_bottom and
-                            @abs(scroll_jump_output) >= scroll_threshold
-                        ) 0 else scroll_jump_viewport;
-                        if (@abs(effective_viewport_jump) >= scroll_threshold) {
-                            const abs_jump = @abs(effective_viewport_jump);
-                            const use_spring = abs_jump >= 32.0;
-                            const pixel_scrolling_active = critical.mouse.pixel_scroll_offset_y != 0;
+                        const effective_viewport_jump: f32 = if (critical.viewport_at_bottom and
+                            @abs(scroll_jump_output) >= scroll_threshold) 0 else scroll_jump_viewport;
 
-                            if (use_spring) {
+                        // When pixel scrolling is active (pixel_scroll_offset_y != 0),
+                        // the viewport advances line-by-line as the accumulated pixel
+                        // offset crosses cell boundaries. These viewport jumps are just
+                        // data-loading — the pixel offset already provides smooth visual
+                        // positioning. Do NOT add spring/momentum animations for them,
+                        // as they would fight with the pixel offset and cause snapping.
+                        const pixel_scrolling_active = critical.mouse.pixel_scroll_offset_y != 0;
+
+                        if (!pixel_scrolling_active and @abs(effective_viewport_jump) >= scroll_threshold) {
+                            const abs_jump = @abs(effective_viewport_jump);
+
+                            if (abs_jump >= 16.0) {
+                                // Large jump (page-up, clicking scrollbar, etc): spring.
                                 self.scroll_spring.position += effective_viewport_jump * cell_h;
                                 self.scroll_animating = true;
-                            } else if (!pixel_scrolling_active) {
-                                const now_scroll = std.time.Instant.now() catch null;
-                                if (now_scroll) |now_s| {
-                                    if (self.last_user_scroll_time) |last_t| {
-                                        const elapsed_ns = now_s.since(last_t);
-                                        const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
-                                        const clamped = @min(elapsed_s, 2.0);
-                                        self.user_scroll_interval_ema = self.user_scroll_interval_ema * 0.7 + clamped * 0.3;
-                                    } else {
-                                        self.user_scroll_interval_ema = 1.0;
-                                    }
-                                    self.last_user_scroll_time = now_s;
-                                }
-
-                                const max_dur = @min(self.config.scroll_animation_duration, 0.12);
-                                const base_dur = self.user_scroll_interval_ema * 0.16;
-                                const min_dur = @min(0.012, max_dur);
-                                const glide_dur = @max(min_dur, @min(max_dur, base_dur));
-
-                                const delta = effective_viewport_jump * cell_h;
-                                const new_start = self.scroll_glide_offset + delta;
-                                self.scroll_glide_start = new_start;
-                                self.scroll_glide_offset = new_start;
-                                self.scroll_glide_time = 0;
-                                self.scroll_glide_duration = glide_dur;
-                                self.scroll_glide_active = true;
-                                self.scroll_animating = true;
                             } else {
-                                self.scroll_glide_active = false;
-                                self.scroll_glide_offset = 0;
-                                self.scroll_glide_start = 0;
-                                self.scroll_glide_time = 0;
+                                // Small-medium jump (mouse wheel): add to momentum velocity.
+                                // Each tick adds velocity; friction decays it smoothly per frame.
+                                // This gives iOS-like momentum scrolling.
+                                self.scroll_momentum_velocity += effective_viewport_jump * cell_h * 4.0;
+                                self.scroll_animating = true;
                             }
                         }
                     }
@@ -3070,11 +3045,32 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     if (is_terminal and (self.scroll_animating or self.output_glide_active or self.tui_glide_active)) {
                         var any_scroll_anim = false;
 
-                        // Spring animation (large jumps)
+                        // Spring animation (large jumps like page-up)
                         if (self.scroll_spring.position != 0) {
                             const scroll_len = self.config.scroll_animation_duration;
                             const scroll_zeta = 1.0 - (self.config.scroll_animation_bounciness * 0.6);
                             if (self.scroll_spring.update(dt, scroll_len, scroll_zeta)) {
+                                any_scroll_anim = true;
+                            }
+                        }
+
+                        // Momentum scroll (mouse wheel): velocity decays with friction.
+                        // Each frame: offset += velocity * dt, velocity *= friction^dt
+                        // Gives smooth iOS-like deceleration.
+                        if (self.scroll_momentum_velocity != 0 or self.scroll_momentum_offset != 0) {
+                            // Exponential friction decay (frame-rate independent)
+                            const friction: f32 = 0.0001; // Lower = more momentum/coast
+                            const decay = std.math.pow(f32, friction, dt);
+                            self.scroll_momentum_velocity *= decay;
+
+                            // Integrate velocity into offset
+                            self.scroll_momentum_offset += self.scroll_momentum_velocity * dt;
+
+                            // Stop when velocity is negligible
+                            if (@abs(self.scroll_momentum_velocity) < 0.5 and @abs(self.scroll_momentum_offset) < 0.5) {
+                                self.scroll_momentum_velocity = 0;
+                                self.scroll_momentum_offset = 0;
+                            } else {
                                 any_scroll_anim = true;
                             }
                         }
@@ -3172,7 +3168,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             }
                         }
 
-                        self.scroll_animating = any_scroll_anim or self.scroll_glide_active or self.output_glide_active or self.tui_glide_active or self.wheel_glide_active;
+                        self.scroll_animating = any_scroll_anim or self.scroll_glide_active or self.output_glide_active or self.tui_glide_active or self.wheel_glide_active or (self.scroll_momentum_velocity != 0);
                     }
 
                     // Sonicboom VFX (both modes)
@@ -3268,9 +3264,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // so the shader only applies it within the scroll region.
                 const spring_offset = if (self.in_alternate_screen) @as(f32, 0) else self.scroll_spring.position;
                 const glide_offset = if (self.in_alternate_screen) @as(f32, 0) else self.scroll_glide_offset;
-                const scroll_offset = base_offset - spring_offset - glide_offset;
+                const momentum_offset = if (self.in_alternate_screen) @as(f32, 0) else self.scroll_momentum_offset;
+                const scroll_offset = base_offset - spring_offset - glide_offset - momentum_offset;
+                // Clamp to [0, 2*cell_h] to prevent the hidden extra rows (top and bottom)
+                // from bleeding into the visible viewport during scroll animations.
+                // At rest: cell_h (hides top extra row). Range allows ±1 row of animation.
+                const clamped_offset = std.math.clamp(scroll_offset, 0, 2.0 * cell_h);
                 // Keep glyphs crisp by aligning to whole pixels.
-                self.uniforms.pixel_scroll_offset_y = @round(scroll_offset);
+                self.uniforms.pixel_scroll_offset_y = @round(clamped_offset);
 
                 // Set TUI scroll uniforms for alternate screen smooth scrolling.
                 // The shader uses these to apply the offset only within the scroll region,

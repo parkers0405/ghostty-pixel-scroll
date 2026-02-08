@@ -59,6 +59,10 @@ pub const Mouse = struct {
 
     /// One-shot wheel glide kick (pixels). Used to smooth discrete wheel steps.
     wheel_glide_kick: f32 = 0,
+
+    /// Kinetic momentum velocity injected when touchpad precision scroll ends.
+    /// Set by Surface when fingers lift off trackpad, consumed by renderer.
+    kinetic_velocity: f32 = 0,
 };
 
 /// The pre-edit state. See Surface.preeditCallback for more information.

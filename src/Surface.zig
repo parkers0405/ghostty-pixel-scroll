@@ -254,6 +254,13 @@ const Mouse = struct {
     /// into history so content should shift up.
     pixel_scroll_offset: f64 = 0,
 
+    /// Kinetic scroll velocity tracking for touchpad momentum.
+    /// Tracks recent precision scroll velocity so we can inject momentum
+    /// when the user lifts their fingers off the touchpad.
+    precision_scroll_velocity: f64 = 0,
+    precision_scroll_last_time: ?std.time.Instant = null,
+    precision_scroll_active: bool = false,
+
     /// True if the mouse is hidden
     hidden: bool = false,
 
@@ -3585,7 +3592,7 @@ pub fn scrollCallback(
     yoff: f64,
     scroll_mods: input.ScrollMods,
 ) !void {
-    // log.info("SCROLL: xoff={} yoff={} mods={}", .{ xoff, yoff, scroll_mods });
+    // log.info("SCROLL: xoff={} yoff={} precision={}", .{ xoff, yoff, scroll_mods.precision });
 
     // Crash metadata in case we crash in here
     crash.sentry.thread_state = self.crashThreadState();
@@ -3814,20 +3821,11 @@ pub fn scrollCallback(
         }
 
         if (use_pixel_scroll and yoff != 0) {
-            // Neovide-style smooth scrolling:
-            // 1. Scroll terminal viewport immediately
-            // 2. Set scroll_delta_lines so renderer can animate visually
-            // 3. Renderer animates from old position to new position
-
-            const yoff_adjusted: f64 = if (scroll_mods.precision)
-                yoff * self.config.mouse_scroll_multiplier.precision
-            else yoff_adjusted: {
-                const yoff_max: f64 = if (yoff > 0)
-                    @max(yoff, 1)
-                else
-                    @min(yoff, -1);
-                break :yoff_adjusted yoff_max * cell_height * self.config.mouse_scroll_multiplier.discrete;
-            };
+            // Pixel-perfect smooth scrolling: accumulate sub-pixel offsets for both
+            // precision (touchpad) and discrete (mouse wheel) input. The viewport
+            // advances one line at a time as the accumulated offset crosses cell
+            // boundaries, with the fractional remainder driving the sub-line pixel
+            // shift in the renderer.
 
             // Check if we can scroll
             const is_main_screen = self.io.terminal.screens.active_key == .primary;
@@ -3835,53 +3833,63 @@ pub fn scrollCallback(
             const has_history = screen_pages.total_rows > screen_pages.rows;
 
             if (is_main_screen and has_history) {
-                // Accumulate pixel offset (negative yoff = scroll down = positive offset)
-                self.mouse.pixel_scroll_offset -= yoff_adjusted;
-
-                // Only scroll terminal when we've accumulated a full line
-                const max_scroll_rows = screen_pages.total_rows -| screen_pages.rows;
-                const current_vp_offset: f64 = switch (screen_pages.viewport) {
-                    .active => 0,
-                    .top => @floatFromInt(max_scroll_rows),
-                    .pin => blk: {
-                        const offset = screen_pages.viewport_pin_row_offset orelse 0;
-                        break :blk @floatFromInt(max_scroll_rows -| offset);
-                    },
+                // Both precision (touchpad) and discrete (mouse wheel) accumulate
+                // pixel offsets for true sub-line smooth scrolling. The difference
+                // is how yoff is interpreted and scaled.
+                const yoff_adjusted: f64 = if (scroll_mods.precision)
+                    yoff * self.config.mouse_scroll_multiplier.precision
+                else yoff_adjusted: {
+                    const yoff_max: f64 = if (yoff > 0)
+                        @max(yoff, 1)
+                    else
+                        @min(yoff, -1);
+                    break :yoff_adjusted yoff_max * cell_height * self.config.mouse_scroll_multiplier.discrete;
                 };
 
-                // Total visual scroll in lines
-                const total_scroll_lines = current_vp_offset + (self.mouse.pixel_scroll_offset / cell_height);
+                // Accumulate sub-pixel offset.
+                // Negative offset = scrolling up (into history), positive = toward active.
+                self.mouse.pixel_scroll_offset -= yoff_adjusted;
 
-                // Clamp visual scroll to valid range
-                if (total_scroll_lines < 0) {
-                    // Hit bottom - clamp offset
-                    self.mouse.pixel_scroll_offset = -current_vp_offset * cell_height;
-                } else if (total_scroll_lines > @as(f64, @floatFromInt(max_scroll_rows))) {
-                    // Hit top - clamp offset
-                    self.mouse.pixel_scroll_offset = (@as(f64, @floatFromInt(max_scroll_rows)) - current_vp_offset) * cell_height;
+                // Track velocity for kinetic momentum on touchpad finger lift.
+                if (scroll_mods.precision) {
+                    self.mouse.precision_scroll_active = true;
+                    const now = std.time.Instant.now() catch null;
+                    if (now) |n| {
+                        if (self.mouse.precision_scroll_last_time) |last| {
+                            const dt_ns = n.since(last);
+                            const dt_s: f64 = @as(f64, @floatFromInt(dt_ns)) / @as(f64, @floatFromInt(std.time.ns_per_s));
+                            if (dt_s > 0 and dt_s < 0.5) {
+                                const instant_vel = -yoff_adjusted / dt_s;
+                                // EMA with alpha 0.3 for smooth velocity tracking
+                                self.mouse.precision_scroll_velocity = self.mouse.precision_scroll_velocity * 0.7 + instant_vel * 0.3;
+                            }
+                        }
+                        self.mouse.precision_scroll_last_time = n;
+                    }
                 }
 
-                // Scroll terminal viewport to keep content loaded
-                // Scroll when offset crosses line boundaries
-                // Keep offset in range [0, cell_height) for upward scroll (into history)
-                // and (-cell_height, 0] for downward scroll (toward active)
-                while (self.mouse.pixel_scroll_offset >= cell_height) {
-                    self.mouse.pixel_scroll_offset -= cell_height;
+                // Scroll viewport when we cross line boundaries.
+                // Negative offset = scrolled into history, positive = toward active.
+                while (self.mouse.pixel_scroll_offset <= -cell_height) {
+                    self.mouse.pixel_scroll_offset += cell_height;
                     try self.io.terminal.scrollViewport(.{ .delta = -1 });
                 }
-                while (self.mouse.pixel_scroll_offset < 0) {
-                    self.mouse.pixel_scroll_offset += cell_height;
+                while (self.mouse.pixel_scroll_offset > 0) {
+                    self.mouse.pixel_scroll_offset -= cell_height;
                     try self.io.terminal.scrollViewport(.{ .delta = 1 });
                 }
 
-                // Update renderer state
-                self.renderer_state.mouse.pixel_scroll_offset_y = @floatCast(self.mouse.pixel_scroll_offset);
-
-                // Add a small glide kick for discrete wheels to smooth out step-y scrolling.
-                if (!scroll_mods.precision) {
-                    const kick = std.math.clamp(-yoff_adjusted * 0.2, -cell_height * 0.6, cell_height * 0.6);
-                    self.renderer_state.mouse.wheel_glide_kick += @floatCast(kick);
+                // When viewport is at bottom (active), snap pixel offset to zero.
+                // Without this, scrolling toward bottom accumulates a residual negative
+                // offset because scrollViewport stops moving but the loop still adjusts
+                // pixel_scroll_offset, leaving a visual displacement.
+                if (self.io.terminal.screens.active.viewportIsBottom()) {
+                    self.mouse.pixel_scroll_offset = 0;
                 }
+
+                // Offset is in range (-cell_height, 0] for the renderer.
+                // Negate so renderer gets positive value for the sub-cell shift.
+                self.renderer_state.mouse.pixel_scroll_offset_y = @floatCast(-self.mouse.pixel_scroll_offset);
             } else {
                 self.mouse.pixel_scroll_offset = 0;
                 self.renderer_state.mouse.pixel_scroll_offset_y = 0;
@@ -3900,6 +3908,20 @@ pub fn scrollCallback(
     }
 
     try self.queueRender();
+}
+
+/// Called when a precision scroll gesture ends (user lifts fingers from touchpad).
+/// Resets precision scroll tracking state. Kinetic momentum is intentionally NOT
+/// injected here because the momentum system is visual-only (pixel offsets) and
+/// doesn't drive actual viewport scrolls, which would cause the view to drift
+/// past scroll bounds.
+pub fn scrollEndCallback(self: *Surface) void {
+    if (!self.mouse.precision_scroll_active) return;
+
+    // Reset precision scroll tracking state
+    self.mouse.precision_scroll_velocity = 0;
+    self.mouse.precision_scroll_last_time = null;
+    self.mouse.precision_scroll_active = false;
 }
 
 /// This is called when the content scale of the surface changes. The surface

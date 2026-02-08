@@ -234,7 +234,10 @@ pub const ViewportMargins = struct {
 
 /// Scroll animation settings
 pub const ScrollSettings = struct {
-    /// For "far" scrolls (> buffer capacity), show this many lines of animation
+    /// For "far" scrolls (> viewport), animate this many lines of content
+    /// sliding in. Matches Neovide's scroll_animation_far_lines (default 1).
+    /// Small values (1-3) give a tight, perceptible whoosh on big jumps
+    /// (gg, G, :1, 100j). Larger values show more blank lines sweeping through.
     scroll_animation_far_lines: u32 = 1,
 };
 
@@ -309,11 +312,6 @@ pub const RenderedWindow = struct {
     /// Whether this window has ever received a non-zero scroll_delta
     /// Used to disable smooth scroll for windows like nvim-tree that don't really scroll
     has_scrolled: bool = false,
-
-    /// Set to true when a far-scroll snap occurs in flush().
-    /// The renderer should snap the cursor to its new position instead of animating.
-    /// Cleared after the renderer reads it.
-    far_scroll_snapped: bool = false,
 
     /// Fixed rows/cols at edges (winbar, borders, etc.)
     viewport_margins: ViewportMargins = .{},
@@ -861,29 +859,71 @@ pub const RenderedWindow = struct {
         }
 
         // Update scroll animation (Neovide-style with far-scroll capping)
+        // Matches Neovide's flush(): for far scrolls, insert empty lines into
+        // the scrollback so the spring animates through them (whoosh effect).
+        // No hard teleport — the spring smoothly decelerates to the destination.
         if (scroll_delta != 0) {
-            const delta_f: f32 = @floatFromInt(scroll_delta);
-            var new_delta = -delta_f; // scroll_delta > 0 -> position goes negative
-
-            // Far-scroll capping: when the scroll is larger than the viewport,
-            // only animate the last N lines and snap the rest instantly.
-            // This prevents slow animations for huge jumps (gg, G, 100j).
-            const far_lines: f32 = @floatFromInt(self.scroll_settings.scroll_animation_far_lines);
             const inner_f: f32 = @floatFromInt(inner_size);
-            if (@abs(new_delta) > inner_f and far_lines < @abs(new_delta)) {
-                // Snap most of the distance instantly by resetting the spring,
-                // then animate only the last far_lines worth of distance
+
+            const max_delta: usize = scrollback.length() -| @as(usize, @intCast(inner_size));
+
+            if (@as(usize, @abs(scroll_delta)) > max_delta) {
+                // Far scroll — matches Neovide: insert empty (null) lines into
+                // the scrollback edges so the spring animates through blank rows,
+                // creating an accelerated whoosh instead of a teleport.
+                const far_lines_cfg = self.scroll_settings.scroll_animation_far_lines;
+                const far_lines_i: isize = if (far_lines_cfg == 0)
+                    inner_size // 0 → use full viewport height
+                else
+                    @min(@as(isize, @intCast(far_lines_cfg)), inner_size);
+
+                // Reset the spring and set it to animate exactly far_lines
+                // worth of distance. Reset clears any leftover velocity from
+                // a previous animation so the far-scroll starts cleanly.
                 self.scroll_animation.reset();
-                new_delta = if (new_delta < 0) -far_lines else far_lines;
-                // Signal to the renderer that cursor should also snap
-                self.far_scroll_snapped = true;
+                self.scroll_animation.position = -@as(f32, @floatFromInt(far_lines_i)) *
+                    @as(f32, @floatFromInt(std.math.sign(scroll_delta)));
+
+                // Insert blank lines into the scrollback slots the spring will
+                // traverse.  Lines MUST be allocated (not null) so that
+                // hasValidScrollbackData() returns true and the renderer
+                // actually applies the pixel offset.  Neovide uses None
+                // (draws nothing), but our renderer gates on non-null lines.
+                //
+                // Scrolling down (scroll_delta > 0, spring negative): blank
+                // rows are at negative indices (above current view).
+                // Scrolling up (scroll_delta < 0, spring positive): blank
+                // rows are past the bottom of the inner view.
+                if (scroll_delta > 0) {
+                    var j: isize = -far_lines_i;
+                    while (j < 0) : (j += 1) {
+                        const sb_ptr = scrollback.get(j);
+                        if (sb_ptr.*) |line| {
+                            line.clear();
+                        } else {
+                            // Allocate a blank line so the renderer sees valid data
+                            sb_ptr.* = GridLine.init(self.alloc, self.grid_width) catch continue;
+                        }
+                    }
+                } else {
+                    var j: isize = inner_size;
+                    while (j < inner_size + far_lines_i) : (j += 1) {
+                        const sb_ptr = scrollback.get(j);
+                        if (sb_ptr.*) |line| {
+                            line.clear();
+                        } else {
+                            sb_ptr.* = GridLine.init(self.alloc, self.grid_width) catch continue;
+                        }
+                    }
+                }
+            } else {
+                // Normal (short) scroll — accumulate onto the spring
+                const delta_f: f32 = @floatFromInt(scroll_delta);
+                const new_delta = -delta_f;
+                const current_pos = self.scroll_animation.position;
+                const new_pos = current_pos + new_delta;
+                self.scroll_animation.position = std.math.clamp(new_pos, -inner_f, inner_f);
             }
-
-            const current_pos = self.scroll_animation.position;
-            const new_pos = current_pos + new_delta;
-
-            const max_delta: f32 = inner_f;
-            self.scroll_animation.position = std.math.clamp(new_pos, -max_delta, max_delta);
         }
 
         // Content has been flushed - safe to render this window now
@@ -895,21 +935,13 @@ pub const RenderedWindow = struct {
     pub fn animate(self: *Self, dt: f32, scroll_duration: f32) bool {
         var animating = false;
 
-        // Animate scroll using critically damped spring (Neovide-style with catchup)
-        // When the spring position is far from 0 (i.e. we're behind), shorten the
-        // animation length so it catches up faster. This prevents lag during rapid
-        // scrolling (holding j/k, Ctrl+D spam, etc.).
-        // scroll_duration from config: >0 = animate at that speed, 0 = snap instantly
-        const base_length = if (scroll_duration > 0) scroll_duration else 0.0;
-        const scroll_dist = @abs(self.scroll_animation.position);
-        const anim_length = if (scroll_dist > 1.0) blk: {
-            // Scale animation length inversely with distance.
-            // At 1 line behind: full animation_length
-            // At 5+ lines behind: much shorter (snappier catchup)
-            // Formula matches Neovide: length / (1 + excess_distance * factor)
-            const catchup_factor: f32 = 0.3;
-            break :blk base_length / (1.0 + (scroll_dist - 1.0) * catchup_factor);
-        } else base_length;
+        // Animate scroll using critically damped spring — matches Neovide exactly.
+        // Neovide passes a fixed scroll_animation_length (default 0.3s) to the
+        // spring every frame with NO adaptive catchup. The spring's own physics
+        // naturally accelerates at the start and decelerates at the end, which
+        // produces the smooth visible scroll animation for both small and large
+        // jumps (:1, gg, G, 100j, etc.).
+        const anim_length = if (scroll_duration > 0) scroll_duration else 0.0;
 
         if (self.scroll_animation.update(dt, anim_length, 0)) {
             animating = true;

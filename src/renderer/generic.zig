@@ -231,73 +231,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         sonicboom_center_x: f32 = 0,
         sonicboom_center_y: f32 = 0,
 
-        /// Scroll animation spring for smooth scrolling (position = offset in pixels from target)
-        /// Used ONLY for large single-shot jumps (10+ lines at once, not streaming).
-        /// Gives a satisfying "drop" effect when e.g. `ls` dumps 50 lines.
-        scroll_spring: animation.Spring = .{},
+        /// Critically damped spring for ALL user scroll animation (primary screen).
+        /// Ported from the Neovim GUI's CriticallyDampedSpring approach:
+        ///   - Position is in LINES (not pixels). Accumulates scroll deltas.
+        ///   - Animates toward 0 with adaptive catchup (faster when far behind).
+        ///   - Fractional part → sub-pixel offset; integer part → row shift.
+        /// This single spring replaces the old momentum/glide/spring mix,
+        /// giving the exact same smooth, responsive feel as the Neovim GUI.
+        user_scroll_spring: animation.Spring = .{},
 
-        /// Velocity-adaptive glide for ALL content arrival.
-        /// Every scroll event gets an ease-out glide whose duration adapts to output rate:
-        ///   - Slow/isolated output → long glide (~80ms), feels intentional
-        ///   - Fast streaming (logs) → very short glide (~8-15ms), subtle conveyor belt
-        /// This means content ALWAYS flows in smoothly — never teleports, never earthquakes.
-        ///
-        /// scroll_glide_start: pixel offset when glide began (frozen per glide start).
-        /// scroll_glide_offset: current computed offset (ease-out from start → 0).
-        /// When new lines arrive mid-glide, the current offset + new delta becomes
-        /// the new start, and time resets — smooth re-targeting.
-        scroll_glide_start: f32 = 0,
-        scroll_glide_offset: f32 = 0,
-        scroll_glide_duration: f32 = 0.06,
-        scroll_glide_time: f32 = 0,
-        scroll_glide_active: bool = false,
-
-        /// Output-only glide for terminal primary screen.
-        /// Applies only to the bottom N rows to avoid global "bounce".
-        output_glide_start: f32 = 0,
-        output_glide_offset: f32 = 0,
-        output_glide_duration: f32 = 0.08,
-        output_glide_time: f32 = 0,
-        output_glide_active: bool = false,
-        output_glide_lines: u16 = 0,
-        output_glide_exclude_row: ?terminal.size.CellCountInt = null,
-
-        /// Alternate screen (TUI) glide for small jumps.
-        tui_glide_start: f32 = 0,
-        tui_glide_offset: f32 = 0,
-        tui_glide_duration: f32 = 0.05,
-        tui_glide_time: f32 = 0,
-        tui_glide_active: bool = false,
-
-        /// Discrete wheel smoothing glide (primary screen).
-        wheel_glide_start: f32 = 0,
-        wheel_glide_offset: f32 = 0,
-        wheel_glide_duration: f32 = 0.05,
-        wheel_glide_time: f32 = 0,
-        wheel_glide_active: bool = false,
-
-        /// Momentum-based scroll velocity for mouse wheel (pixels/sec conceptual).
-        /// Each wheel tick adds velocity; friction decays it each frame.
-        /// This gives iOS-like momentum scrolling - flick to scroll fast,
-        /// gentle ticks for slow browsing, natural deceleration to stop.
-        scroll_momentum_velocity: f32 = 0,
-        scroll_momentum_offset: f32 = 0,
+        /// Alternate screen (TUI) spring for smooth scrolling.
+        /// Uses the same CriticallyDampedSpring approach as user_scroll_spring.
+        tui_scroll_spring: animation.Spring = .{},
 
         /// Whether scroll animation is currently active
         scroll_animating: bool = false,
-
-        /// Scroll rate tracking for velocity-adaptive glide duration.
-        /// Exponential moving average of interval between scroll events (in seconds).
-        /// Starts high (= slow output = long glide) and adapts as events arrive.
-        last_scroll_time: ?std.time.Instant = null,
-        /// Smoothed interval between scroll events (seconds). EMA with alpha ~0.3.
-        /// Used to scale glide duration: long interval → long glide, short → short.
-        scroll_interval_ema: f32 = 1.0,
-
-        /// User scroll rate tracking for velocity-adaptive glide duration.
-        last_user_scroll_time: ?std.time.Instant = null,
-        /// Smoothed interval between user scroll events (seconds).
-        user_scroll_interval_ema: f32 = 1.0,
 
         /// Animation timing state (Neovide-style frame catchup).
         /// `animation_start` is the wall-clock time when the current animation
@@ -745,15 +693,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // When neovim-gui is active and animation values are at their
                 // zero defaults, apply Neovide-like defaults automatically.
-                // Users who explicitly want no animation in nvim-gui mode can
-                // use a tiny value like 0.001.
+                // When pixel-scroll or neovim-gui is active and no explicit duration
+                // was set (0), enable a sensible default so animations are on.
+                // Users who explicitly want no animation can use a tiny value like 0.001.
                 const nvim_active = config.@"neovim-gui".len > 0;
-                const cursor_dur = if (nvim_active and config.@"cursor-animation-duration" == 0)
+                const smooth_mode = nvim_active or config.@"pixel-scroll";
+                const cursor_dur = if (smooth_mode and config.@"cursor-animation-duration" == 0)
                     @as(f32, 0.06)
                 else
                     config.@"cursor-animation-duration";
-                const scroll_dur = if (nvim_active and config.@"scroll-animation-duration" == 0)
-                    @as(f32, 0.2)
+                const scroll_dur = if (smooth_mode and config.@"scroll-animation-duration" == 0)
+                    @as(f32, 0.3) // Match Neovide's default scroll_animation_length (0.3s)
                 else
                     config.@"scroll-animation-duration";
                 const corner_radius = if (nvim_active and config.@"neovim-corner-radius" == 0)
@@ -1215,9 +1165,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // here would cause the draw timer to spin forever.
             return self.cursor_animating or
                 self.scroll_animating or
-                self.output_glide_active or
-                self.tui_glide_active or
-                self.wheel_glide_active or
                 self.sonicboom_active or
                 // In Neovim GUI mode we also need to keep running while
                 // events are pending (dirty flag means content changed)
@@ -1394,25 +1341,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.last_cursor_grid_pos = .{ std.math.maxInt(u16), std.math.maxInt(u16) };
                     // Continue to regular terminal rendering below
                 } else {
-                    self.output_glide_active = false;
-                    self.output_glide_offset = 0;
-                    self.output_glide_start = 0;
-                    self.output_glide_time = 0;
-                    self.output_glide_lines = 0;
                     self.scroll_animating = false;
-                    self.scroll_glide_active = false;
-                    self.scroll_glide_offset = 0;
-                    self.scroll_glide_start = 0;
-                    self.scroll_glide_time = 0;
-                    self.scroll_spring.reset();
-                    self.tui_glide_active = false;
-                    self.tui_glide_offset = 0;
-                    self.tui_glide_start = 0;
-                    self.tui_glide_time = 0;
-                    self.wheel_glide_active = false;
-                    self.wheel_glide_offset = 0;
-                    self.wheel_glide_start = 0;
-                    self.wheel_glide_time = 0;
+                    self.user_scroll_spring.reset();
+                    self.tui_scroll_spring.reset();
                     try self.updateFrameNeovim(nvim);
                     return;
                 }
@@ -1637,11 +1568,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.draw_mutex.lock();
                 defer self.draw_mutex.unlock();
 
-                // Smooth scroll animations for output (content arrival) and user scroll.
+                // Smooth scroll animations using CriticallyDampedSpring (Neovide-style).
                 //
-                // Output: glide only on the bottom rows (no global bounce).
-                // User scroll: glide for small deltas, spring for big recenter jumps.
-                // TUI apps (alternate screen): tiny glide for small jumps, spring only for big dumps.
+                // Both primary and alternate screens use the same spring approach
+                // as the Neovim GUI: accumulate scroll deltas into a spring that
+                // decays toward 0 with adaptive catchup for rapid scrolling.
                 const scroll_threshold: f32 = 1.0;
                 const scroll_jump_total = self.terminal_state.scroll_jump;
                 const scroll_jump_viewport = self.terminal_state.scroll_jump_viewport;
@@ -1649,161 +1580,50 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 if (self.config.scroll_animation_duration <= 0) {
                     // If scroll animation is disabled, always snap.
-                    self.scroll_spring.reset();
-                    self.scroll_glide_active = false;
-                    self.scroll_glide_offset = 0;
-                    self.scroll_glide_start = 0;
-                    self.scroll_glide_time = 0;
-                    self.output_glide_active = false;
-                    self.output_glide_offset = 0;
-                    self.output_glide_start = 0;
-                    self.output_glide_time = 0;
-                    self.output_glide_lines = 0;
-                    self.tui_glide_active = false;
-                    self.tui_glide_offset = 0;
-                    self.tui_glide_start = 0;
-                    self.tui_glide_time = 0;
-                    self.wheel_glide_active = false;
-                    self.wheel_glide_offset = 0;
-                    self.wheel_glide_start = 0;
-                    self.wheel_glide_time = 0;
-                    self.scroll_momentum_velocity = 0;
-                    self.scroll_momentum_offset = 0;
+                    self.user_scroll_spring.reset();
+                    self.tui_scroll_spring.reset();
                     self.scroll_animating = false;
                 } else {
-                    const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
                     const in_alternate = critical.tui_in_alternate;
 
                     if (in_alternate) {
-                        // Alternate screen (TUI): spring only.
-                        self.output_glide_active = false;
-                        self.output_glide_offset = 0;
-                        self.output_glide_start = 0;
-                        self.output_glide_time = 0;
-                        self.output_glide_lines = 0;
-                        self.scroll_glide_active = false;
-                        self.scroll_glide_offset = 0;
-                        self.scroll_glide_start = 0;
-                        self.scroll_glide_time = 0;
-                        self.wheel_glide_active = false;
-                        self.wheel_glide_offset = 0;
-                        self.wheel_glide_start = 0;
-                        self.wheel_glide_time = 0;
+                        // Alternate screen (TUI): CriticallyDampedSpring (same as Neovim GUI).
+                        // Spring position is in lines. Accumulate scroll deltas.
                         if (@abs(scroll_jump_total) >= scroll_threshold) {
-                            const now_scroll = std.time.Instant.now() catch null;
-                            if (now_scroll) |now_s| {
-                                if (self.last_scroll_time) |last_t| {
-                                    const elapsed_ns = now_s.since(last_t);
-                                    const elapsed_s: f32 = @as(f32, @floatFromInt(elapsed_ns)) / @as(f32, @floatFromInt(std.time.ns_per_s));
-                                    const clamped = @min(elapsed_s, 2.0);
-                                    self.scroll_interval_ema = self.scroll_interval_ema * 0.7 + clamped * 0.3;
-                                } else {
-                                    self.scroll_interval_ema = 1.0;
-                                }
-                                self.last_scroll_time = now_s;
-                            }
-
-                            const abs_jump = @abs(scroll_jump_total);
-                            const use_spring = abs_jump >= 32.0;
-
-                            if (use_spring) {
-                                self.scroll_spring.position += scroll_jump_total * cell_h;
-                                self.scroll_animating = true;
-                                self.tui_glide_active = false;
-                                self.tui_glide_offset = 0;
-                                self.tui_glide_start = 0;
-                                self.tui_glide_time = 0;
-                            } else {
-                                const max_dur = @min(self.config.scroll_animation_duration, 0.12);
-                                const base_dur = self.scroll_interval_ema * 0.22;
-                                const glide_dur = @max(0.03, @min(max_dur, base_dur));
-
-                                const delta = scroll_jump_total * cell_h;
-                                const new_start = self.tui_glide_offset + delta;
-                                self.tui_glide_start = new_start;
-                                self.tui_glide_offset = new_start;
-                                self.tui_glide_time = 0;
-                                self.tui_glide_duration = glide_dur;
-                                self.tui_glide_active = true;
-                                self.scroll_animating = true;
-                            }
-                        } else {
-                            self.tui_glide_active = false;
-                            self.tui_glide_offset = 0;
-                            self.tui_glide_start = 0;
-                            self.tui_glide_time = 0;
+                            // Accumulate onto existing spring (allows rapid scroll stacking).
+                            // scroll_jump_total > 0 = content moved up.
+                            // Spring starts positive → tui_scroll_offset_y positive →
+                            // shader shifts content DOWN (old position), decays to 0 (new position).
+                            self.tui_scroll_spring.position += scroll_jump_total;
+                            self.scroll_animating = true;
                         }
                     } else {
-                        // Primary screen: handle output + user scroll separately.
+                        // Primary screen: CriticallyDampedSpring for ALL scroll events.
+                        // Both user scroll AND output arrival get the same spring animation,
+                        // matching the Neovim GUI's eased bounce feel.
 
-                        // Reset all scroll animations when viewport returns to bottom
-                        // (e.g. after `clear`, or user scrolls back to active).
-                        // This prevents stale momentum/spring from pushing content off-screen.
-                        if (critical.just_recentered or (critical.viewport_at_bottom and critical.mouse.pixel_scroll_offset_y == 0)) {
-                            self.scroll_spring.reset();
-                            self.scroll_momentum_velocity = 0;
-                            self.scroll_momentum_offset = 0;
-                            self.scroll_glide_active = false;
-                            self.scroll_glide_offset = 0;
-                            self.scroll_glide_start = 0;
-                            self.scroll_glide_time = 0;
+                        // Reset spring when viewport returns to bottom with no pending animation.
+                        if (critical.just_recentered and self.user_scroll_spring.position == 0) {
+                            self.user_scroll_spring.reset();
                         }
 
-                        if (!critical.viewport_at_bottom) {
-                            self.output_glide_active = false;
-                            self.output_glide_offset = 0;
-                            self.output_glide_start = 0;
-                            self.output_glide_time = 0;
-                            self.output_glide_lines = 0;
-                        }
+                        // When pixel scrolling is active, viewport jumps are just
+                        // data-loading. Don't add spring animation for them.
+                        const pixel_scrolling_active = critical.mouse.pixel_scroll_offset_y != 0;
 
-                        if (critical.mouse.wheel_glide_kick != 0) {
-                            const max_dur = @min(self.config.scroll_animation_duration, 0.08);
-                            const base_dur = self.user_scroll_interval_ema * 0.12;
-                            const glide_dur = @max(0.015, @min(max_dur, base_dur));
-
-                            const delta = critical.mouse.wheel_glide_kick;
-                            const new_start = self.wheel_glide_offset + delta;
-                            self.wheel_glide_start = new_start;
-                            self.wheel_glide_offset = new_start;
-                            self.wheel_glide_time = 0;
-                            self.wheel_glide_duration = glide_dur;
-                            self.wheel_glide_active = true;
+                        // User scroll (viewport movement via mouse wheel, page-up, etc.)
+                        // When output arrives at bottom, the viewport jump is from output,
+                        // not user action — but we still want to animate it.
+                        if (!pixel_scrolling_active and @abs(scroll_jump_viewport) >= scroll_threshold) {
+                            self.user_scroll_spring.position += scroll_jump_viewport;
                             self.scroll_animating = true;
                         }
 
-                        // Content arrival at bottom: NO animation. Just snap.
-                        // Animating every line of output is distracting for logs,
-                        // CLI usage, and streaming content. Let it appear instantly.
-                        // (scroll_jump_output is intentionally ignored here.)
-
-                        // User scroll (viewport movement via mouse wheel, page-up, etc.)
-                        // If output just arrived at bottom, ignore the viewport jump to avoid false "pop".
-                        const effective_viewport_jump: f32 = if (critical.viewport_at_bottom and
-                            @abs(scroll_jump_output) >= scroll_threshold) 0 else scroll_jump_viewport;
-
-                        // When pixel scrolling is active (pixel_scroll_offset_y != 0),
-                        // the viewport advances line-by-line as the accumulated pixel
-                        // offset crosses cell boundaries. These viewport jumps are just
-                        // data-loading — the pixel offset already provides smooth visual
-                        // positioning. Do NOT add spring/momentum animations for them,
-                        // as they would fight with the pixel offset and cause snapping.
-                        const pixel_scrolling_active = critical.mouse.pixel_scroll_offset_y != 0;
-
-                        if (!pixel_scrolling_active and @abs(effective_viewport_jump) >= scroll_threshold) {
-                            const abs_jump = @abs(effective_viewport_jump);
-
-                            if (abs_jump >= 16.0) {
-                                // Large jump (page-up, clicking scrollbar, etc): spring.
-                                self.scroll_spring.position += effective_viewport_jump * cell_h;
-                                self.scroll_animating = true;
-                            } else {
-                                // Small-medium jump (mouse wheel): add to momentum velocity.
-                                // Each tick adds velocity; friction decays it smoothly per frame.
-                                // This gives iOS-like momentum scrolling.
-                                self.scroll_momentum_velocity += effective_viewport_jump * cell_h * 4.0;
-                                self.scroll_animating = true;
-                            }
+                        // Output arrival: new content pushing the viewport down.
+                        // Animate with the same spring for that nice eased bounce.
+                        if (critical.viewport_at_bottom and @abs(scroll_jump_output) >= scroll_threshold) {
+                            self.user_scroll_spring.position += scroll_jump_output;
+                            self.scroll_animating = true;
                         }
                     }
                 }
@@ -2677,18 +2497,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const pos_changed = screen_col != last_x or screen_row != last_y;
 
             if (pos_changed or scroll_changed) {
-                // Check if the cursor's window had a far-scroll snap.
-                // If so, snap the cursor instantly instead of animating.
-                if (cursor_window.far_scroll_snapped) {
-                    // Snap cursor to new position (no animation)
-                    self.cursor_animation.target_x = target_pixel_x;
-                    self.cursor_animation.target_y = target_pixel_y;
-                    self.cursor_animation.current_x = target_pixel_x;
-                    self.cursor_animation.current_y = target_pixel_y;
-                    self.cursor_animation.spring.reset();
-                    self.corner_cursor.snap(target_pixel_x, target_pixel_y, cell_width, cell_height);
-                    cursor_window.far_scroll_snapped = false;
-                } else if (self.config.cursor_animation_duration > 0) {
+                if (self.config.cursor_animation_duration > 0) {
                     // Normal smooth animation to new target
                     self.cursor_animation.setTarget(target_pixel_x, target_pixel_y, cell_width);
                     self.corner_cursor.setTarget(target_pixel_x, target_pixel_y, cell_width, cell_height);
@@ -2998,7 +2807,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // --- Terminal mode timing with sub-stepping & proper fallback ---
             const now = std.time.Instant.now() catch return;
-            const any_anim = self.cursor_animating or self.scroll_animating or self.output_glide_active or self.tui_glide_active or self.wheel_glide_active or self.sonicboom_active;
+            const any_anim = self.cursor_animating or self.scroll_animating or self.sonicboom_active;
 
             // Use display refresh period as fallback dt (first frame / time went backwards)
             const fallback_dt_ns: f32 = @floatFromInt(self.display_refresh_ns);
@@ -3041,134 +2850,43 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }
 
                     // Scroll animation (terminal mode only)
-                    // Two systems: spring for large jumps, linear glide for small arrivals
-                    if (is_terminal and (self.scroll_animating or self.output_glide_active or self.tui_glide_active)) {
+                    // CriticallyDampedSpring with adaptive catchup (Neovide-style).
+                    // Both primary and TUI screens use the same spring approach
+                    // as the Neovim GUI for consistent, smooth scrolling.
+                    if (is_terminal and self.scroll_animating) {
                         var any_scroll_anim = false;
 
-                        // Spring animation (large jumps like page-up)
-                        if (self.scroll_spring.position != 0) {
-                            const scroll_len = self.config.scroll_animation_duration;
-                            const scroll_zeta = 1.0 - (self.config.scroll_animation_bounciness * 0.6);
-                            if (self.scroll_spring.update(dt, scroll_len, scroll_zeta)) {
+                        // Primary screen: user scroll spring (position in lines)
+                        if (self.user_scroll_spring.position != 0) {
+                            const base_length = self.config.scroll_animation_duration;
+                            // Adaptive catchup: shorten duration when far behind.
+                            // Matches Neovim GUI's animate() — prevents lag during
+                            // rapid scrolling (holding j/k, fast wheel, etc.).
+                            const scroll_dist = @abs(self.user_scroll_spring.position);
+                            const anim_length = if (scroll_dist > 1.0) blk: {
+                                const catchup_factor: f32 = 0.3;
+                                break :blk base_length / (1.0 + (scroll_dist - 1.0) * catchup_factor);
+                            } else base_length;
+                            // zeta=1.0 for critically damped (no oscillation)
+                            if (self.user_scroll_spring.update(dt, anim_length, 1.0)) {
                                 any_scroll_anim = true;
                             }
                         }
 
-                        // Momentum scroll (mouse wheel): velocity decays with friction.
-                        // Each frame: offset += velocity * dt, velocity *= friction^dt
-                        // Gives smooth iOS-like deceleration.
-                        if (self.scroll_momentum_velocity != 0 or self.scroll_momentum_offset != 0) {
-                            // Exponential friction decay (frame-rate independent)
-                            const friction: f32 = 0.0001; // Lower = more momentum/coast
-                            const decay = std.math.pow(f32, friction, dt);
-                            self.scroll_momentum_velocity *= decay;
-
-                            // Integrate velocity into offset
-                            self.scroll_momentum_offset += self.scroll_momentum_velocity * dt;
-
-                            // Stop when velocity is negligible
-                            if (@abs(self.scroll_momentum_velocity) < 0.5 and @abs(self.scroll_momentum_offset) < 0.5) {
-                                self.scroll_momentum_velocity = 0;
-                                self.scroll_momentum_offset = 0;
-                            } else {
+                        // Alternate screen (TUI): scroll spring (position in lines)
+                        if (self.tui_scroll_spring.position != 0) {
+                            const base_length = self.config.scroll_animation_duration;
+                            const scroll_dist = @abs(self.tui_scroll_spring.position);
+                            const anim_length = if (scroll_dist > 1.0) blk: {
+                                const catchup_factor: f32 = 0.3;
+                                break :blk base_length / (1.0 + (scroll_dist - 1.0) * catchup_factor);
+                            } else base_length;
+                            if (self.tui_scroll_spring.update(dt, anim_length, 1.0)) {
                                 any_scroll_anim = true;
                             }
                         }
 
-                        // Glide animation (small arrivals: 1-3 lines)
-                        // Smoothstep (ease-in-out) to avoid a "pop" on the first frame.
-                        // Frame-rate independent — same result at 60hz or 165hz.
-                        if (self.scroll_glide_active) {
-                            self.scroll_glide_time += dt;
-                            if (self.scroll_glide_time >= self.scroll_glide_duration) {
-                                // Glide complete — snap to target
-                                self.scroll_glide_active = false;
-                                self.scroll_glide_offset = 0;
-                                self.scroll_glide_time = 0;
-                                self.scroll_glide_start = 0;
-                            } else {
-                                // t goes 0→1 over the duration
-                                const t = self.scroll_glide_time / self.scroll_glide_duration;
-                                // Smoothstep: 3t^2 - 2t^3 (slow start, smooth end)
-                                const smooth = t * t * (3.0 - 2.0 * t);
-                                const ease = 1.0 - smooth;
-                                self.scroll_glide_offset = self.scroll_glide_start * ease;
-                                if (@abs(self.scroll_glide_offset) < 0.5) {
-                                    self.scroll_glide_offset = 0;
-                                    self.scroll_glide_active = false;
-                                    self.scroll_glide_time = 0;
-                                    self.scroll_glide_start = 0;
-                                } else {
-                                    any_scroll_anim = true;
-                                }
-                            }
-                        }
-
-                        // Output glide (bottom rows only)
-                        if (self.output_glide_active) {
-                            self.output_glide_time += dt;
-                            if (self.output_glide_time >= self.output_glide_duration) {
-                                self.output_glide_active = false;
-                                self.output_glide_offset = 0;
-                                self.output_glide_time = 0;
-                                self.output_glide_start = 0;
-                                self.output_glide_lines = 0;
-                            } else {
-                                const t = self.output_glide_time / self.output_glide_duration;
-                                const smooth = t * t * (3.0 - 2.0 * t);
-                                const ease = 1.0 - smooth;
-                                self.output_glide_offset = self.output_glide_start * ease;
-                                any_scroll_anim = true;
-                            }
-                        }
-
-                        if (self.tui_glide_active) {
-                            self.tui_glide_time += dt;
-                            if (self.tui_glide_time >= self.tui_glide_duration) {
-                                self.tui_glide_active = false;
-                                self.tui_glide_offset = 0;
-                                self.tui_glide_time = 0;
-                                self.tui_glide_start = 0;
-                            } else {
-                                const t = self.tui_glide_time / self.tui_glide_duration;
-                                const smooth = t * t * (3.0 - 2.0 * t);
-                                const ease = 1.0 - smooth;
-                                self.tui_glide_offset = self.tui_glide_start * ease;
-                                if (@abs(self.tui_glide_offset) < 0.5) {
-                                    self.tui_glide_offset = 0;
-                                    self.tui_glide_active = false;
-                                    self.tui_glide_time = 0;
-                                    self.tui_glide_start = 0;
-                                } else {
-                                    any_scroll_anim = true;
-                                }
-                            }
-                        }
-
-                        if (self.wheel_glide_active) {
-                            self.wheel_glide_time += dt;
-                            if (self.wheel_glide_time >= self.wheel_glide_duration) {
-                                self.wheel_glide_active = false;
-                                self.wheel_glide_offset = 0;
-                                self.wheel_glide_time = 0;
-                                self.wheel_glide_start = 0;
-                            } else {
-                                const t = self.wheel_glide_time / self.wheel_glide_duration;
-                                const smooth = t * t * (3.0 - 2.0 * t);
-                                const ease = 1.0 - smooth;
-                                self.wheel_glide_offset = self.wheel_glide_start * ease;
-                                if (@abs(self.wheel_glide_offset) < 0.5) {
-                                    self.wheel_glide_offset = 0;
-                                    self.wheel_glide_active = false;
-                                    self.wheel_glide_time = 0;
-                                    self.wheel_glide_start = 0;
-                                } else {
-                                    any_scroll_anim = true;
-                                }
-                            }
-                        }
-
-                        self.scroll_animating = any_scroll_anim or self.scroll_glide_active or self.output_glide_active or self.tui_glide_active or self.wheel_glide_active or (self.scroll_momentum_velocity != 0);
+                        self.scroll_animating = any_scroll_anim;
                     }
 
                     // Sonicboom VFX (both modes)
@@ -3236,63 +2954,43 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // For Neovim GUI mode, pixel_scroll_offset_y is set in updateFrameNeovim
             // Don't override it here
             if (self.nvim_gui == null) {
-                // Terminal scrollback (mouse/trackpad): uses scroll_pixel_offset for sub-cell positioning.
-                // Ghostty always renders with an extra row above the viewport for smooth scrollback,
-                // so we need to shift content UP by cell_h to hide it and align the grid properly.
+                // Terminal scrollback: CriticallyDampedSpring provides smooth visual offset.
                 //
-                // For alternate screen (TUI apps like Neovim), there's no mouse-driven scrollback,
-                // but we STILL need the cell_h shift to align content correctly with the viewport.
-                // The difference is we don't apply scroll_pixel_offset (mouse scroll) in alternate screen.
-                const smooth_pixel_offset: f32 = if (self.in_alternate_screen)
-                    // Alternate screen: fixed cell_h shift for grid alignment (no mouse scroll offset)
-                    0
-                else
-                    // Primary screen: cell_h shift minus mouse scroll offset for smooth scrollback
-                    self.scroll_pixel_offset + self.wheel_glide_offset;
+                // Ghostty renders with an extra row above AND below the viewport.
+                // At rest, pixel_scroll_offset_y = cell_h hides the top extra row.
+                // During animation, the spring position (in lines) shifts content visually.
+                //
+                // Key difference from Neovim GUI: the terminal viewport has ALREADY moved
+                // (data is loaded at the new position). The spring represents the visual
+                // offset from that new data position back toward where we came from.
+                // So the FULL spring position (not just fractional) contributes to the
+                // pixel offset. As the spring decays to 0, the visual catches up to the data.
 
-                const base_offset: f32 = if (self.in_alternate_screen)
-                    // Alternate screen: fixed cell_h shift for grid alignment (no mouse scroll offset)
-                    cell_h
-                else
-                    // Primary screen: cell_h shift minus mouse scroll offset for smooth scrollback
-                    cell_h - smooth_pixel_offset;
-
-                // Add content-arrival animation offset.
-                // Spring (large jumps) + glide (small arrivals) both contribute.
-                // For primary screen: apply globally via pixel_scroll_offset_y.
-                // For alternate screen (TUI): use tui_scroll_offset_y uniform
-                // so the shader only applies it within the scroll region.
-                const spring_offset = if (self.in_alternate_screen) @as(f32, 0) else self.scroll_spring.position;
-                const glide_offset = if (self.in_alternate_screen) @as(f32, 0) else self.scroll_glide_offset;
-                const momentum_offset = if (self.in_alternate_screen) @as(f32, 0) else self.scroll_momentum_offset;
-                const scroll_offset = base_offset - spring_offset - glide_offset - momentum_offset;
-                // Clamp to [0, 2*cell_h] to prevent the hidden extra rows (top and bottom)
-                // from bleeding into the visible viewport during scroll animations.
-                // At rest: cell_h (hides top extra row). Range allows ±1 row of animation.
-                const clamped_offset = std.math.clamp(scroll_offset, 0, 2.0 * cell_h);
-                // Keep glyphs crisp by aligning to whole pixels.
-                self.uniforms.pixel_scroll_offset_y = @round(clamped_offset);
-
-                // Set TUI scroll uniforms for alternate screen smooth scrolling.
-                // The shader uses these to apply the offset only within the scroll region,
-                // keeping status bars, headers, etc. fixed.
                 if (self.in_alternate_screen) {
-                    self.uniforms.tui_scroll_offset_y = -(self.scroll_spring.position + self.tui_glide_offset);
+                    // Alternate screen: fixed cell_h shift, spring offset via tui_scroll_offset_y.
+                    self.uniforms.pixel_scroll_offset_y = cell_h;
+
+                    // TUI spring offset in pixels for the shader scroll region.
+                    // Spring position is in lines, convert to pixels.
+                    self.uniforms.tui_scroll_offset_y = self.tui_scroll_spring.position * cell_h;
                     // Offset by 1 for the extra hidden row at top of the grid.
-                    // In alternate screen, pixel_scroll_offset_y = cell_h hides row 0,
-                    // so terminal scroll region row 0 maps to grid row 1 in the shader.
                     self.uniforms.tui_scroll_region_top = self.scroll_region_top + 1;
                     self.uniforms.tui_scroll_region_bottom = self.scroll_region_bottom + 1;
                 } else {
+                    // Primary screen: spring position (lines) → pixel offset.
+                    // The full spring position matters here since the viewport already moved.
+                    const spring_pixel_offset = self.user_scroll_spring.position * cell_h;
+
+                    // Also incorporate the direct pixel scroll offset from trackpad.
+                    const smooth_pixel_offset = self.scroll_pixel_offset + spring_pixel_offset;
+
+                    const base_offset = cell_h - smooth_pixel_offset;
+                    // Clamp to [0, 2*cell_h] to prevent extra rows from bleeding in.
+                    const clamped_offset = std.math.clamp(base_offset, 0, 2.0 * cell_h);
+                    // Keep glyphs crisp by aligning to whole pixels.
+                    self.uniforms.pixel_scroll_offset_y = @round(clamped_offset);
+
                     self.uniforms.tui_scroll_offset_y = 0;
-                    self.tui_glide_active = false;
-                    self.tui_glide_offset = 0;
-                    self.tui_glide_start = 0;
-                    self.tui_glide_time = 0;
-                    self.wheel_glide_active = false;
-                    self.wheel_glide_offset = 0;
-                    self.wheel_glide_start = 0;
-                    self.wheel_glide_time = 0;
                 }
             }
 
@@ -4209,20 +3907,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         };
 
         fn outputGlideOffsetForRow(self: *const Self, y: terminal.size.CellCountInt) f32 {
-            if (!self.output_glide_active) return 0;
-            if (self.output_glide_lines == 0) return 0;
-            if (self.in_alternate_screen) return 0;
-            if (self.output_glide_exclude_row) |exclude| {
-                if (y == exclude) return 0;
-            }
-
-            const rows: usize = self.cells.size.rows;
-            if (rows == 0) return 0;
-            const lines: usize = @min(@as(usize, self.output_glide_lines), rows);
-            const start_row: usize = rows - lines;
-            if (@as(usize, y) < start_row) return 0;
-
-            return self.output_glide_offset;
+            // Output glide removed — all scroll animation is now via the spring.
+            // This function is kept for API compatibility with callers.
+            _ = self;
+            _ = y;
+            return 0;
         }
 
         /// Convert the terminal state to GPU cells stored in CPU memory. These
@@ -4316,28 +4005,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const row_dirty = row_data.items(.dirty);
             const row_selection = row_data.items(.selection);
             const row_highlights = row_data.items(.highlights);
-
-            self.output_glide_exclude_row = null;
-            if (self.output_glide_active and !self.in_alternate_screen) {
-                if (state.cursor.viewport) |cursor_vp| {
-                    self.output_glide_exclude_row = cursor_vp.y;
-                }
-            }
-
-            if (self.output_glide_active) {
-                const rows_active: usize = @min(state.rows, self.cells.size.rows);
-                const lines: usize = @min(@as(usize, self.output_glide_lines), rows_active);
-                if (lines > 0) {
-                    const start_row: usize = rows_active - lines;
-                    var i: usize = start_row;
-                    while (i < rows_active) : (i += 1) {
-                        row_dirty[i] = true;
-                    }
-                    if (self.terminal_state.dirty == .false) {
-                        self.terminal_state.dirty = .partial;
-                    }
-                }
-            }
 
             // If our cell contents buffer is shorter than the screen viewport,
             // we render the rows that fit, starting from the bottom. If instead
@@ -4554,6 +4221,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
                 const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
+
+                // Cursor target is the actual grid position — no scroll spring offset.
+                // The spring offset is applied later to the rendered corner positions
+                // via pixel_scroll_offset_y so the cursor visually moves with content
+                // during scroll animation, but always snaps/settles at the command line.
                 const target_pixel_x: f32 = @as(f32, @floatFromInt(cursor_x)) * cell_width;
                 const target_pixel_y: f32 = @as(f32, @floatFromInt(cursor_y)) * cell_height;
 
@@ -4565,8 +4237,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     if (was_hidden) {
                         // Cursor was previously hidden (or first appearance). Snap
                         // immediately to avoid animating from (0,0) or stale position.
-                        // This is critical for TUI apps where cursor can flicker between
-                        // hidden/visible states across frames.
                         self.cursor_animation.target_x = target_pixel_x;
                         self.cursor_animation.target_y = target_pixel_y;
                         self.cursor_animation.current_x = target_pixel_x;

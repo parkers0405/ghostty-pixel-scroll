@@ -3374,11 +3374,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // Also incorporate the direct pixel scroll offset from trackpad.
                     const smooth_pixel_offset = self.scroll_pixel_offset + spring_pixel_offset;
 
-                    const base_offset = cell_h - smooth_pixel_offset;
-                    // Clamp to [0, 2*cell_h] to prevent extra rows from bleeding in.
-                    const clamped_offset = std.math.clamp(base_offset, 0, 2.0 * cell_h);
-                    // Keep glyphs crisp by aligning to whole pixels.
-                    self.uniforms.pixel_scroll_offset_y = @round(clamped_offset);
+                    // Clamp the smooth offset to ±cell_h (one cell of travel).
+                    // The grid only has 1 extra row in each direction, so we can't
+                    // visually shift more than 1 cell. Larger spring values simply
+                    // animate faster through this 1-cell window as the spring decays.
+                    const clamped_smooth = std.math.clamp(smooth_pixel_offset, -cell_h, cell_h);
+                    const base_offset = cell_h - clamped_smooth;
+                    // base_offset is in [0, 2*cell_h]. Must stay > 0 so the bg shader
+                    // knows pixel scroll is active and applies the extra-row adjustment.
+                    self.uniforms.pixel_scroll_offset_y = @max(@round(base_offset), @as(f32, 1.0));
 
                     self.uniforms.tui_scroll_offset_y = 0;
                 }

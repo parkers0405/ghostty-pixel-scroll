@@ -19,18 +19,27 @@ vec4 cell_bg() {
     uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
     
-    // Detect if this fragment is in the padding area using screen dimensions.
-    // With pixel scroll, the grid has 2 extra rows (grid_size.y = visible + 2).
-    // The screen only has room for (grid_size.y - 2) rows of content.
-    // Pixels outside that range should show bg/extend, not extra row content.
-    // visible_rows = grid_size.y when no pixel scroll, grid_size.y - 2 with pixel scroll.
-    int visible_rows = (pixel_scroll_offset_y > 0.0) ? int(grid_size.y) - 2 : int(grid_size.y);
-    ivec2 unshifted_grid_pos = ivec2(floor((gl_FragCoord.xy - grid_padding.wx) / cell_size));
-    bool in_padding = (unshifted_grid_pos.y < 0 || unshifted_grid_pos.y >= visible_rows);
-
     // Calculate grid position from fragment coordinates
     vec2 adjusted_coord = gl_FragCoord.xy;
     adjusted_coord.y += pixel_scroll_offset_y; // Global scroll offset (terminal mode)
+
+    // Detect if this fragment is in the vertical padding area.
+    // With pixel scroll, the grid has 2 extra rows (grid_size.y = visible + 2).
+    // After applying the scroll offset, visible content is in shifted rows [1, grid_size.y - 2].
+    // Use the SHIFTED position so the padding check correctly excludes extra rows
+    // regardless of the current scroll offset value.
+    bool has_extra_rows = (pixel_scroll_offset_y > 0.0);
+    ivec2 unshifted_grid_pos = ivec2(floor((gl_FragCoord.xy - grid_padding.wx) / cell_size));
+    int visible_rows = has_extra_rows ? int(grid_size.y) - 2 : int(grid_size.y);
+    bool in_padding;
+    if (has_extra_rows) {
+        // Check in shifted space: rows [1, grid_size.y-2] are visible content.
+        // Row 0 is the extra top row, row grid_size.y-1 is the extra bottom row.
+        ivec2 shifted_grid_pos = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
+        in_padding = (shifted_grid_pos.y < 1 || shifted_grid_pos.y >= int(grid_size.y) - 1);
+    } else {
+        in_padding = (unshifted_grid_pos.y < 0 || unshifted_grid_pos.y >= visible_rows);
+    }
 
     // Apply TUI scroll offset: shift pixels within the scroll region
     bool in_tui_scroll_region = false;
@@ -94,7 +103,16 @@ vec4 cell_bg() {
         // pos correctly accounts for pixel_scroll_offset_y).
         int clamped_y = clamp(grid_pos.y, 1, int(grid_size.y) - 2);
         int clamped_x = clamp(grid_pos.x, 0, int(grid_size.x) - 1);
-        bool should_extend = (unshifted_grid_pos.y < 0)
+        // Determine extend direction. For pixel scroll, use shifted position
+        // since unshifted may not correctly identify top/bottom padding.
+        bool is_top_padding;
+        if (has_extra_rows) {
+            ivec2 shifted_gp = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
+            is_top_padding = (shifted_gp.y < 1);
+        } else {
+            is_top_padding = (unshifted_grid_pos.y < 0);
+        }
+        bool should_extend = is_top_padding
             ? ((padding_extend & EXTEND_UP) != 0)
             : ((padding_extend & EXTEND_DOWN) != 0);
         if (should_extend) {

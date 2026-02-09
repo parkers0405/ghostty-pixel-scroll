@@ -16,9 +16,11 @@ pub const OptionValue = Event.OptionValue;
 pub const StyledContent = io_thread.StyledContent;
 pub const MessageKind = io_thread.MessageKind;
 
-pub const RenderedWindow = @import("rendered_window.zig").RenderedWindow;
-pub const ScrollCommand = @import("rendered_window.zig").ScrollCommand;
-pub const GridCell = @import("rendered_window.zig").GridCell;
+const rendered_window = @import("rendered_window.zig");
+pub const RenderedWindow = rendered_window.RenderedWindow;
+pub const ScrollCommand = rendered_window.ScrollCommand;
+pub const GridCell = rendered_window.GridCell;
+const ViewportMargins = rendered_window.ViewportMargins;
 pub const Animation = @import("animation.zig");
 pub const nvim_input = @import("input.zig");
 pub const CursorRenderer = @import("cursor_renderer.zig").CursorRenderer;
@@ -708,12 +710,24 @@ pub const NeovimGui = struct {
 
     fn handleWinViewportMargins(self: *Self, data: Event.WinViewportMargins) void {
         const window = self.windows.get(data.grid) orelse return;
-        window.viewport_margins = .{
+        const old = window.viewport_margins;
+        const new_margins = ViewportMargins{
             .top = @intCast(data.top),
             .bottom = @intCast(data.bottom),
             .left = @intCast(data.left),
             .right = @intCast(data.right),
         };
+        window.viewport_margins = new_margins;
+
+        // If margins changed, reset scroll animation immediately.
+        // This prevents the winbar/statusline from being treated as scrollable
+        // content during the transition (e.g., buffer switch via telescope).
+        // The scrollback will be resized in the next flush() call.
+        if (old.top != new_margins.top or old.bottom != new_margins.bottom) {
+            window.scroll_animation.reset();
+            window.scroll_delta = 0;
+        }
+
         self.dirty = true;
     }
 

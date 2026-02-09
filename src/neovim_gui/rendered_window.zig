@@ -1032,8 +1032,11 @@ pub const RenderedWindow = struct {
         if (self.scrollback_lines == null) return null;
         if (col >= self.grid_width) return null;
 
-        // Use trunc (round toward zero) for cell lookup, matching getSubLineOffset.
-        const scroll_offset_lines: isize = @intFromFloat(@trunc(self.scroll_animation.position));
+        // Use floor (round toward -inf) for cell lookup, matching Neovide and getSubLineOffset.
+        // floor() is critical for negative positions (scroll-down): floor(-0.5) = -1, which
+        // offsets the lookup to include the old row above the current view.
+        // trunc(-0.5) = 0 would miss that row entirely.
+        const scroll_offset_lines: isize = @intFromFloat(@floor(self.scroll_animation.position));
         const scrollback_idx: isize = scroll_offset_lines + @as(isize, inner_row);
 
         const scrollback = &self.scrollback_lines.?;
@@ -1053,6 +1056,18 @@ pub const RenderedWindow = struct {
 
         const scrollback = &self.scrollback_lines.?;
 
+        // Verify scrollback dimensions match current viewport margins.
+        // After a buffer switch (e.g., telescope file select), margins may have
+        // changed but scrollback hasn't been resized yet (resize happens in flush).
+        // If dimensions don't match, scrollback data is stale and would cause the
+        // winbar/statusline to be treated as scrollable content.
+        const inner_top: isize = @intCast(self.viewport_margins.top);
+        const inner_bottom: isize = @intCast(self.grid_height -| self.viewport_margins.bottom);
+        const inner_size = inner_bottom - inner_top;
+        if (inner_size <= 0) return false;
+        const expected_size: usize = @intCast(inner_size * 2);
+        if (scrollback.length() != expected_size) return false;
+
         // Check if scrollback has been populated at all
         // Even when pos == 0, we need valid data at row 0
         const first_line = scrollback.getConst(0);
@@ -1062,12 +1077,12 @@ pub const RenderedWindow = struct {
         const pos = self.scroll_animation.position;
         if (pos == 0) return true; // No animation, first row check passed
 
-        // Use trunc to match getScrollbackCellByInnerRowSigned and getSubLineOffset
-        const trunc_pos: isize = @intFromFloat(@trunc(pos));
+        // Use floor to match getScrollbackCellByInnerRowSigned and getSubLineOffset
+        const floor_pos: isize = @intFromFloat(@floor(pos));
 
-        // For scroll animation, we read scrollback[trunc_pos + row] for each inner row
+        // For scroll animation, we read scrollback[floor_pos + row] for each inner row
         // Check the first row we'll read during animation
-        const anim_first_line = scrollback.getConst(trunc_pos);
+        const anim_first_line = scrollback.getConst(floor_pos);
         if (anim_first_line == null) return false;
         if (anim_first_line.?.cells.len == 0) return false;
 
@@ -1075,18 +1090,22 @@ pub const RenderedWindow = struct {
     }
 
     /// Get the sub-line pixel offset for smooth scrolling.
-    /// Uses @trunc to match cell lookup (getScrollbackCellByInnerRowSigned).
+    /// Uses @floor to match cell lookup (getScrollbackCellByInnerRowSigned) and Neovide.
     ///
-    /// Example: position = -0.8 (scrolling down, 80% through animation)
-    /// - scroll_offset_lines = trunc(-0.8) = 0
-    /// - scroll_offset = 0 - (-0.8) = 0.8
-    /// - pixel_offset = 0.8 * 51 = +40.8 pixels (shift content DOWN)
+    /// Example: position = -0.5 (scrolling down, midway through animation)
+    /// - scroll_offset_lines = floor(-0.5) = -1
+    /// - scroll_offset = (-1) - (-0.5) = -0.5
+    /// - pixel_offset = -0.5 * 51 = -25.5 pixels (shift content UP)
+    ///
+    /// With floor, the sub-pixel offset is always in (-cell_h, 0] regardless of
+    /// scroll direction. The floor-based line lookup shifts which scrollback rows
+    /// are read, so the pixel offset only handles the fractional part (always ≤ 0).
     ///
     /// The caller rounds this to the nearest whole pixel before sending
     /// to the GPU (both text and bg get the same rounded value).
     pub fn getSubLineOffset(self: *const Self, cell_height: f32) f32 {
         const pos = self.scroll_animation.position;
-        const scroll_offset_lines = @trunc(pos);
+        const scroll_offset_lines = @floor(pos);
         const scroll_offset = scroll_offset_lines - pos;
         return scroll_offset * cell_height;
     }

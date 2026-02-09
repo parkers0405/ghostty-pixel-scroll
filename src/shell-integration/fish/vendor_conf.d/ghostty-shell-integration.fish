@@ -220,3 +220,10 @@ function __ghostty_setup --on-event fish_prompt -d "Setup ghostty integration"
 end
 
 ghostty_exit
+
+# Neovim GUI mode: create a shell function that sends OSC 1338 to switch
+# the current terminal into Ghostty's native Neovim GUI renderer.
+# The function name is configurable via neovim-gui-alias (default: nvim-gui).
+if set -q GHOSTTY_NVIM_GUI_ALIAS; and test -n "$GHOSTTY_NVIM_GUI_ALIAS"
+    eval "function $GHOSTTY_NVIM_GUI_ALIAS; printf '\\e]1338\\a'; end"
+end

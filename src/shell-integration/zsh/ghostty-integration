@@ -398,11 +398,12 @@ _ghostty_deferred_init() {
     # to unfunction themselves when invoked. Unfunctioning is done by calling code.
     builtin unfunction _ghostty_deferred_init
 
-    # nvim-gui: Launch Neovim in Ghostty's native GUI mode
-    # This sends OSC 1338 to trigger Ghostty's Neovim GUI renderer
-    nvim-gui() {
-        builtin print -nu $_ghostty_fd '\e]1338\a'
-    }
+    # Neovim GUI mode: create a shell function that sends OSC 1338 to switch
+    # the current terminal into Ghostty's native Neovim GUI renderer.
+    # The function name is configurable via neovim-gui-alias (default: nvim-gui).
+    if [[ -n "$GHOSTTY_NVIM_GUI_ALIAS" ]]; then
+        eval "${GHOSTTY_NVIM_GUI_ALIAS}() { builtin print -nu \$_ghostty_fd '\\e]1338\\a'; }"
+    fi
 }
 
 _entrypoint

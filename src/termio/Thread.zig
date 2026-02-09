@@ -338,6 +338,11 @@ fn drainMailbox(
                 log.info("termio: enter_neovim_gui message - forwarding to surface", .{});
                 _ = io.surface_mailbox.push(.enter_neovim_gui, .{ .forever = {} });
             },
+            .toggle_panel_gui => {
+                // Forward to surface to toggle panel GUI
+                log.info("termio: toggle_panel_gui message - forwarding to surface", .{});
+                _ = io.surface_mailbox.push(.toggle_panel_gui, .{ .forever = {} });
+            },
             .write_small => |v| try io.queueWrite(
                 data,
                 v.data[0..v.len],

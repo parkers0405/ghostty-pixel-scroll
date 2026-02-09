@@ -1825,6 +1825,9 @@ pub const Surface = extern struct {
     fn initActionMap(self: *Self) void {
         const priv: *Private = self.private();
 
+        const s_variant_type = glib.ext.VariantType.newFor([:0]const u8);
+        defer s_variant_type.free();
+
         const actions = [_]ext.actions.Action(Self){
             .init(
                 "prompt-title",
@@ -1836,6 +1839,11 @@ pub const Surface = extern struct {
                 actionNotifyOnNextCommandFinish,
                 null,
                 glib.Variant.newBoolean(@intFromBool(false)),
+            ),
+            .init(
+                "toggle-panel",
+                actionTogglePanel,
+                s_variant_type,
             ),
         };
 
@@ -2515,6 +2523,24 @@ pub const Surface = extern struct {
         if (state.isOfType(bool_variant_type) == 0) return;
         const value = state.getBoolean() != 0;
         action.setState(glib.Variant.newBoolean(@intFromBool(!value)));
+    }
+
+    pub fn actionTogglePanel(
+        _: *gio.SimpleAction,
+        param: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        const surface = self.core() orelse return;
+        // Get the program name from the variant parameter, default to "lazygit"
+        const program: []const u8 = if (param) |v| blk: {
+            var len: usize = 0;
+            const ptr = v.getString(&len);
+            if (len > 0) break :blk ptr[0..len];
+            break :blk "lazygit";
+        } else "lazygit";
+        _ = surface.performBindingAction(.{ .toggle_panel = program }) catch |err| {
+            log.warn("unable to perform toggle panel action err={}", .{err});
+        };
     }
 
     fn childExitedClose(

@@ -2077,6 +2077,14 @@ pub fn Stream(comptime Handler: type) type {
                     }
                 },
 
+                .toggle_panel_gui => {
+                    // OSC 1339 - Toggle panel GUI
+                    if (@hasField(@TypeOf(self.handler), "surface_mailbox")) {
+                        log.info("OSC 1339 received - forwarding to surface mailbox", .{});
+                        _ = self.handler.surface_mailbox.push(.toggle_panel_gui, .{ .instant = {} });
+                    }
+                },
+
                 .conemu_output_environment_variable,
                 .conemu_run_process,
                 .kitty_text_sizing,

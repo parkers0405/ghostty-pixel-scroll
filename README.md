@@ -21,184 +21,245 @@
 
 ## Ghostty Pixel Scroll Fork
 
-A fork of [Ghostty](https://github.com/ghostty-org/ghostty) with smooth pixel-level scrolling, velocity-adaptive scroll animation, animated cursors, and an embedded Neovim GUI mode. Everything runs on Ghostty's existing GPU renderer (Metal/OpenGL) -- no external dependencies.
+A fork of [Ghostty](https://github.com/ghostty-org/ghostty) with smooth pixel-level scrolling, spring-based animations, an embedded Neovim GUI mode, and a slide-out panel system. Everything runs on Ghostty's existing GPU renderer (Metal/OpenGL) -- no external dependencies.
 
-This is a drop-in replacement for stock Ghostty. Scroll animation is on by default. Everything else is opt-in.
+Drop-in replacement for stock Ghostty. Pixel scrolling and scroll animation are on by default.
 
 ### Quick Start
 
-Add to `~/.config/ghostty/config` -- full recommended settings:
+Add to `~/.config/ghostty/config`:
 
 ```
-# Smooth pixel scrolling
+# Recommended defaults (these are already on -- listed for reference)
 pixel-scroll = true
-
-# Animated cursor (spring-based movement)
 cursor-animation-duration = 0.06
+scroll-animation-duration = 0.15
 
-# Matte ink rendering
+# Optional: matte ink rendering for a refined look
 matte-rendering = 0.5
+
+# Optional: more scroll bounce (try 0.3 for a Neovide-like feel)
+# scroll-animation-duration = 0.3
+# scroll-animation-bounciness = 0.2
 ```
 
-Scroll animation is already on by default (`scroll-animation-duration = 0.15`). Content arrival is velocity-adaptive -- single lines glide in, large dumps get a spring drop, streaming output auto-adapts with no page jerk.
-
-For Neovim GUI mode, just type `nvim-gui` in the terminal -- no config needed.
+For Neovim GUI mode, type `nvim-gui` in the terminal -- no config needed.
 
 ---
 
-### Terminal Mode
+## Terminal Mode
 
-Terminal mode is your normal shell. These options add smooth scrolling and animation on top of stock Ghostty behavior.
+Your normal shell. These options control scrolling, cursor animation, and visual rendering in terminal mode. All animations use critically damped springs (same physics as Neovide).
 
-#### Scrolling
+### Scrolling
 
-| Option                        | Default | What it does                                                                                                                                                    |
-| ----------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `pixel-scroll`                | `false` | Pixel-level mouse/trackpad scrolling. Viewport offset is rounded to whole pixels -- text stays crisp at any refresh rate (tested at 165hz), no blur or shimmer. |
-| `scroll-animation-duration`   | `0.15`  | Content arrival animation duration (seconds). 0 = instant snap. Controls velocity-adaptive glide -- see below.                                                  |
-| `scroll-animation-bounciness` | `0.0`   | Scroll spring bounce for large one-shot jumps (0.0 = critically damped, 1.0 = max bounce).                                                                      |
+| Option | Default | Description |
+|---|---|---|
+| `pixel-scroll` | `true` | Sub-line pixel scrolling for trackpads/mice. Viewport moves by actual pixels, not whole lines. Text stays crisp (rounded to integer pixels). |
+| `scroll-animation-duration` | `0.15` | Spring animation duration for scroll events and content arrival (seconds). 0 = instant snap. Higher = more glide. |
+| `scroll-animation-bounciness` | `0.0` | Scroll spring overshoot. 0 = critically damped (no bounce). Values up to 1.0 add progressively more bounce/oscillation. |
+| `invert-touchpad-scroll` | `false` | Invert scroll direction for precision devices (touchpads only). Does not affect mouse wheel. |
 
-**Velocity-adaptive scroll animation:** When new output appears and the viewport is pinned to the bottom, it animates into view. The animation automatically adapts to output speed:
+**How terminal scroll animation works:** All scroll events (user scrollback, content arrival, page jumps) feed into a single critically damped spring. The spring position represents lines of visual offset from the true viewport position. As new output arrives or you scroll, the spring accumulates the delta and decays smoothly to zero. Small jumps get a quick ease, large jumps (page-up, `cat bigfile`) get a satisfying spring settle. The cursor stays in sync with the spring -- it visually tracks the content offset during animation.
 
-| Output type                             | What happens                                               |
-| --------------------------------------- | ---------------------------------------------------------- |
-| Single line (echo, prompt)              | ~80ms ease-out glide -- content slides in smoothly         |
-| Few lines (git status)                  | ~50-80ms glide -- smooth flow                              |
-| Streaming (docker logs, builds, CI)     | ~8-15ms micro-glide -- subtle conveyor belt, no earthquake |
-| Large one-shot dump (ls, cat) 10+ lines | Spring drop -- satisfying physics bounce                   |
+When `pixel-scroll` is true and `scroll-animation-duration` is 0, the auto-default kicks in and sets scroll animation to 0.3s. Set `scroll-animation-duration = 0.001` if you genuinely want pixel scrolling with no spring animation.
 
-No configuration needed. The glide duration scales automatically via an exponential moving average of the output rate.
+### Cursor
 
-#### Cursor
+| Option | Default | Description |
+|---|---|---|
+| `cursor-animation-duration` | `0.06` | Spring animation duration for cursor movement (seconds). 0 = instant teleport. The cursor glides between grid positions with a 4-corner stretchy effect. |
+| `cursor-animation-bounciness` | `0.0` | Cursor spring overshoot. 0 = critically damped. Up to 1.0 for bounce. |
 
-| Option                        | Default | What it does                                                             |
-| ----------------------------- | ------- | ------------------------------------------------------------------------ |
-| `cursor-animation-duration`   | `0.0`   | Cursor move animation speed (seconds). 0 = instant. Recommended: `0.06`. |
-| `cursor-animation-bounciness` | `0.0`   | Cursor spring bounce (0.0 = critically damped).                          |
+The cursor animation is Neovide-style: a 2D spring moves the cursor center, and 4 independent corner points trail behind with stretch/squash. Works in both terminal mode and Neovim GUI mode.
 
-The cursor animation is a spring-based system -- the cursor glides to its new position when it moves. Works in both terminal mode and Neovim GUI mode.
+When `pixel-scroll` is true and `cursor-animation-duration` is 0, the auto-default kicks in and sets it to 0.06s. Set `cursor-animation-duration = 0.001` to explicitly disable.
 
-#### Visual
+### Visual / Rendering
 
-| Option            | Default | What it does                                                                                                                           |
-| ----------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------- |
-| `matte-rendering` | `0.0`   | Ink/matte color post-processing (0.0 = off, 1.0 = full). Slight desaturation, shadow lift, and cool-tinted shadows for a refined look. |
-| `text-gamma`      | `0.0`   | Text weight adjustment. Positive = thicker, negative = thinner.                                                                        |
-| `text-contrast`   | `0.0`   | Text edge sharpness. Higher = crisper glyphs.                                                                                          |
+| Option | Default | Description |
+|---|---|---|
+| `matte-rendering` | `0.0` | Ink/matte post-processing intensity (0.0-1.0). Adds subtle desaturation, shadow lift, and cool-tinted shadows. Recommended: `0.5`. |
+| `text-gamma` | `0.0` | Glyph weight. Positive = thicker/bolder, negative = thinner/lighter. |
+| `text-contrast` | `0.0` | Glyph edge sharpness. Higher values steepen the alpha curve for crisper text. |
+
+### Panel GUI
+
+Slide-out panels that run alongside your terminal. The terminal grid shrinks to make room (split, not overlay). Panels slide in/out with spring animations.
+
+| Option | Default | Description |
+|---|---|---|
+| `panel-gui-1` | `""` | First panel slot. Format: `position:module` (e.g. `right:menu`, `bottom:lazygit`). |
+| `panel-gui-2` | `""` | Second panel slot. Same format. |
+| `panel-gui-size` | `0.35` | Panel width/height as fraction of the surface (0.0-1.0). |
+
+**Positions:** `right`, `left`, `top`, `bottom`
+**Modules:** `menu` (interactive launcher with favorites, recent commands, file explorer) or any program name (`lazygit`, `htop`, `lazydocker`, etc.)
+
+**Default keybind:** `Ctrl+/` toggles the menu panel. Custom keybinds:
+
+```
+keybind = ctrl+shift+p=toggle_panel:panel
+keybind = ctrl+shift+g=toggle_panel:lazygit
+```
+
+The `menu` module has vim-style navigation (j/k/h/l), section expand/collapse, fuzzy search (`/`), favorites management (a/e/d keys), git status indicators in the file tree, and `o` to open files in nvim-gui mode.
 
 ---
 
-### Neovim GUI Mode
+## Neovim GUI Mode
 
-Type `nvim-gui` in the terminal to switch Ghostty into a native Neovim GUI on the fly. The shell function (available in zsh via Ghostty's shell integration) sends OSC 1338 which transforms the current terminal session into a full Neovim GUI renderer.
-
-Ghostty connects to Neovim over msgpack-rpc using the multigrid UI protocol. This is a completely separate rendering path from terminal mode -- it has its own scroll system, cursor animation, and window management.
+Type `nvim-gui` in the terminal to transform the current session into a native Neovim GUI. The shell function sends OSC 1338 which switches Ghostty from terminal rendering to a full Neovim multigrid UI renderer. Completely separate rendering path from terminal mode -- different scroll system, different cursor handling, different everything.
 
 **Features:**
 
-- True pixel-by-pixel smooth scrolling with per-window independent springs
-- Scroll region awareness -- status bars, winbars, and command line stay fixed while content scrolls
-- Stretchy 4-corner cursor animation (Neovide-style)
-- Proper floating window rendering with clipping and z-ordering
-- Sonicboom VFX ring on cursor mode changes
+- Per-window scroll springs -- each Neovim window animates independently
+- Scroll region awareness -- statusline, winbar, cmdline stay fixed while content scrolls
+- 4-corner stretchy cursor animation (Neovide-style)
+- Sonicboom VFX ring on Vim mode changes (normal/insert/visual)
+- Floating window rendering with z-order, clipping, and opacity springs
+- Window position springs for smooth layout transitions
 - All your Neovim plugins and config work normally
 
-#### Config
+### Neovim GUI Config
 
-| Option                 | Default                                                                       | What it does                                                        |
-| ---------------------- | ----------------------------------------------------------------------------- | ------------------------------------------------------------------- |
-| `neovim-gui`           | `""` (keeps gui as command so you can have reg ghostty terminal on raw spawn) | Set to `spawn`, `embed`, or a socket path. Empty = normal terminal. |
-| `neovim-corner-radius` | `0.0`                                                                         | Rounded SDF corners on Neovim windows (pixels).                     |
-| `neovim-gap-color`     | `#0a0a0a`                                                                     | Color between windows (visible with rounded corners).               |
+| Option | Default | Description |
+|---|---|---|
+| `neovim-gui` | `""` | Set to `spawn` (recommended), `embed`, or a socket path. Empty = normal terminal. |
+| `neovim-gui-alias` | `nvim-gui` | Shell function name for entering GUI mode. Set to empty to disable. |
+| `neovim-corner-radius` | `0.0` | SDF rounded corners on Neovim windows (pixels). Auto-defaults to `8.0` in GUI mode. |
+| `neovim-gap-color` | `#0a0a0a` | Color visible between windows when corner radius > 0. |
 
-> **You don't need to set `neovim-gui` in your config.** The `nvim-gui` command works at any time, even with no config -- it switches the current terminal into GUI mode on the fly via OSC 1338. Only set `neovim-gui = spawn` if you want Ghostty to always launch as a Neovim GUI.
+> **You don't need `neovim-gui` in your config.** Just type `nvim-gui` (or whatever you set `neovim-gui-alias` to) in the terminal. It sends OSC 1338 to switch to GUI mode on the fly. Only set `neovim-gui = spawn` if you want Ghostty to always launch as a Neovim GUI.
 
-> **Auto-defaults:** When Neovim GUI is active and animation/corner values are at 0, Neovide-like defaults apply automatically (cursor = 0.06s, scroll = 0.2s, corners = 8px). Your explicit values always win.
+### Neovim GUI Animation
+
+The GUI mode shares the same config keys as terminal mode but they behave differently:
+
+| Option | Terminal behavior | Neovim GUI behavior |
+|---|---|---|
+| `scroll-animation-duration` | Single spring for all scroll events. Default `0.15`. | Per-window springs. Auto-defaults to `0.3` if set to 0. Matches Neovide's `scroll_animation_length`. |
+| `scroll-animation-bounciness` | Controls spring overshoot. | Not used -- GUI windows are always critically damped. |
+| `cursor-animation-duration` | 2D spring + corner stretch. Default `0.06`. | Same spring + corner stretch, plus sonicboom VFX on mode change. Auto-defaults to `0.06`. |
+| `cursor-animation-bounciness` | Controls cursor spring overshoot. | Same. |
+
+**Auto-defaults:** When Neovim GUI is active (via config or OSC 1338) and values are at 0, sensible Neovide-like defaults apply automatically:
+- `cursor-animation-duration` -> `0.06`
+- `scroll-animation-duration` -> `0.3`
+- `neovim-corner-radius` -> `8.0`
+
+Your explicit values always take priority. Set a tiny value like `0.001` to genuinely disable an animation.
 
 Pass extra args to Neovim via `GHOSTTY_NVIM_ARGS="--clean"` environment variable.
 
 ---
 
-### Shared Features
+## All Config Options (Reference)
 
-These work in **both** terminal mode and Neovim GUI mode:
+### Animation & Scrolling
 
-- **Cursor animation** (`cursor-animation-duration`) -- spring-based cursor movement
-- **Scroll animation** (`scroll-animation-duration`) -- velocity-adaptive in terminal, per-window springs in GUI
-- **Matte rendering** (`matte-rendering`) -- ink/matte color post-processing
-- **Text gamma / contrast** (`text-gamma`, `text-contrast`) -- glyph tuning
+| Option | Default | Applies to | Description |
+|---|---|---|---|
+| `pixel-scroll` | `true` | Terminal | Sub-line pixel scrolling. |
+| `scroll-animation-duration` | `0.15` | Both | Scroll spring duration (seconds). 0 = snap. GUI auto-defaults to 0.3. |
+| `scroll-animation-bounciness` | `0.0` | Terminal | Scroll spring overshoot (0.0-1.0). |
+| `cursor-animation-duration` | `0.06` | Both | Cursor spring duration (seconds). 0 = teleport. |
+| `cursor-animation-bounciness` | `0.0` | Both | Cursor spring overshoot (0.0-1.0). |
+| `invert-touchpad-scroll` | `false` | Terminal | Invert touchpad scroll direction. |
 
-Neovim GUI mode only:
+### Neovim GUI
 
-- **Sonicboom VFX** -- expanding ring effect on cursor mode changes
-- **Rounded corners** (`neovim-corner-radius`) -- SDF rounded window corners
+| Option | Default | Description |
+|---|---|---|
+| `neovim-gui` | `""` | `spawn`, `embed`, socket path, or empty. |
+| `neovim-gui-alias` | `nvim-gui` | Shell function name for entering GUI mode. |
+| `neovim-corner-radius` | `0.0` | Window corner radius (px). Auto-defaults to 8. |
+| `neovim-gap-color` | `#0a0a0a` | Gap color between windows. |
 
-The draw timer only runs while something is actually animating. When everything settles, it stops and CPU/GPU usage drops to zero.
+### Panel GUI
 
-### How It Actually Works
+| Option | Default | Description |
+|---|---|---|
+| `panel-gui-1` | `""` | Panel slot 1 (`position:module`). |
+| `panel-gui-2` | `""` | Panel slot 2 (`position:module`). |
+| `panel-gui-size` | `0.35` | Panel size (fraction of surface). |
 
-This isn't a fake smooth scroll where you slap a CSS transition on a div. The terminal grid is actually moving pixel by pixel.
+### Visual
 
-**Terminal pixel scrolling:** Normal terminals scroll by jumping whole lines -- you flick your trackpad and the text teleports one or more rows. This fork tracks your scroll input as raw pixel deltas and maintains a sub-line offset. The renderer always loads one extra row from the scrollback buffer above what's visible. As you scroll, that offset shifts the entire grid up or down by actual pixels. When the offset crosses a full cell height, the viewport advances one line in the scrollback and the offset wraps back. The result is every frame shows the grid at a real intermediate position between lines -- not interpolated, not faked, just shifted.
+| Option | Default | Description |
+|---|---|---|
+| `matte-rendering` | `0.0` | Ink post-processing (0.0-1.0). |
+| `text-gamma` | `0.0` | Glyph weight adjustment. |
+| `text-contrast` | `0.0` | Glyph edge sharpness. |
 
-On the GPU side, both the background fragment shader and the text vertex shader receive the same `pixel_scroll_offset_y` uniform. The offset is rounded to whole pixels so text glyphs stay on integer boundaries (glyph atlases are rasterized at integer positions, so sub-pixel offsets cause blur). At 165hz with ~20px tall cells you get about 20 distinct positions per line of scroll -- looks completely smooth, no shimmer.
+---
 
-**Content arrival animation:** When new output pushes the viewport down (like running a command), the renderer doesn't just snap to the new position. It records how many lines jumped, picks an animation style (ease-out glide for small output, spring for big dumps), and interpolates the offset from "old position" to "new position" over a few frames. The velocity-adaptive part just adjusts how long that interpolation takes based on how fast output is coming in -- fast streaming gets a near-instant glide so the page doesn't bounce around.
+## How It Works
 
-**Neovim GUI scrolling:** Completely different system. Neovim sends scroll region info over the UI protocol. Each window gets its own spring animation. The shader applies per-cell Y offsets only to cells inside the scroll region, so your statusline and winbar don't move. Floating windows have their own z-order and clipping. It's basically what Neovide does, but running inside Ghostty's renderer instead of a separate app.
+### Terminal Pixel Scrolling
 
-**Low idle cost:** The animation timer only ticks while something is moving. Once all springs and glides settle, the timer stops. Ghostty goes back to pure event-driven rendering with normalish CPU/GPU overhead.
+Normal terminals scroll by jumping whole lines. This fork tracks scroll input as raw pixel deltas and maintains a sub-line offset. The renderer loads one extra row above the viewport. As you scroll, the offset shifts the entire grid by actual pixels. When the offset crosses a cell height, the viewport advances one line and the offset wraps.
 
-### Linux Refresh Rate
+On the GPU, both the background fragment shader and text vertex shader receive the same `pixel_scroll_offset_y` uniform, rounded to whole pixels so text stays on integer boundaries (no sub-pixel blur). At 165hz with ~20px cells you get ~20 distinct positions per line -- completely smooth.
 
-On macOS, the animation timer auto-detects your display refresh rate via CVDisplayLink. On Linux there's no equivalent, so the timer defaults to **~165hz** (hardcoded in `src/renderer/generic.zig` as `display_refresh_ns`). There's no config option for this yet. (Not tested but prolly will work.)
+### Terminal Scroll Animation
 
-**If you're on a 60hz monitor:** Animation duration and timing are correct -- a 0.15s glide takes 0.15s regardless of refresh rate. But pixel scrolling will be less smooth because you have fewer frames to show the movement (~7 frames per cell at 60hz vs ~19 at 165hz). Still way smoother than stock Ghostty's line-jumping, just not as buttery. The timer also ticks more often than your display refreshes, which wastes a few CPU cycles. If this bothers you, change `display_refresh_ns` in the source to match your monitor (e.g. `16_666_666` for 60hz, `6_944_444` for 144hz).
+All scroll events (output arrival, user scrollback, page jumps) accumulate into a critically damped spring. The spring position is in lines. Each frame, the spring decays toward zero and the fractional position maps to `pixel_scroll_offset_y`. The cursor corners track this offset so the cursor moves in sync with content during animation.
 
-### Platform Support
+### Neovim GUI Scrolling
 
-Currently tested on **Linux (OpenGL)**. The Metal shader changes (macOS) have not been tested yet -- they mirror the OpenGL implementation but may have issues. If you're on macOS and run into problems, please open an issue.
+Completely different system. Neovim sends scroll region info via the multigrid UI protocol. Each window gets its own independent spring. The shader applies per-cell Y offsets only to cells inside the scroll region -- statusline, winbar, and cmdline stay fixed. Floating windows have their own z-order, clipping, and opacity/position springs. This is the same approach Neovide uses, running inside Ghostty's renderer.
 
-### Known Issues / TODO
+### Idle Cost
 
-- [ ] **Pasting in Neovim GUI mode** -- paste doesn't work correctly in nvim-gui
-- [ ] **Cursor scroll direction in Neovim GUI** -- mouse scroll direction is inverted (natural scrolling goes the wrong way)
-- [ ] **Linux emoji/unicode rendering** -- characters like `✅ 📡 🚀` don't render correctly (works fine in stock Ghostty)
-- [ ] **Linux vsync** -- animation timer is hardcoded to ~165hz. Works fine on any refresh rate (timing is wall-clock based) but wastes cycles on lower-hz displays. No config option yet -- needs auto-detection or a config field
-- [ ] **macOS Metal shaders** -- untested, may have issues since all development has been on Linux/OpenGL
+The animation timer only ticks while something is moving. Once all springs settle, the timer stops and Ghostty returns to pure event-driven rendering with zero animation overhead.
 
-Contributions welcome -- if you fix something or make it cooler, open a PR.
+---
 
-### Extras
+## Linux Refresh Rate
 
-The Pokemon terminal splash seen in the demo video is [pokemon-colorscripts](https://gitlab.com/phoneybadger/pokemon-colorscripts).
+On macOS, the animation timer uses CVDisplayLink for refresh rate detection. On Linux the timer defaults to **~165hz** (hardcoded `display_refresh_ns` in `src/renderer/generic.zig`).
 
-### Building
+Animation timing is wall-clock based -- a 0.15s spring takes 0.15s at any refresh rate. Lower refresh rates just show fewer intermediate frames. To change the timer rate, edit `display_refresh_ns` (e.g. `16_666_666` for 60hz, `6_944_444` for 144hz).
 
-**With Nix (easiest):**
+## Platform Support
+
+Tested on **Linux (OpenGL)**. macOS Metal shaders mirror the OpenGL implementation but are untested.
+
+## Known Issues
+
+- [ ] Paste doesn't work correctly in nvim-gui mode
+- [ ] Mouse scroll direction inverted in nvim-gui (natural scrolling)
+- [ ] Linux emoji/unicode rendering issues (works in stock Ghostty)
+- [ ] Linux animation timer hardcoded to ~165hz (needs auto-detection)
+- [ ] macOS Metal shaders untested
+
+Contributions welcome.
+
+## Building
+
+**With Nix (recommended):**
 
 ```bash
-cd ghostty-pixel-scroll
 nix-shell --run "zig build -Doptimize=ReleaseFast"
 ```
 
 **Without Nix:**
 
-You need Zig 0.15+ and the same dependencies as stock Ghostty (GTK4, libadwaita, etc). See Ghostty's [build from source docs](https://ghostty.org/docs/install/build) for your distro's package list, then:
+Zig 0.15+ and stock Ghostty dependencies (GTK4, libadwaita, etc). See Ghostty's [build docs](https://ghostty.org/docs/install/build), then:
 
 ```bash
-cd ghostty-pixel-scroll
 zig build -Doptimize=ReleaseFast
 ```
 
-Binary lands in `zig-out/bin/ghostty`. Run it directly or point your WM/DE at it:
+Binary: `zig-out/bin/ghostty`
 
 ```bash
 # Hyprland
-bind = SUPER, Return, exec, /path/to/ghostty-pixel-scroll/zig-out/bin/ghostty
+bind = SUPER, Return, exec, /path/to/zig-out/bin/ghostty
 
 # Sway
-bindsym $mod+Return exec /path/to/ghostty-pixel-scroll/zig-out/bin/ghostty
+bindsym $mod+Return exec /path/to/zig-out/bin/ghostty
 
 # Or just run it
 ./zig-out/bin/ghostty

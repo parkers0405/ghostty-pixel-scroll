@@ -27,9 +27,15 @@ pub const CriticallyDampedSpring = struct {
         self.position = (a + b * dt) * c;
         self.velocity = c * (-a * omega - b * dt * omega + b);
 
-        // Close enough -- stop animating but keep the residual so a new
-        // scroll event can accumulate on top without a visual snap.
-        if (@abs(self.position) < 0.01) return false;
+        // Close enough — snap to zero and stop. The residual (< 0.01 lines,
+        // i.e. less than half a pixel) is invisible, but leaving it non-zero
+        // causes the renderer to activate extra-row rendering and pollute
+        // the statusline/margin cells.
+        if (@abs(self.position) < 0.01) {
+            self.position = 0;
+            self.velocity = 0;
+            return false;
+        }
 
         return true;
     }

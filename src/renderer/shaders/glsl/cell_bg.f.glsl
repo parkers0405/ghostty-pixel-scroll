@@ -19,6 +19,15 @@ vec4 cell_bg() {
     uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
     
+    // Detect if this fragment is in the padding area using screen dimensions.
+    // With pixel scroll, the grid has 2 extra rows (grid_size.y = visible + 2).
+    // The screen only has room for (grid_size.y - 2) rows of content.
+    // Pixels outside that range should show bg/extend, not extra row content.
+    // visible_rows = grid_size.y when no pixel scroll, grid_size.y - 2 with pixel scroll.
+    int visible_rows = (pixel_scroll_offset_y > 0.0) ? int(grid_size.y) - 2 : int(grid_size.y);
+    ivec2 unshifted_grid_pos = ivec2(floor((gl_FragCoord.xy - grid_padding.wx) / cell_size));
+    bool in_padding = (unshifted_grid_pos.y < 0 || unshifted_grid_pos.y >= visible_rows);
+
     // Calculate grid position from fragment coordinates
     vec2 adjusted_coord = gl_FragCoord.xy;
     adjusted_coord.y += pixel_scroll_offset_y; // Global scroll offset (terminal mode)
@@ -76,6 +85,26 @@ vec4 cell_bg() {
     }
 
     vec4 bg = vec4(0.0);
+
+    // If this fragment is in the padding area (outside the visible grid),
+    // treat it as out-of-bounds regardless of where the scroll offset maps it.
+    // This prevents the extra pixel-scroll rows from showing in the padding.
+    if (in_padding) {
+        // Use the shifted grid_pos to find the edge row's color (the shifted
+        // pos correctly accounts for pixel_scroll_offset_y).
+        int clamped_y = clamp(grid_pos.y, 1, int(grid_size.y) - 2);
+        int clamped_x = clamp(grid_pos.x, 0, int(grid_size.x) - 1);
+        bool should_extend = (unshifted_grid_pos.y < 0)
+            ? ((padding_extend & EXTEND_UP) != 0)
+            : ((padding_extend & EXTEND_DOWN) != 0);
+        if (should_extend) {
+            int cell_index_final = clamped_y * int(grid_size.x) + clamped_x;
+            uvec4 raw_color = unpack4u8(cells[cell_index_final].color);
+            raw_color.a = 255u;
+            return load_color(raw_color, use_linear_blending);
+        }
+        return bg;
+    }
 
     // Clamp x position, extends edge bg colors in to padding on sides.
     if (grid_pos.x < 0) {

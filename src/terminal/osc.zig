@@ -155,6 +155,9 @@ pub const Command = union(Key) {
     /// Ghostty: Enter Neovim GUI mode (OSC 1338)
     enter_neovim_gui: void,
 
+    /// Ghostty: Toggle panel GUI (OSC 1339)
+    toggle_panel_gui: void,
+
     pub const SemanticPrompt = parsers.semantic_prompt.Command;
 
     pub const Key = LibEnum(
@@ -185,6 +188,7 @@ pub const Command = union(Key) {
             "conemu_comment",
             "kitty_text_sizing",
             "enter_neovim_gui",
+            "toggle_panel_gui",
         },
     );
 
@@ -345,6 +349,7 @@ pub const Parser = struct {
         @"777",
         @"1337",
         @"1338",
+        @"1339",
     };
 
     pub fn init(alloc: ?Allocator) Parser {
@@ -407,6 +412,7 @@ pub const Parser = struct {
             .show_desktop_notification,
             .kitty_text_sizing,
             .enter_neovim_gui,
+            .toggle_panel_gui,
             => {},
         }
 
@@ -605,11 +611,13 @@ pub const Parser = struct {
                 ';' => self.writeToFixed(),
                 '7' => self.state = .@"1337",
                 '8' => self.state = .@"1338",
+                '9' => self.state = .@"1339",
                 else => self.state = .invalid,
             },
 
             .@"1337",
             .@"1338",
+            .@"1339",
             => switch (c) {
                 ';' => self.writeToFixed(),
                 else => self.state = .invalid,
@@ -703,6 +711,13 @@ pub const Parser = struct {
                 // OSC 1338 - Enter Neovim GUI mode
                 // Usage: printf '\e]1338\a'
                 self.command = .enter_neovim_gui;
+                return &self.command;
+            },
+
+            .@"1339" => {
+                // OSC 1339 - Toggle panel GUI
+                // Usage: printf '\e]1339\a'
+                self.command = .toggle_panel_gui;
                 return &self.command;
             },
         };

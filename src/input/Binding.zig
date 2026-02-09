@@ -802,6 +802,16 @@ pub const Action = union(enum) {
     /// configuration file to customize its behavior.
     toggle_quick_terminal,
 
+    /// Toggle the slide-out panel GUI. Opens/closes a side or bottom panel
+    /// running a TUI program (lazygit, lazydocker, etc.) alongside the
+    /// terminal. The panel must be configured via `panel-gui`.
+    ///
+    /// The value is the program name to toggle, e.g. `toggle_panel:lazygit`.
+    /// If the panel doesn't exist yet, it will be spawned. If it's already
+    /// open, it will slide closed (process stays alive). If closed, slides
+    /// back open.
+    toggle_panel: []const u8,
+
     /// Show or hide all windows. If all windows become shown, we also ensure
     /// Ghostty becomes focused. When hiding all windows, focus is yielded
     /// to the next application as determined by the OS.
@@ -1378,6 +1388,7 @@ pub const Action = union(enum) {
             .goto_split,
             .goto_window,
             .toggle_split_zoom,
+            .toggle_panel,
             .toggle_readonly,
             .resize_split,
             .equalize_splits,

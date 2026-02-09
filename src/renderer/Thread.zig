@@ -611,7 +611,7 @@ fn drawCallback(
         return .disarm;
     };
 
-    if (t.renderer.nvim_gui != null) {
+    if (t.renderer.nvim_gui != null or t.renderer.panel != null) {
         // For Neovim GUI mode, we need a full updateFrame + draw when
         // there are active animations or pending events to process.
         // When idle (timer running only for custom shader animation),

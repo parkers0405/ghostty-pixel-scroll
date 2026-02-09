@@ -37,6 +37,7 @@ const internal_os = @import("os/main.zig");
 const inspectorpkg = @import("inspector/main.zig");
 const SurfaceMouse = @import("surface_mouse.zig");
 const neovim_gui = @import("neovim_gui/main.zig");
+const panel_gui = @import("panel_gui/main.zig");
 
 const log = std.log.scoped(.surface);
 
@@ -127,6 +128,17 @@ inspector: ?*inspectorpkg.Inspector = null,
 /// Neovim GUI mode - when set, this surface acts as a Neovim GUI client
 /// instead of a terminal emulator
 nvim_gui: ?*neovim_gui.NeovimGui = null,
+
+/// Panel GUI - slide-out panels for TUI programs (lazygit, lazydocker, etc.)
+/// Supports up to 4 concurrent panels.
+panels: [4]?*panel_gui.PanelGui = .{null} ** 4,
+
+/// The full (real) screen width/height before panel reservation.
+/// When a panel is open, we reduce self.size.screen to make the terminal
+/// grid smaller. This field stores the original so the renderer can draw
+/// the panel in the reserved area.
+real_screen_width: u32 = 0,
+real_screen_height: u32 = 0,
 
 /// All our sizing information.
 size: rendererpkg.Size,
@@ -354,6 +366,9 @@ const DerivedConfig = struct {
     notify_on_command_finish_after: Duration,
     key_remaps: input.KeyRemapSet,
     neovim_gui_socket: ?[]const u8,
+    panel_gui_1: ?[]const u8,
+    panel_gui_2: ?[]const u8,
+    panel_gui_size: f32,
 
     const Link = struct {
         regex: oni.Regex,
@@ -436,6 +451,15 @@ const DerivedConfig = struct {
                 try alloc.dupe(u8, config.@"neovim-gui")
             else
                 null,
+            .panel_gui_1 = if (config.@"panel-gui-1".len > 0)
+                try alloc.dupe(u8, config.@"panel-gui-1")
+            else
+                null,
+            .panel_gui_2 = if (config.@"panel-gui-2".len > 0)
+                try alloc.dupe(u8, config.@"panel-gui-2")
+            else
+                null,
+            .panel_gui_size = config.@"panel-gui-size",
 
             // Assignments happen sequentially so we have to do this last
             // so that the memory is captured from allocs above.
@@ -656,6 +680,7 @@ pub fn init(
             .env_override = config.env,
             .shell_integration = config.@"shell-integration",
             .shell_integration_features = config.@"shell-integration-features",
+            .neovim_gui_alias = config.@"neovim-gui-alias",
             .working_directory = config.@"working-directory",
             .resources_dir = global_state.resources_dir.host(),
             .term = config.term,
@@ -803,6 +828,18 @@ pub fn init(
             log.warn("Failed to initialize Neovim GUI mode: {}", .{err});
         };
     }
+
+    // Initialize Panel GUIs if configured
+    if (derived_config.panel_gui_1) |spec| {
+        self.initPanelFromSpec(spec) catch |err| {
+            log.warn("Failed to initialize Panel GUI 1: {}", .{err});
+        };
+    }
+    if (derived_config.panel_gui_2) |spec| {
+        self.initPanelFromSpec(spec) catch |err| {
+            log.warn("Failed to initialize Panel GUI 2: {}", .{err});
+        };
+    }
 }
 
 pub fn deinit(self: *Surface) void {
@@ -841,6 +878,14 @@ pub fn deinit(self: *Surface) void {
     // Clean up Neovim GUI if active
     if (self.nvim_gui) |nvim| {
         nvim.deinit();
+    }
+
+    // Clean up Panel GUIs if active
+    for (&self.panels) |*slot| {
+        if (slot.*) |p| {
+            p.deinit();
+            slot.* = null;
+        }
     }
 
     // Clean up our keyboard state
@@ -955,6 +1000,58 @@ pub fn initNeovimGui(self: *Surface) !void {
     log.info("Neovim GUI mode initialized successfully", .{});
 }
 
+/// Initialize Neovim GUI mode with a custom working directory.
+/// Used by the panel file explorer to set nvim's cwd to the file's parent dir.
+pub fn initNeovimGuiWithCwd(self: *Surface, cwd: ?[]const u8) !void {
+    if (self.nvim_gui != null) return;
+
+    const socket_path = self.config.neovim_gui_socket orelse "spawn";
+
+    log.info("Initializing Neovim GUI mode with socket: {s}, cwd: {?s}", .{ socket_path, cwd });
+
+    const nvim = try neovim_gui.NeovimGui.init(self.alloc);
+    errdefer nvim.deinit();
+
+    const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
+    const x_dpi = content_scale.x * font.face.default_dpi;
+    const y_dpi = content_scale.y * font.face.default_dpi;
+    const explicit_padding = self.config.scaledPadding(x_dpi, y_dpi);
+    const screen_without_balanced = self.size.screen.subPadding(explicit_padding);
+    const grid_size = rendererpkg.GridSize.init(screen_without_balanced, self.size.cell);
+
+    nvim.grid_width = grid_size.columns;
+    nvim.grid_height = grid_size.rows;
+    nvim.cell_width = @floatFromInt(self.size.cell.width);
+    nvim.cell_height = @floatFromInt(self.size.cell.height);
+
+    // Use provided cwd, falling back to terminal's pwd
+    const effective_cwd = cwd orelse self.io.terminal.getPwd();
+
+    if (std.mem.eql(u8, socket_path, "embed")) {
+        try nvim.spawn(effective_cwd);
+    } else if (std.mem.eql(u8, socket_path, "spawn")) {
+        try nvim.spawnWithSocket(effective_cwd);
+    } else {
+        try nvim.connect(socket_path);
+    }
+
+    self.nvim_gui = nvim;
+    self.renderer_state.nvim_gui = nvim;
+
+    const WakeupType = @TypeOf(self.renderer_thread.wakeup);
+    nvim.setRenderWakeup(
+        @ptrCast(&self.renderer_thread.wakeup),
+        struct {
+            fn notify(ptr: *anyopaque) void {
+                const wakeup: *WakeupType = @ptrCast(@alignCast(ptr));
+                wakeup.notify() catch {};
+            }
+        }.notify,
+    );
+
+    log.info("Neovim GUI mode initialized with cwd: {?s}", .{effective_cwd});
+}
+
 /// Send a key event to Neovim (when in GUI mode)
 pub fn sendKeyToNeovim(self: *Surface, event: input.KeyEvent) !void {
     const nvim = self.nvim_gui orelse return;
@@ -965,6 +1062,268 @@ pub fn sendKeyToNeovim(self: *Surface, event: input.KeyEvent) !void {
         // Queue a render to show the response from Neovim ASAP
         try self.queueRender();
     }
+}
+
+/// Parse a panel spec and initialize it.
+/// Format: "position:module_type:args" or "position:program_name" (shorthand)
+/// Examples:
+///   "right:program:lazygit"   -- explicit module type
+///   "right:lazygit"           -- shorthand (assumes program module)
+///   "bottom:program:lazydocker"
+pub fn initPanelFromSpec(self: *Surface, spec: []const u8) !void {
+    // Parse position (first segment before ':')
+    const first_sep = std.mem.indexOfScalar(u8, spec, ':') orelse {
+        log.warn("Invalid panel spec (expected position:module): {s}", .{spec});
+        return error.InvalidPanelSpec;
+    };
+
+    const pos_str = spec[0..first_sep];
+    const rest = spec[first_sep + 1 ..];
+
+    if (rest.len == 0) {
+        log.warn("Empty module in panel spec: {s}", .{spec});
+        return error.InvalidPanelSpec;
+    }
+
+    const position: panel_gui.PanelPosition = if (std.mem.eql(u8, pos_str, "right"))
+        .right
+    else if (std.mem.eql(u8, pos_str, "left"))
+        .left
+    else if (std.mem.eql(u8, pos_str, "bottom"))
+        .bottom
+    else if (std.mem.eql(u8, pos_str, "top"))
+        .top
+    else {
+        log.warn("Invalid panel position '{s}', expected right/left/bottom/top", .{pos_str});
+        return error.InvalidPanelSpec;
+    };
+
+    // Parse the module from the rest
+    const module = panel_gui.PanelModule.parse(rest) orelse {
+        log.warn("Invalid panel module spec: {s}", .{rest});
+        return error.InvalidPanelSpec;
+    };
+
+    try self.initPanelWithModule(module, position);
+}
+
+/// Initialize a Panel GUI for a given module and position
+pub fn initPanelWithModule(self: *Surface, module: panel_gui.PanelModule, position: panel_gui.PanelPosition) !void {
+    const panel_name = module.name();
+
+    // Check if this panel already exists
+    if (self.findPanel(panel_name) != null) {
+        log.info("Panel '{s}' already exists", .{panel_name});
+        return;
+    }
+
+    // Find a free slot
+    const slot_idx = for (&self.panels, 0..) |*slot, i| {
+        if (slot.* == null) break i;
+    } else {
+        log.warn("No free panel slots (max 4)", .{});
+        return error.TooManyPanels;
+    };
+
+    log.info("Initializing panel: name={s} module={s} position={s} slot={}", .{
+        panel_name,
+        @tagName(module),
+        @tagName(position),
+        slot_idx,
+    });
+
+    const p = try panel_gui.PanelGui.init(self.alloc, module, position);
+    errdefer p.deinit();
+
+    // Set size fraction from config
+    p.size_fraction = self.config.panel_gui_size;
+
+    // Set cell and surface dimensions
+    p.cell_width = @floatFromInt(self.size.cell.width);
+    p.cell_height = @floatFromInt(self.size.cell.height);
+    p.surface_width = @floatFromInt(self.size.screen.width);
+    p.surface_height = @floatFromInt(self.size.screen.height);
+
+    // Set theme colors from terminal palette
+    {
+        const tc = &self.io.terminal.colors;
+        const bg_rgb = if (tc.background.get()) |c| @as(u32, c.r) << 16 | @as(u32, c.g) << 8 | @as(u32, c.b) else 0x1e1e2e;
+        const fg_rgb = if (tc.foreground.get()) |c| @as(u32, c.r) << 16 | @as(u32, c.g) << 8 | @as(u32, c.b) else 0xcdd6f4;
+        var pal16: [16]u32 = undefined;
+        for (0..16) |i| {
+            const c = tc.palette.current[i];
+            pal16[i] = @as(u32, c.r) << 16 | @as(u32, c.g) << 8 | @as(u32, c.b);
+        }
+        p.setThemeColors(bg_rgb, fg_rgb, pal16);
+    }
+
+    // Get the current working directory
+    const terminal_cwd = self.io.terminal.getPwd();
+
+    // Spawn the program
+    try p.spawn(terminal_cwd);
+
+    // Wire up render wakeup (same pattern as neovim_gui)
+    const WakeupType = @TypeOf(self.renderer_thread.wakeup);
+    p.setRenderWakeup(
+        @ptrCast(&self.renderer_thread.wakeup),
+        struct {
+            fn notify(ptr: *anyopaque) void {
+                const wakeup: *WakeupType = @ptrCast(@alignCast(ptr));
+                wakeup.notify() catch {};
+            }
+        }.notify,
+    );
+
+    self.panels[slot_idx] = p;
+
+    // Update renderer state with first active panel
+    self.updateRendererPanel();
+
+    log.info("Panel '{s}' initialized successfully in slot {}", .{ panel_name, slot_idx });
+}
+
+/// Find an existing panel by name
+fn findPanel(self: *Surface, panel_name: []const u8) ?*panel_gui.PanelGui {
+    for (&self.panels) |*slot| {
+        if (slot.*) |p| {
+            if (std.mem.eql(u8, p.name, panel_name)) return p;
+        }
+    }
+    return null;
+}
+
+/// Find the focused panel (if any)
+fn findFocusedPanel(self: *Surface) ?*panel_gui.PanelGui {
+    for (&self.panels) |*slot| {
+        if (slot.*) |p| {
+            if (p.focused and p.ready and !p.exited) return p;
+        }
+    }
+    return null;
+}
+
+/// Update the renderer state with the first visible panel
+fn updateRendererPanel(self: *Surface) void {
+    // Expose the first active panel (open or animating) to the renderer.
+    // Check slide target (isOpen) rather than progress, because right after
+    // open() is called the progress is still 0 but we need the renderer to
+    // start driving the animation.
+    self.renderer_state.real_screen_width = self.real_screen_width;
+    self.renderer_state.real_screen_height = self.real_screen_height;
+    for (&self.panels) |*slot| {
+        if (slot.*) |p| {
+            if (p.slide.isOpen() or p.isVisible()) {
+                self.renderer_state.panel = p;
+                return;
+            }
+        }
+    }
+    self.renderer_state.panel = null;
+}
+
+/// Send a key event to a focused panel's PTY
+pub fn sendKeyToPanel(self: *Surface, event: input.KeyEvent) !void {
+    const p = self.findFocusedPanel() orelse return;
+
+    if (panel_gui.panel_input.toVtSequence(event)) |vt_seq| {
+        try p.sendKey(vt_seq);
+        try self.queueRender();
+    }
+}
+
+/// Toggle a panel by name. Creates it if it doesn't exist yet.
+/// The name is the module's identifier (e.g. "lazygit", "lazydocker",
+/// or in the future "command_history", "favorites", etc.)
+pub fn togglePanel(self: *Surface, panel_name: []const u8) !void {
+    if (self.findPanel(panel_name)) |p| {
+        // Panel exists - toggle it
+        p.toggle();
+        // If opening, give it focus. If closing, unfocus.
+        p.focused = p.slide.isOpen();
+        self.updateRendererPanel();
+        // Trigger terminal resize to account for panel space change
+        try self.resizeForPanel();
+        try self.queueRender();
+    } else {
+        // Panel doesn't exist - look up config or create with defaults
+        const result = self.lookupPanelConfig(panel_name);
+        try self.initPanelWithModule(result.module, result.position);
+
+        // Give the newly created panel focus and trigger render
+        if (self.findPanel(result.module.name())) |p| {
+            p.focused = true;
+        }
+        // Trigger terminal resize to account for panel space
+        try self.resizeForPanel();
+        try self.queueRender();
+    }
+}
+
+/// Look up panel config by name. Searches configured specs first,
+/// then falls back to treating the name as a program with default position.
+fn lookupPanelConfig(self: *Surface, panel_name: []const u8) struct {
+    module: panel_gui.PanelModule,
+    position: panel_gui.PanelPosition,
+} {
+    // Search configured specs
+    const specs = [_]?[]const u8{ self.config.panel_gui_1, self.config.panel_gui_2 };
+    for (specs) |maybe_spec| {
+        const spec = maybe_spec orelse continue;
+        // Parse "position:module_spec"
+        const sep = std.mem.indexOfScalar(u8, spec, ':') orelse continue;
+        const pos_str = spec[0..sep];
+        const rest = spec[sep + 1 ..];
+
+        // Parse the module from the rest
+        const module = panel_gui.PanelModule.parse(rest) orelse continue;
+
+        // Check if this module matches the requested name
+        if (std.mem.eql(u8, module.name(), panel_name)) {
+            const position: panel_gui.PanelPosition =
+                if (std.mem.eql(u8, pos_str, "left")) .left else if (std.mem.eql(u8, pos_str, "bottom")) .bottom else if (std.mem.eql(u8, pos_str, "top")) .top else .right;
+            return .{ .module = module, .position = position };
+        }
+    }
+
+    // For all other names (including "panel", "menu", "lazygit", etc.)
+    // open the interactive menu panel. External TUI apps are launched
+    // from within the menu as "open in split" actions rather than
+    // being rendered in the panel's mini VT parser.
+    return .{
+        .module = .menu,
+        .position = .right,
+    };
+}
+
+/// Get the program name from the first configured panel spec
+fn getFirstPanelProgram(self: *Surface) ?[]const u8 {
+    const specs = [_]?[]const u8{ self.config.panel_gui_1, self.config.panel_gui_2 };
+    for (specs) |maybe_spec| {
+        const spec = maybe_spec orelse continue;
+        const sep = std.mem.indexOfScalar(u8, spec, ':') orelse continue;
+        const program = spec[sep + 1 ..];
+        if (program.len > 0) return program;
+    }
+    return null;
+}
+
+/// Look up the configured position for a program name, default to .right
+fn findPanelPosition(self: *Surface, program: []const u8) panel_gui.PanelPosition {
+    const specs = [_]?[]const u8{ self.config.panel_gui_1, self.config.panel_gui_2 };
+    for (specs) |maybe_spec| {
+        const spec = maybe_spec orelse continue;
+        const sep = std.mem.indexOfScalar(u8, spec, ':') orelse continue;
+        const spec_program = spec[sep + 1 ..];
+        if (std.mem.eql(u8, spec_program, program)) {
+            const pos_str = spec[0..sep];
+            if (std.mem.eql(u8, pos_str, "left")) return .left;
+            if (std.mem.eql(u8, pos_str, "bottom")) return .bottom;
+            if (std.mem.eql(u8, pos_str, "top")) return .top;
+            return .right;
+        }
+    }
+    return .right;
 }
 
 /// Returns a mailbox that can be used to send messages to this surface.
@@ -1298,6 +1657,14 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
                     log.err("failed to init Neovim GUI: {}", .{err});
                 };
             }
+        },
+
+        .toggle_panel_gui => {
+            // OSC 1339 - Toggle panel GUI (toggles menu panel by default)
+            log.info("toggling Panel GUI via OSC 1339", .{});
+            self.togglePanel("panel") catch |err| {
+                log.err("failed to toggle panel GUI: {}", .{err});
+            };
         },
     }
 }
@@ -2574,21 +2941,81 @@ pub fn sizeCallback(self: *Surface, size: apprt.SurfaceSize) !void {
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
-    const new_screen_size: rendererpkg.ScreenSize = .{
-        .width = size.width,
-        .height = size.height,
-    };
+    // Store the real (full) screen dimensions. The panel reserves
+    // part of this space; the terminal grid uses the remainder.
+    self.real_screen_width = size.width;
+    self.real_screen_height = size.height;
 
-    // Update our screen size, but only if it actually changed. And if
-    // the screen size didn't change, then our grid size could not have
-    // changed, so we just return.
-    if (self.size.screen.equals(new_screen_size)) return;
+    // Compute the effective screen size (reduced by panel reservation)
+    const effective = self.effectiveScreenSize(size.width, size.height);
 
-    try self.resize(new_screen_size);
+    // Early-return if effective screen size hasn't changed
+    if (self.size.screen.equals(effective)) return;
+
+    try self.resize(effective);
+}
+
+/// Compute the effective screen size after subtracting space reserved
+/// by open panels. We reserve the full panel width immediately when
+/// the panel is open (regardless of slide animation progress) so the
+/// terminal grid resizes once at open/close, avoiding SIGWINCH spam
+/// during animation. The slide animation is purely visual in the
+/// renderer — the panel content slides into the pre-reserved gap.
+fn effectiveScreenSize(self: *Surface, real_w: u32, real_h: u32) rendererpkg.ScreenSize {
+    var w: u32 = real_w;
+    var h: u32 = real_h;
+
+    for (&self.panels) |*slot| {
+        if (slot.*) |p| {
+            // Reserve full panel space as soon as the panel is open.
+            // On close, release immediately — the renderer keeps extra
+            // columns via real_cols during the close animation so the
+            // panel can slide out visually.
+            if (!p.slide.isOpen()) continue;
+
+            switch (p.position) {
+                .right, .left => {
+                    const panel_px: u32 = @intFromFloat(
+                        @as(f32, @floatFromInt(real_w)) * p.size_fraction,
+                    );
+                    w -|= panel_px;
+                },
+                .top, .bottom => {
+                    const panel_px: u32 = @intFromFloat(
+                        @as(f32, @floatFromInt(real_h)) * p.size_fraction,
+                    );
+                    h -|= panel_px;
+                },
+            }
+        }
+    }
+
+    return .{ .width = @max(w, 1), .height = @max(h, 1) };
+}
+
+/// Recalculate the effective screen size and trigger a resize if needed.
+/// Called after panel open/close/animate to update the terminal grid.
+fn resizeForPanel(self: *Surface) !void {
+    // If we haven't received a sizeCallback yet, use the current screen
+    // size as the real size. This avoids resizing to 1x1 on first open.
+    const real_w = if (self.real_screen_width > 0) self.real_screen_width else self.size.screen.width;
+    const real_h = if (self.real_screen_height > 0) self.real_screen_height else self.size.screen.height;
+    if (real_w == 0 or real_h == 0) return;
+
+    // Store as real screen dims if not yet set
+    if (self.real_screen_width == 0) {
+        self.real_screen_width = real_w;
+        self.real_screen_height = real_h;
+    }
+
+    const effective = self.effectiveScreenSize(real_w, real_h);
+    if (!self.size.screen.equals(effective)) {
+        try self.resize(effective);
+    }
 }
 
 fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
-    // Save our screen size
+    // Save our screen size (this is the effective size, after panel reservation)
     self.size.screen = size;
     self.balancePaddingIfNeeded();
 
@@ -2615,6 +3042,20 @@ fn resize(self: *Surface, size: rendererpkg.ScreenSize) !void {
         grid_size.columns,
         grid_size.rows,
     });
+
+    // Resize all active panels (give them the REAL screen dimensions)
+    for (&self.panels) |*slot| {
+        if (slot.*) |p| {
+            p.updateSurfaceSize(
+                @floatFromInt(self.real_screen_width),
+                @floatFromInt(self.real_screen_height),
+                @floatFromInt(self.size.cell.width),
+                @floatFromInt(self.size.cell.height),
+            ) catch |err| {
+                log.warn("Failed to resize panel: {}", .{err});
+            };
+        }
+    }
 
     // If in Neovim GUI mode, resize the Neovim UI
     if (self.nvim_gui) |nvim| {
@@ -2840,6 +3281,97 @@ pub fn keyCallback(
         event,
         if (insp_ev) |*ev| ev else null,
     )) |v| return v;
+
+    // If a panel has focus, route keys to it
+    if (self.findFocusedPanel()) |p| {
+        // In program mode, Escape returns focus to terminal.
+        // In menu mode, Escape is handled by the menu (closes the panel).
+        if (event.key == .escape and event.action == .press and p.module == .program) {
+            p.focused = false;
+            try self.queueRender();
+            return .consumed;
+        }
+        try self.sendKeyToPanel(event);
+        // After sending key to menu, check for pending actions
+        if (p.module == .menu) {
+            if (p.menu) |menu| {
+                if (menu.pending_action) |action| {
+                    switch (action) {
+                        .close => {
+                            p.close();
+                            p.focused = false;
+                            self.updateRendererPanel();
+                            try self.resizeForPanel();
+                            menu.pending_action = null;
+                        },
+                        .run_command => |cmd| {
+                            // Close panel and type the command into the terminal
+                            log.info("panel: running command '{s}'", .{cmd});
+                            p.close();
+                            p.focused = false;
+                            self.updateRendererPanel();
+                            try self.resizeForPanel();
+                            // Write command + enter to the terminal PTY
+                            self.queueIo(.{ .write_stable = cmd }, .unlocked);
+                            self.queueIo(.{ .write_stable = "\n" }, .unlocked);
+                            menu.pending_action = null;
+                        },
+                        .open_file => |info| {
+                            // Open file: close panel and enter nvim-gui mode
+                            // with the file open, cwd set to the file's parent dir.
+                            log.info("panel: opening file '{s}' (cwd: {s})", .{ info.path, info.dir });
+
+                            // Copy path and dir before closing panel
+                            const path_copy = self.alloc.dupe(u8, info.path) catch "";
+                            defer if (path_copy.len > 0) self.alloc.free(path_copy);
+                            const dir_copy = self.alloc.dupe(u8, info.dir) catch "";
+                            defer if (dir_copy.len > 0) self.alloc.free(dir_copy);
+
+                            p.close();
+                            p.focused = false;
+                            self.updateRendererPanel();
+                            try self.resizeForPanel();
+                            menu.pending_action = null;
+
+                            if (path_copy.len > 0) {
+                                // Enter nvim-gui mode if not already active
+                                if (self.nvim_gui == null) {
+                                    self.initNeovimGuiWithCwd(if (dir_copy.len > 0) dir_copy else null) catch |err| {
+                                        log.err("panel: failed to init nvim-gui: {}", .{err});
+                                    };
+                                }
+                                // Open the file in Neovim with cwd set to parent dir
+                                if (self.nvim_gui) |nvim| {
+                                    if (nvim.io) |io| {
+                                        // First: cd to the parent directory so the lua
+                                        // file tree shows the correct location
+                                        if (dir_copy.len > 0) {
+                                            if (std.fmt.allocPrint(self.alloc, "cd {s}", .{dir_copy})) |cd_cmd| {
+                                                defer self.alloc.free(cd_cmd);
+                                                io.sendCommand(cd_cmd) catch |err| {
+                                                    log.err("panel: failed to send cd to nvim: {}", .{err});
+                                                };
+                                            } else |_| {}
+                                        }
+                                        // Then: open the file
+                                        if (std.fmt.allocPrint(self.alloc, "edit {s}", .{path_copy})) |edit_cmd| {
+                                            defer self.alloc.free(edit_cmd);
+                                            io.sendCommand(edit_cmd) catch |err| {
+                                                log.err("panel: failed to send edit to nvim: {}", .{err});
+                                            };
+                                        } else |_| {}
+                                    }
+                                }
+                            }
+                        },
+                        else => {},
+                    }
+                }
+            }
+        }
+        try self.queueRender();
+        return .consumed;
+    }
 
     // If we're in Neovim GUI mode, check if Neovim exited first
     if (self.nvim_gui) |nvim| {
@@ -4270,6 +4802,59 @@ pub fn mouseButtonCallback(
     // Update our modifiers if they changed
     self.modsChanged(mods);
 
+    // Panel GUI: handle clicks on panel area and drag handle
+    if (button == .left) {
+        const pos = try self.rt_surface.getCursorPos();
+        const px: f32 = @floatCast(pos.x);
+        const py: f32 = @floatCast(pos.y);
+
+        if (action == .press) {
+            // Check drag handle first (higher priority)
+            for (&self.panels) |*slot| {
+                if (slot.*) |p| {
+                    if (p.isVisible() and p.hitTestDragHandle(px, py)) {
+                        p.dragging = true;
+                        p.drag_last_x = px;
+                        p.drag_last_y = py;
+                        return true; // consumed
+                    }
+                }
+            }
+            // Check panel body click (gives focus)
+            for (&self.panels) |*slot| {
+                if (slot.*) |p| {
+                    if (p.isVisible() and p.hitTest(px, py)) {
+                        // Unfocus all panels, focus this one
+                        for (&self.panels) |*s| {
+                            if (s.*) |other| other.focused = false;
+                        }
+                        p.focused = true;
+                        try self.queueRender();
+                        return true; // consumed
+                    }
+                }
+            }
+            // Click outside all panels - unfocus all
+            for (&self.panels) |*slot| {
+                if (slot.*) |p| {
+                    if (p.focused) {
+                        p.focused = false;
+                        try self.queueRender();
+                    }
+                }
+            }
+        } else if (action == .release) {
+            // Release drag
+            for (&self.panels) |*slot| {
+                if (slot.*) |p| {
+                    if (p.dragging) {
+                        p.dragging = false;
+                    }
+                }
+            }
+        }
+    }
+
     // In Neovim GUI mode, send mouse button events to Neovim via nvim_input_mouse API
     if (self.nvim_gui) |nvim| {
         // Check if mouse is enabled in Neovim
@@ -5043,6 +5628,42 @@ pub fn cursorPosCallback(
     defer crash.sentry.thread_state = null;
 
     // log.debug("cursor pos x={} y={} mods={?}", .{ pos.x, pos.y, mods });
+
+    // Handle panel drag resize and hover-based focus switching
+    {
+        const px: f32 = @floatCast(pos.x);
+        const py: f32 = @floatCast(pos.y);
+        for (&self.panels) |*slot| {
+            if (slot.*) |p| {
+                if (p.dragging) {
+                    const dx = px - p.drag_last_x;
+                    const dy = py - p.drag_last_y;
+                    p.drag_last_x = px;
+                    p.drag_last_y = py;
+                    p.handleDragResize(dx, dy);
+                    p.updateSurfaceSize(
+                        p.surface_width,
+                        p.surface_height,
+                        p.cell_width,
+                        p.cell_height,
+                    ) catch {};
+                    self.updateRendererPanel();
+                    try self.queueRender();
+                }
+
+                // Hover-based focus: if the mouse is within the panel's
+                // visible area, give it focus. Otherwise, focus returns
+                // to the terminal.
+                if (p.isVisible()) {
+                    if (p.hitTest(px, py)) {
+                        p.focused = true;
+                    } else {
+                        p.focused = false;
+                    }
+                }
+            }
+        }
+    }
 
     // If the position is negative, it is outside our viewport and
     // we need to clear any hover states.
@@ -6230,6 +6851,10 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
                 try self.setSelection(s);
                 try self.queueRender();
             }
+        },
+
+        .toggle_panel => |program| {
+            try self.togglePanel(program);
         },
 
         .inspector => |mode| return try self.rt_app.performAction(

@@ -251,3 +251,10 @@ function __ghostty_preexec() {
 
 preexec_functions+=(__ghostty_preexec)
 precmd_functions+=(__ghostty_precmd)
+
+# Neovim GUI mode: create a shell function that sends OSC 1338 to switch
+# the current terminal into Ghostty's native Neovim GUI renderer.
+# The function name is configurable via neovim-gui-alias (default: nvim-gui).
+if [[ -n "$GHOSTTY_NVIM_GUI_ALIAS" ]]; then
+    eval "${GHOSTTY_NVIM_GUI_ALIAS}() { builtin printf '\\e]1338\\a'; }"
+fi

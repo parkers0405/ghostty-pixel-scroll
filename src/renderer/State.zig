@@ -8,6 +8,7 @@ const inputpkg = @import("../input.zig");
 const renderer = @import("../renderer.zig");
 const animation = @import("../animation.zig");
 const neovim_gui = @import("../neovim_gui/main.zig");
+const panel_gui = @import("../panel_gui/main.zig");
 
 /// The mutex that must be held while reading any of the data in the
 /// members of this state. Note that the state itself is NOT protected
@@ -25,6 +26,15 @@ inspector: ?*Inspector = null,
 /// Neovim GUI mode state. When set, the renderer should read cell content
 /// from NeovimGui windows instead of the terminal.
 nvim_gui: ?*neovim_gui.NeovimGui = null,
+
+/// Panel GUI state. When set, the renderer composites the panel alongside
+/// the main terminal content with slide animation.
+panel: ?*panel_gui.PanelGui = null,
+
+/// The real (full) screen dimensions, before panel reservation.
+/// The renderer uses these to know where to draw the panel content.
+real_screen_width: u32 = 0,
+real_screen_height: u32 = 0,
 
 /// Dead key state. This will render the current dead key preedit text
 /// over the cursor. This currently only ever renders a single codepoint.

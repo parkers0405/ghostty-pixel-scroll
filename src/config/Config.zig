@@ -932,29 +932,33 @@ palette: Palette = .{},
 /// Enable per-pixel scrolling for high precision input devices (for example
 /// touchpads). When enabled, scrollback can move by sub-line increments
 /// instead of only whole lines. This provides a much smoother scrolling
-/// experience.
+/// experience. Always enabled by default.
 ///
 /// This only affects scrolling the terminal's own scrollback, not applications
 /// running inside the terminal (for example full-screen TUIs) that handle
 /// scrolling themselves.
-@"pixel-scroll": bool = false,
+@"pixel-scroll": bool = true,
 
 /// The duration of the cursor animation in seconds. 0 = no animation (instant).
-/// Recommended: 0.06 for a smooth feel, Neovide uses ~0.04-0.15.
-/// When neovim-gui is active and this is 0, defaults to 0.06 automatically.
-@"cursor-animation-duration": f32 = 0.0,
+/// The animated cursor smoothly glides between positions using a critically
+/// damped spring, matching the Neovide cursor feel. Set to 0 to disable.
+@"cursor-animation-duration": f32 = 0.06,
 
 /// The bounciness of the cursor animation (0.0 to 1.0).
+/// 0 = critically damped (no overshoot), 1.0 = maximum bounce.
 @"cursor-animation-bounciness": f32 = 0.0,
 
 /// The duration of the scroll animation in seconds. 0 = no animation (instant).
-/// Controls smooth content-arrival animation: small output (1-3 lines) glides in
-/// gently, large dumps (4+ lines) get a satisfying spring drop. Rapid streaming
-/// output (docker logs, builds) is automatically detected and snaps instantly.
-/// When neovim-gui is active and this is 0, defaults to 0.2 automatically.
+/// When enabled, content arrival (new output) and scroll events animate
+/// smoothly using a critically damped spring (matching Neovide's formula).
+/// Recommended: 0.15-0.3 for a smooth feel.
+/// When neovim-gui is active and this is 0, defaults to 0.3 automatically.
 @"scroll-animation-duration": f32 = 0.15,
 
 /// The bounciness of the scroll animation (0.0 to 1.0).
+/// 0 = critically damped (no overshoot, fastest settling).
+/// Values > 0 make the spring underdamped, causing a bounce/overshoot effect.
+/// Only takes effect when scroll-animation-duration > 0.
 @"scroll-animation-bounciness": f32 = 0.0,
 
 /// Enable Neovim GUI mode. Ghostty becomes a native Neovim GUI client
@@ -969,6 +973,12 @@ palette: Palette = .{},
 /// Empty string (default) = normal terminal mode.
 @"neovim-gui": []const u8 = "",
 
+/// Shell alias name for entering Neovim GUI mode. The shell integration
+/// creates a function with this name that sends OSC 1338 to switch the
+/// current terminal into Neovim GUI mode. Set to empty string to disable
+/// the alias entirely.
+@"neovim-gui-alias": []const u8 = "nvim-gui",
+
 /// Gap color between Neovim windows. Visible when neovim-corner-radius > 0.
 @"neovim-gap-color": Color = .{ .r = 0x0a, .g = 0x0a, .b = 0x0a },
 
@@ -976,6 +986,38 @@ palette: Palette = .{},
 /// Recommended: 8.0 for a polished look.
 /// When neovim-gui is active and this is 0, defaults to 8.0 automatically.
 @"neovim-corner-radius": f32 = 0.0,
+
+/// Configure slide-out panels for running TUI programs (lazygit, lazydocker,
+/// htop, etc.) alongside your terminal. Panels slide in from the side or
+/// bottom with smooth spring animations and a draggable resize handle.
+///
+/// Format: `position:module` where position is one of `right`, `left`,
+/// `bottom`, `top` and module is either `menu` (interactive launcher) or
+/// a program name (e.g. `lazygit`, `htop`). Examples:
+///
+///     panel-gui-1 = right:menu
+///     panel-gui-2 = bottom:lazydocker
+///
+/// The `menu` module shows an interactive panel with sections for Apps
+/// (Lazygit, Lazydocker, htop, etc.), Favorites, and Recent Commands.
+/// Navigate with j/k (vim-style), press Enter to launch an app.
+///
+/// Toggle panels with keybind actions:
+///
+///     keybind = ctrl+shift+p=toggle_panel:panel
+///     keybind = ctrl+shift+g=toggle_panel:lazygit
+///
+/// Panels persist when closed (process stays alive). Reopening shows the
+/// same session.
+@"panel-gui-1": []const u8 = "",
+
+/// Second panel slot. Same format as panel-gui-1.
+@"panel-gui-2": []const u8 = "",
+
+/// Default panel size as a fraction of the surface (0.0 to 1.0).
+/// For side panels (left/right): fraction of width.
+/// For top/bottom panels: fraction of height.
+@"panel-gui-size": f32 = 0.35,
 
 /// Matte/ink post-processing intensity (0.0 = off, 1.0 = full).
 /// Gives colors a physical-ink quality with subtle desaturation,
@@ -6475,6 +6517,14 @@ pub const Keybinds = struct {
                 alloc,
                 .{ .key = .{ .unicode = 'i' }, .mods = .{ .shift = true, .ctrl = true } },
                 .{ .inspector = .toggle },
+            );
+
+            // Panel GUI menu (slide-out panel with Favorites, Recent Commands, Files)
+            // Ctrl+/ — doesn't conflict with any existing keybinds
+            try self.set.put(
+                alloc,
+                .{ .key = .{ .unicode = '/' }, .mods = .{ .ctrl = true } },
+                .{ .toggle_panel = "panel" },
             );
 
             // Terminal

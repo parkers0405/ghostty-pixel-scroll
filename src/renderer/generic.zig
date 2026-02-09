@@ -23,6 +23,7 @@ const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
 const animation = @import("../animation.zig");
 const neovim_gui = @import("../neovim_gui/main.zig");
+const panel_gui_mod = @import("../panel_gui/main.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
@@ -293,6 +294,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Neovim GUI mode state. When set, the renderer reads from Neovim
         /// windows instead of terminal_state.
         nvim_gui: ?*neovim_gui.NeovimGui = null,
+
+        /// Panel GUI state. When set, the renderer composites the panel
+        /// alongside the terminal content.
+        panel: ?*panel_gui_mod.PanelGui = null,
+
+        /// Real (full) screen dimensions before panel reservation.
+        /// Used to position the panel rendering in the gap area.
+        real_screen_width: u32 = 0,
+        real_screen_height: u32 = 0,
 
         /// The number of frames since the last terminal state reset.
         /// We reset the terminal state after ~100,000 frames (about 10 to
@@ -691,10 +701,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     config.link.links.items,
                 );
 
-                // When neovim-gui is active and animation values are at their
-                // zero defaults, apply Neovide-like defaults automatically.
-                // When pixel-scroll or neovim-gui is active and no explicit duration
-                // was set (0), enable a sensible default so animations are on.
+                // When neovim-gui or pixel-scroll is active and animation values
+                // are at their zero defaults, apply sensible defaults automatically.
                 // Users who explicitly want no animation can use a tiny value like 0.001.
                 const nvim_active = config.@"neovim-gui".len > 0;
                 const smooth_mode = nvim_active or config.@"pixel-scroll";
@@ -1168,7 +1176,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.sonicboom_active or
                 // In Neovim GUI mode we also need to keep running while
                 // events are pending (dirty flag means content changed)
-                (self.nvim_gui != null and self.nvim_gui.?.dirty);
+                (self.nvim_gui != null and self.nvim_gui.?.dirty) or
+                // Panel GUI: keep running while panel is animating or has new content
+                (self.panel != null and (self.panel.?.isDirty() or self.panel.?.isVisible()));
         }
 
         /// Return the ideal draw timer interval in milliseconds based on the
@@ -1324,8 +1334,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             //     );
             // }
 
-            // Update nvim_gui pointer from state
+            // Update nvim_gui and panel pointers from state
             self.nvim_gui = state.nvim_gui;
+            self.panel = state.panel;
+            self.real_screen_width = state.real_screen_width;
+            self.real_screen_height = state.real_screen_height;
 
             // If in Neovim GUI mode, use a separate update path
             if (self.nvim_gui) |nvim| {
@@ -1648,6 +1661,31 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     log.warn("error rebuilding GPU cells err={}", .{err});
                 };
 
+                // Overlay panel content on top of terminal cells.
+                // This must happen AFTER rebuildCells so the panel overwrites
+                // the terminal cells in its region.
+                if (self.panel) |panel| {
+                    // Process pending PTY output into the panel's cell grid
+                    panel.processOutput() catch |err| {
+                        log.warn("error processing panel output err={}", .{err});
+                    };
+
+                    // Animate the panel (slide in/out, drag spring, etc.)
+                    // Use a fixed dt since we don't have frame timing in terminal mode
+                    const panel_dt: f32 = 1.0 / 120.0;
+                    _ = panel.animate(panel_dt);
+
+                    // If the panel is visible, overlay its cells onto the grid
+                    if (panel.isVisible()) {
+                        self.rebuildCellsFromPanel(panel) catch |err| {
+                            log.warn("error rebuilding panel cells err={}", .{err});
+                        };
+                    }
+
+                    // Clear dirty flag after rendering
+                    panel.clearDirty();
+                }
+
                 // The scrollbar is only emitted during draws so we also
                 // check the scrollbar cache here and update if needed.
                 // This is pretty fast.
@@ -1773,13 +1811,22 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const dt: f32 = frame_dt / @as(f32, @floatFromInt(num_steps));
 
             // Run animation steps
+            // Neovim GUI always uses scroll animation (Neovide default 0.3s).
+            // When nvim-gui is activated via OSC 1338 (not config), the DerivedConfig
+            // auto-defaults don't apply, so scroll_animation_duration may be 0.
+            // Fall back to Neovide's default in that case.
+            const nvim_scroll_dur: f32 = if (self.config.scroll_animation_duration > 0)
+                self.config.scroll_animation_duration
+            else
+                0.3;
+
             var step: u32 = 0;
             while (step < num_steps) : (step += 1) {
                 var any_animating = false;
                 {
                     var window_iter = nvim.windows.valueIterator();
                     while (window_iter.next()) |window_ptr| {
-                        if (window_ptr.*.animate(dt, self.config.scroll_animation_duration)) {
+                        if (window_ptr.*.animate(dt, nvim_scroll_dur)) {
                             any_animating = true;
                         }
                     }
@@ -2263,9 +2310,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
 
                 // Render scrollable region.
-                // During scroll animation, always render inner_size + 1 rows
-                // (matching Neovide's iter_scrollable_lines which iterates 0..=inner_size).
-                // The extra row at the bottom allows content to scroll into view smoothly.
+                // During scroll animation, render inner_size + 1 rows (0..=inner_size),
+                // matching Neovide's iter_scrollable_lines. The extra row at the bottom
+                // holds content that's partially visible as it scrolls in/out of view.
+                // The floor-based scrollback lookup (in getScrollbackCellByInnerRow)
+                // determines WHICH content each row shows, while the sub-pixel offset
+                // shifts all rows uniformly upward within the clipped region.
                 // Use RAW (pre-round) offset to decide whether animation is active.
                 const bg_offset_fixed: i16 = @intFromFloat(std.math.clamp(scroll_pixel_offset * 256.0, -32768.0, 32767.0));
                 const is_scroll_animating = (!is_floating and has_valid_scrollback and raw_scroll_offset != 0);
@@ -2291,17 +2341,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             }
                         }
 
-                        // For extra animation row: only draw if we own the cell OR no one owns it (unclaimed)
-                        // This prevents drawing over statusline which is a separate window
+                        // Extra animation row: render content that's partially scrolling
+                        // into view. Skip bg write (to avoid polluting margin/statusline
+                        // cells with non-zero offset). Text is clipped by the fragment shader.
                         const is_extra_anim_row = (render_extra_row and inner_row == inner_size);
-                        const cell_unclaimed = occlusion_map[screen_y * cols + screen_x] == 0;
-                        const can_draw_extra = is_extra_anim_row and (owns_cell or cell_unclaimed);
 
                         // For message windows, skip cells we don't own (empty cells)
-                        if (is_message_window and !owns_cell and !can_draw_extra) continue;
-
-                        // Skip extra animation row if another window owns that cell (e.g. statusline)
-                        if (is_extra_anim_row and !owns_cell and !cell_unclaimed) continue;
+                        if (is_message_window and !owns_cell and !is_extra_anim_row) continue;
 
                         // Read from scrollback for smooth scroll animation (editor windows only),
                         // or actual_lines for floating windows and when scrollback is unavailable
@@ -2324,53 +2370,63 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             bg_color = tmp;
                         }
 
-                        // Floating windows: no scroll offset, use per-window opacity for fade animation.
-                        if (is_floating) {
-                            self.cells.bgCell(screen_y, screen_x).* = .{
-                                .color = .{
-                                    @intCast((bg_color >> 16) & 0xFF),
-                                    @intCast((bg_color >> 8) & 0xFF),
-                                    @intCast(bg_color & 0xFF),
-                                    win_opacity,
-                                },
-                                .offset_y_fixed = 0,
-                                .window_id = cur_window_id,
-                            };
-                        } else if (hl_attr.blend > 0) {
-                            const blend_alpha = 255 - (@as(u16, hl_attr.blend) * 255 / 100);
-                            const inv_alpha = 255 - blend_alpha;
+                        // Write background cell — but SKIP the extra animation row.
+                        // The extra row occupies the margin/statusline screen position;
+                        // writing a non-zero offset there would corrupt the statusline bg.
+                        // Instead, the bg shader handles the partial reveal through the
+                        // offset on the last real inner row.
+                        if (!is_extra_anim_row) {
+                            // Floating windows: no scroll offset, use per-window opacity for fade animation.
+                            if (is_floating) {
+                                self.cells.bgCell(screen_y, screen_x).* = .{
+                                    .color = .{
+                                        @intCast((bg_color >> 16) & 0xFF),
+                                        @intCast((bg_color >> 8) & 0xFF),
+                                        @intCast(bg_color & 0xFF),
+                                        win_opacity,
+                                    },
+                                    .offset_y_fixed = 0,
+                                    .window_id = cur_window_id,
+                                };
+                            } else if (hl_attr.blend > 0) {
+                                const blend_alpha = 255 - (@as(u16, hl_attr.blend) * 255 / 100);
+                                const inv_alpha = 255 - blend_alpha;
 
-                            const cell_r: u16 = @intCast((bg_color >> 16) & 0xFF);
-                            const cell_g: u16 = @intCast((bg_color >> 8) & 0xFF);
-                            const cell_b: u16 = @intCast(bg_color & 0xFF);
-                            const def_r: u16 = @intCast((default_bg >> 16) & 0xFF);
-                            const def_g: u16 = @intCast((default_bg >> 8) & 0xFF);
-                            const def_b: u16 = @intCast(default_bg & 0xFF);
+                                const cell_r: u16 = @intCast((bg_color >> 16) & 0xFF);
+                                const cell_g: u16 = @intCast((bg_color >> 8) & 0xFF);
+                                const cell_b: u16 = @intCast(bg_color & 0xFF);
+                                const def_r: u16 = @intCast((default_bg >> 16) & 0xFF);
+                                const def_g: u16 = @intCast((default_bg >> 8) & 0xFF);
+                                const def_b: u16 = @intCast(default_bg & 0xFF);
 
-                            const final_r: u8 = @intCast((cell_r * blend_alpha + def_r * inv_alpha) / 255);
-                            const final_g: u8 = @intCast((cell_g * blend_alpha + def_g * inv_alpha) / 255);
-                            const final_b: u8 = @intCast((cell_b * blend_alpha + def_b * inv_alpha) / 255);
+                                const final_r: u8 = @intCast((cell_r * blend_alpha + def_r * inv_alpha) / 255);
+                                const final_g: u8 = @intCast((cell_g * blend_alpha + def_g * inv_alpha) / 255);
+                                const final_b: u8 = @intCast((cell_b * blend_alpha + def_b * inv_alpha) / 255);
 
-                            self.cells.bgCell(screen_y, screen_x).* = .{
-                                .color = .{ final_r, final_g, final_b, 255 },
-                                .offset_y_fixed = bg_offset_fixed,
-                                .window_id = cur_window_id,
-                            };
-                        } else {
-                            self.cells.bgCell(screen_y, screen_x).* = .{
-                                .color = .{
-                                    @intCast((bg_color >> 16) & 0xFF),
-                                    @intCast((bg_color >> 8) & 0xFF),
-                                    @intCast(bg_color & 0xFF),
-                                    255,
-                                },
-                                .offset_y_fixed = bg_offset_fixed,
-                                .window_id = cur_window_id,
-                            };
+                                self.cells.bgCell(screen_y, screen_x).* = .{
+                                    .color = .{ final_r, final_g, final_b, 255 },
+                                    .offset_y_fixed = bg_offset_fixed,
+                                    .window_id = cur_window_id,
+                                };
+                            } else {
+                                self.cells.bgCell(screen_y, screen_x).* = .{
+                                    .color = .{
+                                        @intCast((bg_color >> 16) & 0xFF),
+                                        @intCast((bg_color >> 8) & 0xFF),
+                                        @intCast(bg_color & 0xFF),
+                                        255,
+                                    },
+                                    .offset_y_fixed = bg_offset_fixed,
+                                    .window_id = cur_window_id,
+                                };
+                            }
                         }
 
-                        // Only render TEXT if this window owns this cell or can draw extra animation row
-                        if (owns_cell or can_draw_extra) {
+                        // Render TEXT: for owned cells and the extra animation row.
+                        // The fragment shader clips text that lands in fixed margin cells
+                        // (cells with offset_y=0), so extra row text won't bleed into
+                        // the statusline.
+                        if (owns_cell or is_extra_anim_row) {
                             if (grid_cell) |cell| {
                                 const text = cell.getText();
                                 if (text.len > 0) {
@@ -2762,6 +2818,374 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
         }
 
+        /// Render panel GUI content into the extended cell buffer columns.
+        /// The terminal grid occupies columns 0..term_cols.  The panel's
+        /// reserved gap area occupies columns term_cols..real_cols.
+        /// During slide animation the panel content may only partially fill
+        /// the gap — the rest is filled with the panel background color.
+        fn rebuildCellsFromPanel(self: *Self, panel: *panel_gui_mod.PanelGui) !void {
+            const rendered = panel.panel orelse return;
+
+            // Cell dimensions
+            const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
+            const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+            if (cell_w == 0 or cell_h == 0) return;
+
+            // Panel background color (Catppuccin Mocha Base)
+            const panel_bg: u32 = rendered.default_bg;
+            const panel_bg_r: u8 = @intCast((panel_bg >> 16) & 0xFF);
+            const panel_bg_g: u8 = @intCast((panel_bg >> 8) & 0xFF);
+            const panel_bg_b: u8 = @intCast(panel_bg & 0xFF);
+
+            // Determine the gap columns (extended area beyond the terminal grid).
+            // These columns exist because rebuildCells expanded the cell buffer
+            // to real_cols = term_cols + gap_cols.
+            // term_cols is the terminal's actual column count from terminal state.
+            const term_cols: u16 = self.terminal_state.cols;
+            const total_cols = self.cells.size.columns;
+            const total_rows = self.cells.size.rows;
+
+            // Fill the entire gap area with the panel background.
+            // This ensures a clean background during the slide animation
+            // before the panel content fills in.
+            if (total_cols > term_cols) {
+                var r: u16 = 0;
+                while (r < total_rows) : (r += 1) {
+                    var c: u16 = term_cols;
+                    while (c < total_cols) : (c += 1) {
+                        self.cells.bgCell(r, c).* = .{
+                            .color = .{ panel_bg_r, panel_bg_g, panel_bg_b, 255 },
+                            .offset_y_fixed = 0,
+                        };
+                    }
+                }
+            }
+
+            // Get the panel's pixel rectangle on the surface
+            const rect = panel.getPanelRect();
+
+            // Grid padding (top, right, bottom, left)
+            const pad_left = self.uniforms.grid_padding[3];
+            const pad_top = self.uniforms.grid_padding[0];
+
+            // Convert panel pixel rect to grid coordinates
+            // The grid starts at (pad_left, pad_top) in pixel space
+            const grid_start_col_f = (rect.x - pad_left) / cell_w;
+            const grid_start_row_f = (rect.y - pad_top) / cell_h;
+
+            // Clamp to valid grid range (all values must be >= 0 for u16)
+            const max_col: f32 = @floatFromInt(self.cells.size.columns);
+            const max_row: f32 = @floatFromInt(self.cells.size.rows);
+
+            const grid_start_col: u16 = @intFromFloat(@min(max_col, @max(0, @ceil(grid_start_col_f))));
+            const grid_start_row: u16 = @intFromFloat(@min(max_row, @max(0, @ceil(grid_start_row_f))));
+
+            const grid_end_col_f = (rect.x + rect.w - pad_left) / cell_w;
+            const grid_end_row_f = (rect.y + rect.h - pad_top) / cell_h;
+            const grid_end_col: u16 = @intFromFloat(@max(0, @min(
+                max_col,
+                @floor(grid_end_col_f),
+            )));
+            const grid_end_row: u16 = @intFromFloat(@max(0, @min(
+                max_row,
+                @floor(grid_end_row_f),
+            )));
+
+            if (grid_start_col >= grid_end_col or grid_start_row >= grid_end_row) return;
+
+            // Rounded corner radius in cell units
+            const corner_radius_px = panel.corner_radius;
+            const corner_r_cols: f32 = corner_radius_px / cell_w;
+            const corner_r_rows: f32 = corner_radius_px / cell_h;
+
+            const panel_cols: f32 = @floatFromInt(grid_end_col - grid_start_col);
+            const panel_rows: f32 = @floatFromInt(grid_end_row - grid_start_row);
+
+            // First pass: remove terminal fg glyphs that fall within the
+            // panel's column range.  We must NOT clear the entire row
+            // because that would destroy terminal text to the left/right
+            // of the panel.  Instead we filter each row's fg list in-place.
+            {
+                var row: u16 = grid_start_row;
+                while (row < grid_end_row) : (row += 1) {
+                    // fg_rows are indexed at y + 1 (index 0 is cursor)
+                    const list_idx: usize = @as(usize, row) + 1;
+                    if (list_idx >= self.cells.fg_rows.lists.len) continue;
+                    const list = &self.cells.fg_rows.lists[list_idx];
+
+                    // In-place removal: keep only cells outside panel columns
+                    var write: usize = 0;
+                    for (list.items) |item| {
+                        const cx = item.grid_pos[0];
+                        if (cx < grid_start_col or cx >= grid_end_col) {
+                            list.items[write] = item;
+                            write += 1;
+                        }
+                    }
+                    list.shrinkRetainingCapacity(write);
+                }
+            }
+
+            // Second pass: write bg + text cells
+            var screen_row: u16 = grid_start_row;
+            while (screen_row < grid_end_row) : (screen_row += 1) {
+                const panel_row: u32 = screen_row - grid_start_row;
+                if (panel_row >= rendered.rows) break;
+
+                const row_f: f32 = @floatFromInt(panel_row);
+
+                var screen_col: u16 = grid_start_col;
+                while (screen_col < grid_end_col) : (screen_col += 1) {
+                    const panel_col: u32 = screen_col - grid_start_col;
+                    if (panel_col >= rendered.cols) break;
+
+                    const col_f: f32 = @floatFromInt(panel_col);
+
+                    // ── Rounded corner check ──
+                    // For cells in the corner regions, check if they fall
+                    // outside the rounded rectangle and skip them (leave
+                    // the terminal content visible through the corners).
+                    const in_corner = self.isInRoundedCorner(
+                        col_f,
+                        row_f,
+                        panel_cols,
+                        panel_rows,
+                        corner_r_cols,
+                        corner_r_rows,
+                    );
+
+                    if (in_corner) {
+                        // Leave this cell transparent (terminal shows through)
+                        continue;
+                    }
+
+                    const cell = rendered.getCell(panel_row, panel_col);
+
+                    // Determine effective colors (handle reverse attribute)
+                    var eff_fg = cell.fg;
+                    var eff_bg = cell.bg;
+                    if (cell.reverse) {
+                        const tmp = eff_fg;
+                        eff_fg = eff_bg;
+                        eff_bg = tmp;
+                    }
+
+                    // Dim attribute: reduce fg brightness
+                    if (cell.dim) {
+                        const dim_r = @as(u32, (eff_fg >> 16) & 0xFF) / 2;
+                        const dim_g = @as(u32, (eff_fg >> 8) & 0xFF) / 2;
+                        const dim_b = @as(u32, eff_fg & 0xFF) / 2;
+                        eff_fg = (dim_r << 16) | (dim_g << 8) | dim_b;
+                    }
+
+                    // Write background cell - FULLY OPAQUE (alpha=255)
+                    self.cells.bgCell(screen_row, screen_col).* = .{
+                        .color = .{
+                            @intCast((eff_bg >> 16) & 0xFF),
+                            @intCast((eff_bg >> 8) & 0xFF),
+                            @intCast(eff_bg & 0xFF),
+                            255,
+                        },
+                        .offset_y_fixed = 0,
+                    };
+
+                    // Write text cell if there's content
+                    const text = cell.getText();
+                    if (text.len > 0) {
+                        self.addPanelGlyph(screen_col, screen_row, text, eff_fg, cell.bold, cell.italic, cell.underline) catch {};
+                    }
+                }
+            }
+
+            // Draw a 1-cell-wide border/separator along the panel's inner edge.
+            // Use a subtle Surface0 color to visually separate panel from terminal.
+            const border_color_r: u8 = 0x31; // Catppuccin Surface0
+            const border_color_g: u8 = 0x32;
+            const border_color_b: u8 = 0x44;
+
+            switch (panel.position) {
+                .right => {
+                    // Vertical border on the left edge of the panel
+                    var r: u16 = grid_start_row;
+                    while (r < grid_end_row) : (r += 1) {
+                        if (grid_start_col < self.cells.size.columns) {
+                            self.cells.bgCell(r, grid_start_col).* = .{
+                                .color = .{ border_color_r, border_color_g, border_color_b, 255 },
+                                .offset_y_fixed = 0,
+                            };
+                        }
+                    }
+                },
+                .left => {
+                    // Vertical border on the right edge of the panel
+                    const edge_col = grid_end_col -| 1;
+                    var r: u16 = grid_start_row;
+                    while (r < grid_end_row) : (r += 1) {
+                        if (edge_col < self.cells.size.columns) {
+                            self.cells.bgCell(r, edge_col).* = .{
+                                .color = .{ border_color_r, border_color_g, border_color_b, 255 },
+                                .offset_y_fixed = 0,
+                            };
+                        }
+                    }
+                },
+                .bottom => {
+                    // Horizontal border on the top edge
+                    if (grid_start_row < self.cells.size.rows) {
+                        var c: u16 = grid_start_col;
+                        while (c < grid_end_col) : (c += 1) {
+                            self.cells.bgCell(grid_start_row, c).* = .{
+                                .color = .{ border_color_r, border_color_g, border_color_b, 255 },
+                                .offset_y_fixed = 0,
+                            };
+                        }
+                    }
+                },
+                .top => {
+                    // Horizontal border on the bottom edge
+                    const edge_row = grid_end_row -| 1;
+                    if (edge_row < self.cells.size.rows) {
+                        var c: u16 = grid_start_col;
+                        while (c < grid_end_col) : (c += 1) {
+                            self.cells.bgCell(edge_row, c).* = .{
+                                .color = .{ border_color_r, border_color_g, border_color_b, 255 },
+                                .offset_y_fixed = 0,
+                            };
+                        }
+                    }
+                },
+            }
+        }
+
+        /// Check if a cell position falls outside the rounded corner arc.
+        /// Returns true if the cell should be clipped (corner region).
+        fn isInRoundedCorner(
+            self: *const Self,
+            col: f32,
+            row: f32,
+            panel_cols: f32,
+            panel_rows: f32,
+            radius_cols: f32,
+            radius_rows: f32,
+        ) bool {
+            _ = self;
+            if (radius_cols <= 0 or radius_rows <= 0) return false;
+
+            // Check each corner quadrant
+            // Top-left
+            if (col < radius_cols and row < radius_rows) {
+                const dx = (radius_cols - col - 0.5) / radius_cols;
+                const dy = (radius_rows - row - 0.5) / radius_rows;
+                if (dx * dx + dy * dy > 1.0) return true;
+            }
+            // Top-right
+            if (col >= panel_cols - radius_cols and row < radius_rows) {
+                const dx = (col - (panel_cols - radius_cols) + 0.5) / radius_cols;
+                const dy = (radius_rows - row - 0.5) / radius_rows;
+                if (dx * dx + dy * dy > 1.0) return true;
+            }
+            // Bottom-left
+            if (col < radius_cols and row >= panel_rows - radius_rows) {
+                const dx = (radius_cols - col - 0.5) / radius_cols;
+                const dy = (row - (panel_rows - radius_rows) + 0.5) / radius_rows;
+                if (dx * dx + dy * dy > 1.0) return true;
+            }
+            // Bottom-right
+            if (col >= panel_cols - radius_cols and row >= panel_rows - radius_rows) {
+                const dx = (col - (panel_cols - radius_cols) + 0.5) / radius_cols;
+                const dy = (row - (panel_rows - radius_rows) + 0.5) / radius_rows;
+                if (dx * dx + dy * dy > 1.0) return true;
+            }
+
+            return false;
+        }
+
+        /// Add a glyph from panel content to the GPU cell buffer.
+        /// Simplified version of addNeovimGlyph that works with panel Cell attributes.
+        fn addPanelGlyph(
+            self: *Self,
+            x: u16,
+            y: u16,
+            text: []const u8,
+            fg_color: u32,
+            bold: bool,
+            italic: bool,
+            underline: bool,
+        ) !void {
+            if (text.len == 0) return;
+
+            // Decode first UTF-8 codepoint
+            const seq_len = std.unicode.utf8ByteSequenceLength(text[0]) catch return;
+            if (text.len < seq_len) return;
+            const codepoint = std.unicode.utf8Decode(text[0..seq_len]) catch return;
+
+            // Skip spaces and null
+            if (codepoint == ' ' or codepoint == 0) return;
+
+            // Determine font style
+            const font_style: font.Style = if (bold and italic)
+                .bold_italic
+            else if (bold)
+                .bold
+            else if (italic)
+                .italic
+            else
+                .regular;
+
+            // Render the glyph
+            const render_result = self.font_grid.renderCodepoint(
+                self.alloc,
+                codepoint,
+                font_style,
+                null, // auto-detect presentation
+                .{
+                    .cell_width = 1,
+                    .grid_metrics = self.grid_metrics,
+                },
+            ) catch return;
+
+            const render = render_result orelse return;
+            if (render.glyph.width == 0 or render.glyph.height == 0) return;
+
+            // Add to cell buffer
+            try self.cells.add(self.alloc, .text, .{
+                .atlas = switch (render.presentation) {
+                    .emoji => .color,
+                    .text => .grayscale,
+                },
+                .grid_pos = .{ x, y },
+                .color = .{
+                    @intCast((fg_color >> 16) & 0xFF),
+                    @intCast((fg_color >> 8) & 0xFF),
+                    @intCast(fg_color & 0xFF),
+                    255,
+                },
+                .glyph_pos = .{
+                    render.glyph.atlas_x,
+                    render.glyph.atlas_y,
+                },
+                .glyph_size = .{
+                    render.glyph.width,
+                    render.glyph.height,
+                },
+                .bearings = .{
+                    @intCast(render.glyph.offset_x),
+                    @intCast(render.glyph.offset_y),
+                },
+                .pixel_offset_y = 0,
+            });
+
+            // Handle underline
+            if (underline) {
+                const ul_color = terminal.color.RGB{
+                    .r = @intCast((fg_color >> 16) & 0xFF),
+                    .g = @intCast((fg_color >> 8) & 0xFF),
+                    .b = @intCast(fg_color & 0xFF),
+                };
+                self.addUnderline(x, y, .single, ul_color, 255, 0) catch {};
+            }
+        }
+
         /// Draw the frame to the screen.
         ///
         /// If `sync` is true, this will synchronously block until
@@ -2850,38 +3274,26 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }
 
                     // Scroll animation (terminal mode only)
-                    // CriticallyDampedSpring with adaptive catchup (Neovide-style).
-                    // Both primary and TUI screens use the same spring approach
-                    // as the Neovim GUI for consistent, smooth scrolling.
+                    // CriticallyDampedSpring matching Neovide's implementation exactly.
+                    // Fixed animation_length per frame (no adaptive catchup — that breaks
+                    // the analytical solution's stability and causes overshoot/bounce).
                     if (is_terminal and self.scroll_animating) {
                         var any_scroll_anim = false;
+                        const scroll_len = self.config.scroll_animation_duration;
+                        // zeta: 1.0 = critically damped (no overshoot).
+                        // bounciness > 0 lowers zeta below 1.0 = underdamped (oscillation).
+                        const scroll_zeta = 1.0 - (self.config.scroll_animation_bounciness * 0.6);
 
                         // Primary screen: user scroll spring (position in lines)
                         if (self.user_scroll_spring.position != 0) {
-                            const base_length = self.config.scroll_animation_duration;
-                            // Adaptive catchup: shorten duration when far behind.
-                            // Matches Neovim GUI's animate() — prevents lag during
-                            // rapid scrolling (holding j/k, fast wheel, etc.).
-                            const scroll_dist = @abs(self.user_scroll_spring.position);
-                            const anim_length = if (scroll_dist > 1.0) blk: {
-                                const catchup_factor: f32 = 0.3;
-                                break :blk base_length / (1.0 + (scroll_dist - 1.0) * catchup_factor);
-                            } else base_length;
-                            // zeta=1.0 for critically damped (no oscillation)
-                            if (self.user_scroll_spring.update(dt, anim_length, 1.0)) {
+                            if (self.user_scroll_spring.update(dt, scroll_len, scroll_zeta)) {
                                 any_scroll_anim = true;
                             }
                         }
 
                         // Alternate screen (TUI): scroll spring (position in lines)
                         if (self.tui_scroll_spring.position != 0) {
-                            const base_length = self.config.scroll_animation_duration;
-                            const scroll_dist = @abs(self.tui_scroll_spring.position);
-                            const anim_length = if (scroll_dist > 1.0) blk: {
-                                const catchup_factor: f32 = 0.3;
-                                break :blk base_length / (1.0 + (scroll_dist - 1.0) * catchup_factor);
-                            } else base_length;
-                            if (self.tui_scroll_spring.update(dt, anim_length, 1.0)) {
+                            if (self.tui_scroll_spring.update(dt, scroll_len, scroll_zeta)) {
                                 any_scroll_anim = true;
                             }
                         }
@@ -2905,28 +3317,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             const alpha: u8 = @intFromFloat(@max(0, std.math.pow(f32, 1.0 - t, 2.0) * 220.0));
                             self.uniforms.sonicboom_color = .{ 255, 255, 255, alpha };
                         }
-                    }
-                }
-
-                // After all sub-steps, update terminal mode corner uniforms
-                if (is_terminal and self.cursor_animating) {
-                    const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
-                    const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
-                    const cursor_x = self.uniforms.cursor_pos[0];
-                    const cursor_y = self.uniforms.cursor_pos[1];
-                    if (cursor_x != std.math.maxInt(u16) and cursor_y != std.math.maxInt(u16)) {
-                        const cursor_row_offset = self.outputGlideOffsetForRow(@intCast(cursor_y));
-                        const scroll_off = self.uniforms.pixel_scroll_offset_y - cursor_row_offset;
-                        const floaty_pos = self.cursor_animation.getPosition();
-                        self.corner_cursor.destination = .{
-                            floaty_pos.x + cell_w * 0.5,
-                            floaty_pos.y + cell_h * 0.5,
-                        };
-                        const corners = self.corner_cursor.getCorners();
-                        self.uniforms.cursor_corner_tl = .{ corners[0][0], corners[0][1] - scroll_off };
-                        self.uniforms.cursor_corner_tr = .{ corners[1][0], corners[1][1] - scroll_off };
-                        self.uniforms.cursor_corner_br = .{ corners[2][0], corners[2][1] - scroll_off };
-                        self.uniforms.cursor_corner_bl = .{ corners[3][0], corners[3][1] - scroll_off };
                     }
                 }
             }
@@ -2991,6 +3381,29 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.uniforms.pixel_scroll_offset_y = @round(clamped_offset);
 
                     self.uniforms.tui_scroll_offset_y = 0;
+                }
+            }
+
+            // Update terminal cursor corners AFTER pixel_scroll_offset_y is set.
+            // Must run when cursor OR scroll is animating, because the cursor
+            // corners need to track the scroll offset even when the cursor itself
+            // isn't moving between cells.
+            if (self.nvim_gui == null and (self.cursor_animating or self.scroll_animating)) {
+                const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
+                const cursor_x = self.uniforms.cursor_pos[0];
+                const cursor_y = self.uniforms.cursor_pos[1];
+                if (cursor_x != std.math.maxInt(u16) and cursor_y != std.math.maxInt(u16)) {
+                    const scroll_off = self.uniforms.pixel_scroll_offset_y;
+                    const floaty_pos = self.cursor_animation.getPosition();
+                    self.corner_cursor.destination = .{
+                        floaty_pos.x + cell_w * 0.5,
+                        floaty_pos.y + cell_h * 0.5,
+                    };
+                    const corners = self.corner_cursor.getCorners();
+                    self.uniforms.cursor_corner_tl = .{ corners[0][0], corners[0][1] - scroll_off };
+                    self.uniforms.cursor_corner_tr = .{ corners[1][0], corners[1][1] - scroll_off };
+                    self.uniforms.cursor_corner_br = .{ corners[2][0], corners[2][1] - scroll_off };
+                    self.uniforms.cursor_corner_bl = .{ corners[3][0], corners[3][1] - scroll_off };
                 }
             }
 
@@ -3606,7 +4019,27 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 @floatFromInt(blank.bottom),
                 @floatFromInt(blank.left),
             };
-            self.uniforms.screen_size = .{
+            // When a panel is open, the terminal grid uses the effective
+            // (reduced) screen size, but we need the shader to cover the
+            // full viewport so the panel columns are rendered too.
+            // When a panel is open but real_screen_width hasn't propagated
+            // yet, derive it from the effective width + panel fraction.
+            self.uniforms.screen_size = if (self.real_screen_width > 0)
+                .{
+                    @floatFromInt(self.real_screen_width),
+                    @floatFromInt(self.real_screen_height),
+                }
+            else if (self.panel) |p| blk: {
+                if (p.slide.isOpen() and p.size_fraction < 1.0) {
+                    const eff_w: f32 = @floatFromInt(self.size.screen.width);
+                    const eff_h: f32 = @floatFromInt(self.size.screen.height);
+                    break :blk .{ eff_w / (1.0 - p.size_fraction), eff_h };
+                }
+                break :blk .{
+                    @floatFromInt(self.size.screen.width),
+                    @floatFromInt(self.size.screen.height),
+                };
+            } else .{
                 @floatFromInt(self.size.screen.width),
                 @floatFromInt(self.size.screen.height),
             };
@@ -3957,19 +4390,60 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 };
             } else null;
 
+            // When a panel is open (or animating closed), we need the cell
+            // buffer to be wider than the terminal grid so the panel can
+            // render in the gap area.  Compute extra columns from the
+            // panel's size_fraction and current slide progress — this is
+            // independent of self.size.screen which may have already
+            // snapped to full width on close.
+            const real_cols: u16 = if (self.panel) |p| blk: {
+                if (!p.isVisible() and !p.slide.isOpen()) break :blk state.cols;
+                const cell_w: u32 = self.grid_metrics.cell_width;
+                if (cell_w == 0) break :blk state.cols;
+
+                // Determine the full (unreduced) screen width.  The surface
+                // forwards this via renderer state, but on the very first frame
+                // after panel open it may still be 0 or match the already-reduced
+                // effective width.  In that case, derive it from the effective
+                // width and the panel's size_fraction:
+                //   effective = real * (1 - frac)  →  real = effective / (1 - frac)
+                const effective_w: f32 = @floatFromInt(self.size.screen.width);
+                const real_w: f32 = if (self.real_screen_width > 0)
+                    @floatFromInt(self.real_screen_width)
+                else if (p.size_fraction < 1.0)
+                    effective_w / (1.0 - p.size_fraction)
+                else
+                    effective_w;
+
+                // When opening (target=1), allocate the full panel width
+                // immediately so the first frame isn't black. Only use
+                // animated progress during the closing animation.
+                const progress = if (p.slide.isOpen()) @as(f32, 1.0) else p.slide.progress;
+                const panel_px: u32 = @intFromFloat(
+                    real_w * p.size_fraction * progress,
+                );
+                if (panel_px == 0) break :blk state.cols;
+                const extra_cols: u16 = @intCast(@min(
+                    (panel_px + cell_w - 1) / cell_w, // ceiling division
+                    std.math.maxInt(u16) - state.cols,
+                ));
+                break :blk state.cols +| extra_cols;
+            } else state.cols;
+
             const grid_size_diff =
                 self.cells.size.rows != state.rows or
-                self.cells.size.columns != state.cols;
+                self.cells.size.columns != real_cols;
 
             if (grid_size_diff) {
                 var new_size = self.cells.size;
                 new_size.rows = state.rows;
-                new_size.columns = state.cols;
+                new_size.columns = real_cols;
                 try self.cells.resize(self.alloc, new_size);
 
-                // Update our uniforms accordingly, otherwise
-                // our background cells will be out of place.
-                self.uniforms.grid_size = .{ new_size.columns, new_size.rows };
+                // The grid_size uniform tells the shader how many cells to
+                // draw.  We use the full (terminal + panel) column count so
+                // the panel columns are included in the render.
+                self.uniforms.grid_size = .{ real_cols, new_size.rows };
             }
 
             const rebuild = state.dirty == .full or grid_size_diff;
@@ -3979,7 +4453,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // We also reset our padding extension depending on the screen type
                 switch (self.config.padding_color) {
-                    .background => {},
+                    .background => {
+                        // Pixel scroll has extra rows that the padding area would
+                        // map into. Force extend so the shader can clamp to the
+                        // visible edge row instead of showing black.
+                        if (self.config.pixel_scroll) {
+                            self.uniforms.padding_extend = .{
+                                .up = true,
+                                .down = true,
+                                .left = true,
+                                .right = true,
+                            };
+                        }
+                    },
 
                     // For extension, assume we are extending in all directions.
                     // For "extend" this may be disabled due to heuristics below.

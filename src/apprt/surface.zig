@@ -111,6 +111,9 @@ pub const Message = union(enum) {
     /// Enter Neovim GUI mode (triggered by OSC 1338)
     enter_neovim_gui: void,
 
+    /// Toggle panel GUI (triggered by OSC 1339)
+    toggle_panel_gui: void,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 

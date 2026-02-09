@@ -562,6 +562,7 @@ pub const Config = struct {
     env_override: configpkg.RepeatableStringMap = .{},
     shell_integration: configpkg.Config.ShellIntegration = .detect,
     shell_integration_features: configpkg.Config.ShellIntegrationFeatures = .{},
+    neovim_gui_alias: []const u8 = "nvim-gui",
     working_directory: ?[]const u8 = null,
     resources_dir: ?[]const u8,
     term: []const u8,
@@ -756,6 +757,12 @@ const Subprocess = struct {
                 &env,
                 cfg.shell_integration_features,
             );
+
+            // Pass the neovim-gui alias name to shell integration.
+            // Empty string = don't create any alias.
+            if (cfg.neovim_gui_alias.len > 0) {
+                try env.put("GHOSTTY_NVIM_GUI_ALIAS", cfg.neovim_gui_alias);
+            }
 
             const force: ?shell_integration.Shell = switch (cfg.shell_integration) {
                 .none => {

@@ -22,7 +22,9 @@ const imagepkg = @import("image.zig");
 const ImageState = imagepkg.State;
 const shadertoy = @import("shadertoy.zig");
 const animation = @import("../animation.zig");
+const gui_protocol = @import("../gui_protocol.zig");
 const neovim_gui = @import("../neovim_gui/main.zig");
+const nvim_adapter = @import("../neovim_gui/gui_adapter.zig");
 const panel_gui_mod = @import("../panel_gui/main.zig");
 const assert = @import("../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
@@ -216,7 +218,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         last_cursor_scroll_pos: f32 = 0,
 
         /// Last cursor shape (for detecting shape changes)
-        last_cursor_shape: ?neovim_gui.CursorShape = null,
+        last_cursor_shape: ?gui_protocol.CursorShape = null,
 
         /// Whether cursor animation is currently active (needs continuous render)
         cursor_animating: bool = false,
@@ -294,6 +296,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Neovim GUI mode state. When set, the renderer reads from Neovim
         /// windows instead of terminal_state.
         nvim_gui: ?*neovim_gui.NeovimGui = null,
+
+        /// Scratch buffers for the neovim→gui adapter. Reused across frames.
+        nvim_adapter_state: nvim_adapter.AdapterState = .{},
 
         /// Panel GUI state. When set, the renderer composites the panel
         /// alongside the terminal content.
@@ -918,6 +923,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         pub fn deinit(self: *Self) void {
             if (self.overlay) |*overlay| overlay.deinit(self.alloc);
+            self.nvim_adapter_state.deinit(self.alloc);
             self.terminal_state.deinit(self.alloc);
             if (self.search_selected_match) |*m| m.arena.deinit();
             if (self.search_matches) |*m| m.arena.deinit();
@@ -1884,7 +1890,34 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const needs_rebuild = content_dirty or scroll_dirty;
 
             if (needs_rebuild) {
-                try self.rebuildCellsFromNeovim(nvim);
+                // Build generic GuiState via the adapter, then render.
+                nvim_adapter.setFrameNvim(nvim);
+                const gui_state = nvim_adapter.buildGuiState(
+                    nvim,
+                    &self.nvim_adapter_state,
+                    self.alloc,
+                    @floatFromInt(self.grid_metrics.cell_height),
+                    self.config.neovim_corner_radius,
+                    self.config.neovim_gap_color,
+                    @floatCast(self.config.background_opacity),
+                ) catch {
+                    return;
+                };
+
+                // Handle the case where the adapter found no windows
+                // (grid 1 doesn't exist yet) — need to set grid size from nvim fallback.
+                if (gui_state.windows.len == 0) {
+                    const nr: u16 = @intCast(nvim.grid_height);
+                    const nc: u16 = @intCast(nvim.grid_width);
+                    if (nr > 0 and nc > 0) {
+                        if (self.cells.size.rows != nr or self.cells.size.columns != nc) {
+                            try self.cells.resize(self.alloc, .{ .rows = nr, .columns = nc });
+                            self.uniforms.grid_size = .{ nc, nr };
+                        }
+                    }
+                } else {
+                    try self.rebuildCellsFromGui(gui_state);
+                }
                 self.cells_rebuilt = true;
             }
 
@@ -1910,32 +1943,19 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.font_shaper.endFrame();
         }
 
-        /// Rebuild GPU cells from Neovim window content.
-        fn rebuildCellsFromNeovim(self: *Self, nvim: *neovim_gui.NeovimGui) !void {
-            // Reset all cells
+        /// Rebuild GPU cells from a GuiState (produced by any backend adapter).
+        /// This is the generic version — no backend-specific types appear here.
+        fn rebuildCellsFromGui(self: *Self, state: gui_protocol.GuiState) !void {
             self.cells.reset();
 
-            // Use grid 1's actual size (what Neovim has responded with), not the requested size.
-            // During rapid resize (e.g., hy3 animations), the requested size may differ from
-            // what Neovim has actually configured, causing rendering mismatches.
-            const grid1 = nvim.windows.get(1) orelse {
-                // Fall back to requested size if grid 1 doesn't exist yet
-                const rows: u16 = @intCast(nvim.grid_height);
-                const cols: u16 = @intCast(nvim.grid_width);
-                log.debug("rebuildCellsFromNeovim: no grid1, using requested size {}x{}", .{ cols, rows });
-                if (rows == 0 or cols == 0) return;
-                if (self.cells.size.rows != rows or self.cells.size.columns != cols) {
-                    try self.cells.resize(self.alloc, .{ .rows = rows, .columns = cols });
-                    self.uniforms.grid_size = .{ cols, rows };
-                }
-                return; // No windows to render yet
-            };
+            const windows = state.windows;
+            if (windows.len == 0) return;
 
-            const rows: u16 = @intCast(grid1.grid_height);
-            const cols: u16 = @intCast(grid1.grid_width);
-
-            log.debug("rebuildCellsFromNeovim: grid1 size={}x{}, needs_content={}", .{ cols, rows, grid1.needs_content });
-
+            // Grid size comes from the first root window (grid 1 equivalent).
+            // The adapter guarantees roots come first.
+            const grid1 = windows[0];
+            const rows: u16 = @intCast(grid1.render_height);
+            const cols: u16 = @intCast(grid1.render_width);
             if (rows == 0 or cols == 0) return;
 
             if (self.cells.size.rows != rows or self.cells.size.columns != cols) {
@@ -1943,12 +1963,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.uniforms.grid_size = .{ cols, rows };
             }
 
-            // Get default colors from Neovim
-            const default_fg = nvim.default_foreground;
-            const default_bg = nvim.default_background;
+            const default_bg = state.config.default_bg;
 
-            // Fill entire grid with default background color first
-            // This ensures no gaps even if Neovim windows don't cover everything
+            // Fill grid with default bg.
             const bg_r: u8 = @intCast((default_bg >> 16) & 0xFF);
             const bg_g: u8 = @intCast((default_bg >> 8) & 0xFF);
             const bg_b: u8 = @intCast(default_bg & 0xFF);
@@ -1961,808 +1978,410 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            // Partition windows into root (non-floating) and floating, like Neovide does
-            // Root windows render first, then floating windows sorted by z-index on top
-            var root_windows = std.ArrayListUnmanaged(*neovim_gui.RenderedWindow){};
-            defer root_windows.deinit(self.alloc);
-            var floating_windows = std.ArrayListUnmanaged(*neovim_gui.RenderedWindow){};
-            defer floating_windows.deinit(self.alloc);
-
-            var skipped_needs_content: u32 = 0;
-            var window_iter = nvim.windows.valueIterator();
-            while (window_iter.next()) |window_ptr| {
-                const window = window_ptr.*;
-                if (window.hidden or !window.valid) continue;
-                if (window.opacity <= 0.0) continue; // Fully transparent (fade-out complete)
-                if (window.grid_height == 0 or window.grid_width == 0) continue;
-                // Skip windows that haven't received a win_pos yet (except grid 1 which is the outer container)
-                // This prevents rendering grids like the cmdline grid at wrong positions
-                if (!window.has_position and window.id != 1) continue;
-                // Skip windows that were just resized and haven't received content yet
-                // This prevents black flashes during rapid resize (e.g., hy3 animations)
-                if (window.needs_content) {
-                    skipped_needs_content += 1;
-                    continue;
-                }
-
-                // Skip windows that have no content buffer (actual_lines not initialized)
-                // This happens when win_float_pos arrives before grid_resize
-                // Previously we allowed floating windows through, but they render empty without actual_lines
-                if (window.actual_lines == null) continue;
-
-                // Skip windows that have no size yet (grid_resize hasn't arrived or set 0 size)
-                // This prevents rendering 0x0 windows
-                if (window.grid_width == 0 or window.grid_height == 0) {
-                    continue;
-                }
-
-                // Determine if this is a floating/message window
-                const is_message_or_float = window.zindex > 0 or window.window_type == .floating or window.window_type == .message;
-
-                // Partition: floating windows have zindex > 0 or are explicitly floating/message type
-                const is_floating = is_message_or_float;
-                if (is_floating) {
-                    floating_windows.append(self.alloc, window) catch continue;
-                } else {
-                    root_windows.append(self.alloc, window) catch continue;
-                }
-            }
-
-            // Sort floating windows by z-index then composition order (lower first, so higher renders on top)
-            std.mem.sort(*neovim_gui.RenderedWindow, floating_windows.items, {}, struct {
-                fn lessThan(_: void, a: *neovim_gui.RenderedWindow, b: *neovim_gui.RenderedWindow) bool {
-                    if (a.zindex == b.zindex) {
-                        if (a.composition_order == b.composition_order) {
-                            return a.id < b.id;
-                        }
-                        return a.composition_order < b.composition_order;
-                    }
-                    return a.zindex < b.zindex;
-                }
-            }.lessThan);
-
-            // Get cell height for scroll offset calculation
             const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+            const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
+            const pad_left = self.uniforms.grid_padding[3];
+            const pad_top = self.uniforms.grid_padding[0];
 
-            // Build final render order: root windows first (by grid id), then floating windows (by zindex)
-            var windows_to_render = std.ArrayListUnmanaged(*neovim_gui.RenderedWindow){};
-            defer windows_to_render.deinit(self.alloc);
-
-            // Add root windows first (sorted by grid id for stability)
-            std.mem.sort(*neovim_gui.RenderedWindow, root_windows.items, {}, struct {
-                fn lessThan(_: void, a: *neovim_gui.RenderedWindow, b: *neovim_gui.RenderedWindow) bool {
-                    return a.id < b.id;
-                }
-            }.lessThan);
-            for (root_windows.items) |w| {
-                windows_to_render.append(self.alloc, w) catch continue;
-            }
-
-            // Add floating windows on top (already sorted by zindex)
-            for (floating_windows.items) |w| {
-                windows_to_render.append(self.alloc, w) catch continue;
-            }
-
-            log.debug("rebuildCellsFromNeovim: rendering {} root + {} floating = {} total (skipped {} needs_content)", .{
-                root_windows.items.len,
-                floating_windows.items.len,
-                windows_to_render.items.len,
-                skipped_needs_content,
-            });
-            // Debug: log which windows are being rendered
-            for (root_windows.items) |w| {
-                log.debug("  root window: grid={} pos=({},{}) size={}x{} display={}x{} margins=({},{},{},{})", .{
-                    w.id,
-                    @as(i32, @intFromFloat(w.grid_position[0])),
-                    @as(i32, @intFromFloat(w.grid_position[1])),
-                    w.grid_width,
-                    w.grid_height,
-                    w.display_width,
-                    w.display_height,
-                    w.viewport_margins.top,
-                    w.viewport_margins.bottom,
-                    w.viewport_margins.left,
-                    w.viewport_margins.right,
-                });
-            }
-            for (floating_windows.items) |w| {
-                log.debug("  floating window: grid={} pos=({},{}) size={}x{} zindex={} compindex={} type={s} has_lines={}", .{
-                    w.id,
-                    @as(i32, @intFromFloat(w.grid_position[0])),
-                    @as(i32, @intFromFloat(w.grid_position[1])),
-                    w.grid_width,
-                    w.grid_height,
-                    w.zindex,
-                    w.composition_order,
-                    @tagName(w.window_type),
-                    w.actual_lines != null,
-                });
-            }
-
-            // Track which window ids are floating/message for occlusion decisions
+            // Track floating window ids for occlusion.
             var floating_ids = std.AutoHashMap(u64, void).init(self.alloc);
             defer floating_ids.deinit();
-            for (windows_to_render.items) |w| {
-                const is_floating = w.zindex > 0 or w.window_type == .floating or w.window_type == .message;
-                if (is_floating) {
-                    floating_ids.put(w.id, {}) catch {};
-                }
+            for (windows) |w| {
+                if (w.window_type != .root) floating_ids.put(w.id, {}) catch {};
             }
 
-            // Build window rect array for SDF rounded corners
-            // Each window gets an index (1-based, max 16). The shader uses these
-            // to compute SDF distance to the rounded rect boundary.
-            const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
-            const pad_left = self.uniforms.grid_padding[3]; // grid_padding: top, right, bottom, left
-            const pad_top = self.uniforms.grid_padding[0];
+            // SDF rounded corner rects (max 16 windows).
             var window_id_map = std.AutoHashMap(u64, u8).init(self.alloc);
             defer window_id_map.deinit();
-            var next_window_id: u8 = 1;
+            var next_wid: u8 = 1;
 
-            // Set config uniforms
-            self.uniforms.corner_radius = self.config.neovim_corner_radius;
-            // Use the actual Neovim default background as gap color so the
-            // SDF rounding blends seamlessly into the background
-            self.uniforms.gap_color = .{
-                @intCast((default_bg >> 16) & 0xFF),
-                @intCast((default_bg >> 8) & 0xFF),
-                @intCast(default_bg & 0xFF),
-                0xFF,
-            };
+            self.uniforms.corner_radius = state.config.corner_radius;
+            self.uniforms.gap_color = .{ state.config.gap_color[0], state.config.gap_color[1], state.config.gap_color[2], 0xFF };
             self.uniforms.matte_intensity = self.config.matte_rendering;
             self.uniforms.text_gamma = self.config.text_gamma;
             self.uniforms.text_contrast = self.config.text_contrast;
 
-            for (windows_to_render.items) |w| {
-                if (next_window_id > 16) break;
-
-                const win_col_f: f32 = w.grid_position[0];
-                const win_row_f: f32 = w.grid_position[1];
-                const rw: f32 = @floatFromInt(w.getRenderWidth());
-                const rh: f32 = @floatFromInt(w.getRenderHeight());
-
-                // Convert grid coords to pixel coords
-                const px_x = pad_left + win_col_f * cell_w;
-                const px_y = pad_top + win_row_f * cell_h;
-                const px_w = rw * cell_w;
-                const px_h = rh * cell_h;
-
-                const wid = next_window_id;
-                window_id_map.put(w.id, wid) catch {};
-                self.uniforms.window_rects[wid - 1] = .{ px_x, px_y, px_w, px_h };
-                next_window_id += 1;
+            for (windows) |w| {
+                if (next_wid > 16) break;
+                const rw: f32 = @floatFromInt(w.render_width);
+                const rh: f32 = @floatFromInt(w.render_height);
+                const px_x = pad_left + w.grid_col * cell_w;
+                const px_y = pad_top + w.grid_row * cell_h;
+                window_id_map.put(w.id, next_wid) catch {};
+                self.uniforms.window_rects[next_wid - 1] = .{ px_x, px_y, rw * cell_w, rh * cell_h };
+                next_wid += 1;
             }
-            self.uniforms.window_rect_count = next_window_id - 1;
+            self.uniforms.window_rect_count = next_wid - 1;
 
-            // RENDERING STRATEGY:
-            //
-            // We use painter's algorithm (back to front) for BACKGROUNDS but need occlusion for TEXT.
-            //
-            // Why? Backgrounds can be overwritten by later windows (floating paints over root).
-            // But TEXT is added to a vertex buffer - if we add root window text first, it stays
-            // in the buffer even after floating window backgrounds are drawn, causing bleed-through.
-            //
-            // So:
-            // - BACKGROUNDS: Always render (painter's algorithm - later windows overwrite)
-            // - TEXT: Use occlusion map to prevent root window text under floating windows
-            //
-            // For message windows (noice.nvim), skip empty cells entirely to let statusline show.
-
-            // Build occlusion map for TEXT rendering only
-            // This prevents root window text from appearing under floating windows
+            // Occlusion map: prevents root text from bleeding through float backgrounds.
+            // Backgrounds use painter's algorithm (just overwrite). Text needs this gate.
             var occlusion_map = try self.alloc.alloc(u64, rows * cols);
             defer self.alloc.free(occlusion_map);
             @memset(occlusion_map, 0);
 
-            // Claim cells from highest z-index to lowest
-            // For text rendering, we need to account for viewport margins
-            // Margins (borders, winbar, statusline) only have backgrounds, not text content
-            // So they shouldn't block text from windows below them
-            var i: usize = windows_to_render.items.len;
+            // Claim cells highest-z first. Margin cells are skipped (they only carry bg).
+            // Message windows only claim cells with actual content.
+            var i: usize = windows.len;
             while (i > 0) {
                 i -= 1;
-                const window = windows_to_render.items[i];
-                const win_col: u16 = @intFromFloat(window.grid_position[0]);
-                const win_row: u16 = @intFromFloat(window.grid_position[1]);
-                const is_message = window.window_type == .message;
-
-                // Use render dimensions (from win_pos) to avoid artifacts during resize
-                const render_width = window.getRenderWidth();
-                const render_height = window.getRenderHeight();
-
-                // Get margins for this window to skip border/margin cells in occlusion
-                const margin_top = window.viewport_margins.top;
-                const margin_bottom = window.viewport_margins.bottom;
-                const margin_left = window.viewport_margins.left;
-                const margin_right = window.viewport_margins.right;
-
+                const w = windows[i];
+                const wc: u16 = @intFromFloat(w.grid_col);
+                const wr: u16 = @intFromFloat(w.grid_row);
+                const is_msg = w.window_type == .message;
                 var py: u32 = 0;
-                while (py < render_height) : (py += 1) {
+                while (py < w.render_height) : (py += 1) {
                     var px: u32 = 0;
-                    while (px < render_width) : (px += 1) {
-                        const sy = @as(u16, @intCast(py)) + win_row;
-                        const sx = @as(u16, @intCast(px)) + win_col;
-                        if (sy < rows and sx < cols) {
-                            if (occlusion_map[sy * cols + sx] == 0) {
-                                // Skip margin rows - they only have backgrounds, no text
-                                // This prevents floating window borders from blocking text below
-                                const is_margin_row = py < margin_top or py >= (render_height -| margin_bottom);
-                                const is_margin_col = px < margin_left or px >= (render_width -| margin_right);
-                                if (is_margin_row or is_margin_col) continue;
-
-                                // Message windows only claim cells with actual content
-                                if (is_message) {
-                                    const cell = window.getCell(py, px);
-                                    if (cell) |c| {
-                                        const text = c.getText();
-                                        if (text.len > 0 and text[0] != ' ' and text[0] != 0) {
-                                            occlusion_map[sy * cols + sx] = window.id;
-                                        }
-                                    }
-                                } else {
-                                    occlusion_map[sy * cols + sx] = window.id;
-                                }
+                    while (px < w.render_width) : (px += 1) {
+                        const sy = @as(u16, @intCast(py)) + wr;
+                        const sx = @as(u16, @intCast(px)) + wc;
+                        if (sy >= rows or sx >= cols) continue;
+                        if (occlusion_map[sy * cols + sx] != 0) continue;
+                        if (py < w.margin_top or py >= (w.render_height -| w.margin_bottom)) continue;
+                        if (is_msg) {
+                            if (w.getCell(w.ctx, py, px)) |cell| {
+                                const t = cell.getText();
+                                if (t.len > 0 and t[0] != ' ' and t[0] != 0)
+                                    occlusion_map[sy * cols + sx] = w.id;
                             }
+                        } else {
+                            occlusion_map[sy * cols + sx] = w.id;
                         }
                     }
                 }
             }
 
-            // Process each Neovim window in z-order (root windows first, then floating)
-            for (windows_to_render.items) |window| {
-                // Get window position offset
-                const win_col: u16 = @intFromFloat(window.grid_position[0]);
-                const win_row: u16 = @intFromFloat(window.grid_position[1]);
-
-                // Window ID for SDF rounding (0 = no rounding)
-                const cur_window_id: u8 = window_id_map.get(window.id) orelse 0;
-
-                // Use render dimensions (from win_pos) to avoid artifacts during resize
-                // win_pos arrives before grid_resize, so these may be smaller than grid dimensions
-                const render_width = window.getRenderWidth();
-                const render_height = window.getRenderHeight();
-
-                // Check if this is a floating window (includes message windows like NOICE command bar)
-                const is_floating = window.zindex > 0 or window.window_type == .floating or window.window_type == .message;
-                const is_message_window = window.window_type == .message;
-
-                // Per-window opacity for fade-in/fade-out animation (0.0 = invisible, 1.0 = opaque)
+            // Render each window in order (painter's for bg, occlusion-gated for text).
+            for (windows) |window| {
+                const win_col: u16 = @intFromFloat(window.grid_col);
+                const win_row: u16 = @intFromFloat(window.grid_row);
+                const cur_wid: u8 = window_id_map.get(window.id) orelse 0;
+                const render_width = window.render_width;
+                const render_height = window.render_height;
+                const is_float = window.window_type != .root;
+                const is_msg = window.window_type == .message;
                 const win_opacity: u8 = @intFromFloat(std.math.clamp(window.opacity * 255.0, 0.0, 255.0));
+                const scroll_offset = window.scroll_pixel_offset;
+                const bg_offset_fixed: i16 = @intFromFloat(std.math.clamp(scroll_offset * 256.0, -32768.0, 32767.0));
+                const is_scrolling = (window.has_scroll_animation and window.scroll_raw_offset != 0);
+                const inner_size = render_height -| window.margin_top -| window.margin_bottom;
 
-                // Get per-window scroll offset in pixels for smooth scrolling
-                // Only editor windows use scrollback-based smooth scroll.
-                // Floating windows get entirely new content from Neovim on each update,
-                // so scrollback rotation doesn't work for them (causes black rows).
-                const has_valid_scrollback = if (!is_floating) window.hasValidScrollbackData() else false;
-
-                // Neovide-style scroll offset computation:
-                //
-                //   raw_offset  = the sub-pixel float from the spring (for deciding
-                //                 whether animation is active / extra row needed)
-                //   scroll_pixel_offset = round(raw_offset) — the whole-pixel value
-                //                 that BOTH text and bg cells use (eliminates shimmer)
-                //
-                // The raw offset drives "is animation happening?" and "do we need an
-                // extra row?", while the rounded offset is what actually goes to the
-                // GPU.  This keeps motion smooth (sub-pixel spring drives scrollback
-                // line selection) while keeping text crisp (whole-pixel shift).
-                const raw_scroll_offset: f32 = if (has_valid_scrollback)
-                    window.getSubLineOffset(cell_h)
-                else
-                    0;
-                const scroll_pixel_offset: f32 = @round(raw_scroll_offset);
-
-                // If rounding pushed us to a full cell height, the scrollback line
-                // lookup already advanced past this boundary via floor(), so the
-                // effective pixel offset wraps back to 0.  This keeps the rounded
-                // offset consistent with the line selection.
-                // (In practice this only fires when raw is very close to ±cell_h.)
-
-                const margin_top = window.viewport_margins.top;
-                const margin_bottom = window.viewport_margins.bottom;
-                const inner_size = render_height -| margin_top -| margin_bottom;
-
-                // Render top margin rows (winbar etc) - no scroll
-                // Margin rows use painter's algorithm (no occlusion check) because:
-                // 1. They're excluded from the occlusion map build
-                // 2. Grid 1's interior rows occupy the same screen space but should be
-                //    overwritten by child windows' margin rows (winbar/statusline)
-                // 3. Windows render in z-order (grid 1 first), so later windows correctly
-                //    overpaint both background AND text
+                // --- Top margin (winbar etc) — no scroll, no occlusion ---
                 var row: u32 = 0;
-                while (row < margin_top) : (row += 1) {
+                while (row < window.margin_top) : (row += 1) {
                     var col: u32 = 0;
                     while (col < render_width) : (col += 1) {
-                        const screen_y = @as(u16, @intCast(row)) + win_row;
-                        const screen_x = @as(u16, @intCast(col)) + win_col;
-                        if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
-
-                        const grid_cell = window.getCell(row, col);
-                        const hl_id: u64 = if (grid_cell) |c| c.hl_id else 0;
-                        const hl_attr = if (is_floating) nvim.getHlAttr(hl_id) else nvim.getHlAttr(hl_id);
-
-                        var fg_color = hl_attr.foreground.?;
-                        var bg_color = hl_attr.background.?;
-                        if (hl_attr.reverse) {
-                            const tmp = fg_color;
-                            fg_color = bg_color;
-                            bg_color = tmp;
-                        }
-
-                        // Background: always paint (painter's algorithm)
-                        self.cells.bgCell(screen_y, screen_x).* = .{
-                            .color = .{
-                                @intCast((bg_color >> 16) & 0xFF),
-                                @intCast((bg_color >> 8) & 0xFF),
-                                @intCast(bg_color & 0xFF),
-                                win_opacity,
-                            },
-                            .offset_y_fixed = 0, // Margins don't scroll
-                            .window_id = cur_window_id,
-                        };
-
-                        // Text: always render (no occlusion check for margin rows)
-                        if (grid_cell) |cell| {
+                        const sy = @as(u16, @intCast(row)) + win_row;
+                        const sx = @as(u16, @intCast(col)) + win_col;
+                        if (sy >= self.cells.size.rows or sx >= self.cells.size.columns) continue;
+                        const maybe_cell = window.getCell(window.ctx, row, col);
+                        if (maybe_cell) |cell| {
+                            var fg = cell.style.fg;
+                            var bg = cell.style.bg;
+                            if (cell.style.reverse) {
+                                const t = fg;
+                                fg = bg;
+                                bg = t;
+                            }
+                            self.cells.bgCell(sy, sx).* = .{
+                                .color = .{ @intCast((bg >> 16) & 0xFF), @intCast((bg >> 8) & 0xFF), @intCast(bg & 0xFF), win_opacity },
+                                .offset_y_fixed = 0,
+                                .window_id = cur_wid,
+                            };
                             const text = cell.getText();
-                            if (text.len > 0) self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, 0) catch {};
+                            if (text.len > 0) self.addGuiGlyph(sx, sy, text, fg, cell.style, 0) catch {};
+                        } else {
+                            // Null cell: write default bg with window_id for SDF rounding.
+                            self.cells.bgCell(sy, sx).* = .{
+                                .color = .{ bg_r, bg_g, bg_b, win_opacity },
+                                .offset_y_fixed = 0,
+                                .window_id = cur_wid,
+                            };
                         }
                     }
                 }
 
-                // Render scrollable region.
-                // During scroll animation, render inner_size + 1 rows (0..=inner_size),
-                // matching Neovide's iter_scrollable_lines. The extra row at the bottom
-                // holds content that's partially visible as it scrolls in/out of view.
-                // The floor-based scrollback lookup (in getScrollbackCellByInnerRow)
-                // determines WHICH content each row shows, while the sub-pixel offset
-                // shifts all rows uniformly upward within the clipped region.
-                // Use RAW (pre-round) offset to decide whether animation is active.
-                const bg_offset_fixed: i16 = @intFromFloat(std.math.clamp(scroll_pixel_offset * 256.0, -32768.0, 32767.0));
-                const is_scroll_animating = (!is_floating and has_valid_scrollback and raw_scroll_offset != 0);
-                const render_extra_row = is_scroll_animating;
-                const render_rows = if (render_extra_row) inner_size + 1 else inner_size;
+                // --- Scrollable inner region ---
+                const render_rows = if (is_scrolling) inner_size + 1 else inner_size;
                 var inner_row: u32 = 0;
                 while (inner_row < render_rows) : (inner_row += 1) {
                     var col: u32 = 0;
                     while (col < render_width) : (col += 1) {
-                        // Screen position: margin_top + inner_row
-                        const screen_row = margin_top + inner_row;
-                        const screen_y = @as(u16, @intCast(screen_row)) + win_row;
-                        const screen_x = @as(u16, @intCast(col)) + win_col;
+                        const screen_row_idx = window.margin_top + inner_row;
+                        const sy = @as(u16, @intCast(screen_row_idx)) + win_row;
+                        const sx = @as(u16, @intCast(col)) + win_col;
+                        if (sy >= self.cells.size.rows or sx >= self.cells.size.columns) continue;
 
-                        if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
-
-                        // Check if this window owns this cell for TEXT rendering
-                        const owner = occlusion_map[screen_y * cols + screen_x];
+                        const owner = occlusion_map[sy * cols + sx];
                         var owns_cell = owner == window.id;
-                        if (is_floating and !owns_cell) {
-                            if (owner == 0 or !floating_ids.contains(owner)) {
-                                owns_cell = true;
-                            }
+                        if (is_float and !owns_cell) {
+                            if (owner == 0 or !floating_ids.contains(owner)) owns_cell = true;
                         }
 
-                        // Extra animation row: render content that's partially scrolling
-                        // into view. Skip bg write (to avoid polluting margin/statusline
-                        // cells with non-zero offset). Text is clipped by the fragment shader.
-                        const is_extra_anim_row = (render_extra_row and inner_row == inner_size);
+                        const is_extra = (is_scrolling and inner_row == inner_size);
+                        if (is_msg and !owns_cell and !is_extra) continue;
 
-                        // For message windows, skip cells we don't own (empty cells)
-                        if (is_message_window and !owns_cell and !is_extra_anim_row) continue;
-
-                        // Read from scrollback for smooth scroll animation (editor windows only),
-                        // or actual_lines for floating windows and when scrollback is unavailable
-                        const grid_cell = if (!is_floating and has_valid_scrollback)
-                            window.getScrollbackCellByInnerRow(inner_row, col)
+                        // Read from scrollback when scroll-animating, else from actual grid.
+                        const cell: ?gui_protocol.GuiCell = if (window.has_scroll_animation and !is_float)
+                            window.getScrollCell(window.ctx, inner_row, col)
                         else
-                            window.getCell(margin_top + inner_row, col);
+                            window.getCell(window.ctx, window.margin_top + inner_row, col);
 
-                        // Get highlight attributes
-                        const hl_id: u64 = if (grid_cell) |c| c.hl_id else 0;
-                        const hl_attr = if (is_floating) nvim.getHlAttr(hl_id) else nvim.getHlAttr(hl_id);
-
-                        // getHlAttr always returns non-null colors (defaults filled in)
-                        var fg_color = hl_attr.foreground.?;
-                        var bg_color = hl_attr.background.?;
-
-                        if (hl_attr.reverse) {
-                            const tmp = fg_color;
-                            fg_color = bg_color;
-                            bg_color = tmp;
-                        }
-
-                        // Write background cell — but SKIP the extra animation row.
-                        // The extra row occupies the margin/statusline screen position;
-                        // writing a non-zero offset there would corrupt the statusline bg.
-                        // Instead, the bg shader handles the partial reveal through the
-                        // offset on the last real inner row.
-                        if (!is_extra_anim_row) {
-                            // Floating windows: no scroll offset, use per-window opacity for fade animation.
-                            if (is_floating) {
-                                self.cells.bgCell(screen_y, screen_x).* = .{
-                                    .color = .{
-                                        @intCast((bg_color >> 16) & 0xFF),
-                                        @intCast((bg_color >> 8) & 0xFF),
-                                        @intCast(bg_color & 0xFF),
-                                        win_opacity,
-                                    },
-                                    .offset_y_fixed = 0,
-                                    .window_id = cur_window_id,
-                                };
-                            } else if (hl_attr.blend > 0) {
-                                const blend_alpha = 255 - (@as(u16, hl_attr.blend) * 255 / 100);
-                                const inv_alpha = 255 - blend_alpha;
-
-                                const cell_r: u16 = @intCast((bg_color >> 16) & 0xFF);
-                                const cell_g: u16 = @intCast((bg_color >> 8) & 0xFF);
-                                const cell_b: u16 = @intCast(bg_color & 0xFF);
-                                const def_r: u16 = @intCast((default_bg >> 16) & 0xFF);
-                                const def_g: u16 = @intCast((default_bg >> 8) & 0xFF);
-                                const def_b: u16 = @intCast(default_bg & 0xFF);
-
-                                const final_r: u8 = @intCast((cell_r * blend_alpha + def_r * inv_alpha) / 255);
-                                const final_g: u8 = @intCast((cell_g * blend_alpha + def_g * inv_alpha) / 255);
-                                const final_b: u8 = @intCast((cell_b * blend_alpha + def_b * inv_alpha) / 255);
-
-                                self.cells.bgCell(screen_y, screen_x).* = .{
-                                    .color = .{ final_r, final_g, final_b, 255 },
-                                    .offset_y_fixed = bg_offset_fixed,
-                                    .window_id = cur_window_id,
-                                };
-                            } else {
-                                self.cells.bgCell(screen_y, screen_x).* = .{
-                                    .color = .{
-                                        @intCast((bg_color >> 16) & 0xFF),
-                                        @intCast((bg_color >> 8) & 0xFF),
-                                        @intCast(bg_color & 0xFF),
-                                        255,
-                                    },
-                                    .offset_y_fixed = bg_offset_fixed,
-                                    .window_id = cur_window_id,
-                                };
+                        if (cell) |c| {
+                            var fg = c.style.fg;
+                            var bg = c.style.bg;
+                            if (c.style.reverse) {
+                                const t = fg;
+                                fg = bg;
+                                bg = t;
                             }
-                        }
 
-                        // Render TEXT: for owned cells and the extra animation row.
-                        // The fragment shader clips text that lands in fixed margin cells
-                        // (cells with offset_y=0), so extra row text won't bleed into
-                        // the statusline.
-                        if (owns_cell or is_extra_anim_row) {
-                            if (grid_cell) |cell| {
-                                const text = cell.getText();
-                                if (text.len > 0) {
-                                    const effective_offset: f32 = if (is_floating) 0 else scroll_pixel_offset;
-                                    self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, effective_offset) catch {};
+                            // Background — skip the extra animation row (would corrupt statusline).
+                            if (!is_extra) {
+                                if (is_float) {
+                                    self.cells.bgCell(sy, sx).* = .{
+                                        .color = .{ @intCast((bg >> 16) & 0xFF), @intCast((bg >> 8) & 0xFF), @intCast(bg & 0xFF), win_opacity },
+                                        .offset_y_fixed = 0,
+                                        .window_id = cur_wid,
+                                    };
+                                } else if (c.style.blend > 0) {
+                                    const ba = 255 - (@as(u16, c.style.blend) * 255 / 100);
+                                    const ia = 255 - ba;
+                                    const cr: u16 = @intCast((bg >> 16) & 0xFF);
+                                    const cg: u16 = @intCast((bg >> 8) & 0xFF);
+                                    const cb: u16 = @intCast(bg & 0xFF);
+                                    const dr: u16 = @intCast((default_bg >> 16) & 0xFF);
+                                    const dg: u16 = @intCast((default_bg >> 8) & 0xFF);
+                                    const db: u16 = @intCast(default_bg & 0xFF);
+                                    self.cells.bgCell(sy, sx).* = .{
+                                        .color = .{ @intCast((cr * ba + dr * ia) / 255), @intCast((cg * ba + dg * ia) / 255), @intCast((cb * ba + db * ia) / 255), 255 },
+                                        .offset_y_fixed = bg_offset_fixed,
+                                        .window_id = cur_wid,
+                                    };
+                                } else {
+                                    self.cells.bgCell(sy, sx).* = .{
+                                        .color = .{ @intCast((bg >> 16) & 0xFF), @intCast((bg >> 8) & 0xFF), @intCast(bg & 0xFF), 255 },
+                                        .offset_y_fixed = bg_offset_fixed,
+                                        .window_id = cur_wid,
+                                    };
                                 }
                             }
+
+                            // Text — occlusion-gated, extra row gets text (clipped by shader).
+                            if (owns_cell or is_extra) {
+                                const text = c.getText();
+                                if (text.len > 0) {
+                                    const eff_offset: f32 = if (is_float) 0 else scroll_offset;
+                                    self.addGuiGlyph(sx, sy, text, fg, c.style, eff_offset) catch {};
+                                }
+                            }
+                        } else if (!is_extra) {
+                            // Null cell: default bg with scroll offset + window_id.
+                            self.cells.bgCell(sy, sx).* = .{
+                                .color = .{ bg_r, bg_g, bg_b, 255 },
+                                .offset_y_fixed = bg_offset_fixed,
+                                .window_id = cur_wid,
+                            };
                         }
                     }
                 }
 
-                // Render bottom margin rows (statusline etc) - no scroll, solid like floating
-                row = render_height -| margin_bottom;
+                // --- Bottom margin (statusline) — no scroll, solid bg ---
+                row = render_height -| window.margin_bottom;
                 while (row < render_height) : (row += 1) {
                     var col: u32 = 0;
                     while (col < render_width) : (col += 1) {
-                        const screen_y = @as(u16, @intCast(row)) + win_row;
-                        const screen_x = @as(u16, @intCast(col)) + win_col;
-                        if (screen_y >= self.cells.size.rows or screen_x >= self.cells.size.columns) continue;
+                        const sy = @as(u16, @intCast(row)) + win_row;
+                        const sx = @as(u16, @intCast(col)) + win_col;
+                        if (sy >= self.cells.size.rows or sx >= self.cells.size.columns) continue;
 
-                        // Check if this window owns this cell for TEXT rendering
-                        // Margin rows are excluded from the occlusion map, so unclaimed
-                        // cells (owner == 0) in our margin rows belong to us.
-                        const owner = occlusion_map[screen_y * cols + screen_x];
+                        const owner = occlusion_map[sy * cols + sx];
                         var owns_cell = (owner == window.id) or (owner == 0);
-                        if (is_floating and !owns_cell) {
-                            if (!floating_ids.contains(owner)) {
-                                owns_cell = true;
+                        if (is_float and !owns_cell) {
+                            if (!floating_ids.contains(owner)) owns_cell = true;
+                        }
+                        if (is_msg and !owns_cell) continue;
+
+                        if (window.getCell(window.ctx, row, col)) |cell| {
+                            var fg = cell.style.fg;
+                            var bg = cell.style.bg;
+                            if (cell.style.reverse) {
+                                const t = fg;
+                                fg = bg;
+                                bg = t;
                             }
-                        }
-
-                        // For message windows, skip cells we don't own (empty cells)
-                        if (is_message_window and !owns_cell) continue;
-
-                        const grid_cell = window.getCell(row, col);
-                        // Get highlight attributes
-                        const hl_id: u64 = if (grid_cell) |c| c.hl_id else 0;
-                        const hl_attr = if (is_floating) nvim.getHlAttr(hl_id) else nvim.getHlAttr(hl_id);
-
-                        // getHlAttr always returns non-null colors
-                        var fg_color = hl_attr.foreground.?;
-                        var bg_color = hl_attr.background.?;
-                        if (hl_attr.reverse) {
-                            const tmp = fg_color;
-                            fg_color = bg_color;
-                            bg_color = tmp;
-                        }
-
-                        // Bottom margin is always statusline - use solid background, no blend
-                        // This prevents transparency issues where scrolling content shows through
-                        self.cells.bgCell(screen_y, screen_x).* = .{
-                            .color = .{
-                                @intCast((bg_color >> 16) & 0xFF),
-                                @intCast((bg_color >> 8) & 0xFF),
-                                @intCast(bg_color & 0xFF),
-                                win_opacity,
-                            },
-                            .offset_y_fixed = 0,
-                            .window_id = cur_window_id,
-                        };
-
-                        // Only render TEXT if this window owns this cell (occlusion check)
-                        if (owns_cell) {
-                            if (grid_cell) |cell| {
+                            self.cells.bgCell(sy, sx).* = .{
+                                .color = .{ @intCast((bg >> 16) & 0xFF), @intCast((bg >> 8) & 0xFF), @intCast(bg & 0xFF), win_opacity },
+                                .offset_y_fixed = 0,
+                                .window_id = cur_wid,
+                            };
+                            if (owns_cell) {
                                 const text = cell.getText();
-                                if (text.len > 0) {
-                                    self.addNeovimGlyph(screen_x, screen_y, text, fg_color, hl_attr, 0) catch {};
-                                }
+                                if (text.len > 0) self.addGuiGlyph(sx, sy, text, fg, cell.style, 0) catch {};
                             }
+                        } else {
+                            self.cells.bgCell(sy, sx).* = .{
+                                .color = .{ bg_r, bg_g, bg_b, win_opacity },
+                                .offset_y_fixed = 0,
+                                .window_id = cur_wid,
+                            };
                         }
                     }
                 }
             }
 
-            // Render cursor
-            self.renderNeovimCursor(nvim, default_fg, default_bg);
+            // Cursor
+            self.renderGuiCursor(state.cursor);
         }
 
-        /// Render the Neovim cursor using Ghostty's cursor animation system
-        fn renderNeovimCursor(self: *Self, nvim: *neovim_gui.NeovimGui, default_fg: u32, default_bg: u32) void {
-            _ = default_bg;
-
-            // Get the cursor's window to find screen position
-            const cursor_window = nvim.windows.get(nvim.cursor_grid) orelse return;
-            if (!cursor_window.valid or cursor_window.hidden) return;
+        /// Render the GUI cursor with spring animation and corner stretching.
+        fn renderGuiCursor(self: *Self, cursor: gui_protocol.GuiCursor) void {
+            if (!cursor.visible) return;
+            if (cursor.screen_row >= self.cells.size.rows or cursor.screen_col >= self.cells.size.columns) return;
 
             const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
             const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
 
-            // Get scroll animation position (like Neovide: grid.y -= window.scroll_animation.position)
-            const scroll_pos = cursor_window.scroll_animation.position;
-
-            // Calculate grid position
-            const local_col_f: f32 = @floatFromInt(nvim.cursor_col);
-            const local_row_f: f32 = @floatFromInt(nvim.cursor_row);
-            const grid_x = local_col_f + cursor_window.grid_position[0];
-            // Neovide subtracts scroll position from grid Y so cursor moves with content
-            const grid_y = local_row_f + cursor_window.grid_position[1] - scroll_pos;
-
-            // Screen position (integer grid cell) - for uniforms/cell lookup only
-            const screen_col: u16 = @intFromFloat(@max(0, grid_x));
-            const screen_row: u16 = @intFromFloat(@max(0, local_row_f + cursor_window.grid_position[1]));
-
-            if (screen_row >= self.cells.size.rows or screen_col >= self.cells.size.columns) return;
-
-            // Don't set cursor_pos for Neovim mode - we use animated cursor rendering instead
-            // Setting cursor_pos would cause the shader to draw a non-animated cursor at the actual position
-            // which creates a "black thing" that lags behind the animated cursor
+            // Suppress the shader's non-animated cursor.
             self.uniforms.cursor_pos = .{ std.math.maxInt(u16), std.math.maxInt(u16) };
 
-            // Pixel positions (top-left of cursor cell) - includes scroll offset
-            // This is the cursor's TARGET position that it animates toward
-            const target_pixel_x: f32 = grid_x * cell_width;
-            const target_pixel_y: f32 = grid_y * cell_height;
+            const target_px = cursor.grid_x * cell_width;
+            const target_py = cursor.grid_y * cell_height;
 
-            // Neovide-style cursor animation
-            // The cursor should animate smoothly when either:
-            // 1. Cursor grid position changes (normal movement)
-            // 2. Scroll position changes (cursor follows content)
-
+            // Detect position or scroll changes → trigger animation.
             const last_x = self.last_cursor_grid_pos[0];
             const last_y = self.last_cursor_grid_pos[1];
-            const scroll_changed = scroll_pos != self.last_cursor_scroll_pos;
-            const pos_changed = screen_col != last_x or screen_row != last_y;
+            const pos_changed = cursor.screen_col != last_x or cursor.screen_row != last_y;
+            const scroll_changed = cursor.scroll_pos != self.last_cursor_scroll_pos;
 
             if (pos_changed or scroll_changed) {
                 if (self.config.cursor_animation_duration > 0) {
-                    // Normal smooth animation to new target
-                    self.cursor_animation.setTarget(target_pixel_x, target_pixel_y, cell_width);
-                    self.corner_cursor.setTarget(target_pixel_x, target_pixel_y, cell_width, cell_height);
+                    self.cursor_animation.setTarget(target_px, target_py, cell_width);
+                    self.corner_cursor.setTarget(target_px, target_py, cell_width, cell_height);
                     self.cursor_animating = true;
                 } else {
-                    // Animations disabled - snap instantly
-                    self.cursor_animation.target_x = target_pixel_x;
-                    self.cursor_animation.target_y = target_pixel_y;
-                    self.cursor_animation.current_x = target_pixel_x;
-                    self.cursor_animation.current_y = target_pixel_y;
+                    self.cursor_animation.target_x = target_px;
+                    self.cursor_animation.target_y = target_py;
+                    self.cursor_animation.current_x = target_px;
+                    self.cursor_animation.current_y = target_py;
                     self.cursor_animation.spring.reset();
-                    self.corner_cursor.snap(target_pixel_x, target_pixel_y, cell_width, cell_height);
+                    self.corner_cursor.snap(target_px, target_py, cell_width, cell_height);
                 }
-
-                self.last_cursor_grid_pos = .{ screen_col, screen_row };
-                self.last_cursor_scroll_pos = scroll_pos;
+                self.last_cursor_grid_pos = .{ cursor.screen_col, cursor.screen_row };
+                self.last_cursor_scroll_pos = cursor.scroll_pos;
             }
 
-            // Get the floaty animated position (smooth spring movement)
-            const floaty_pos = self.cursor_animation.getPosition();
-
-            // Update corner cursor destination to track the floaty position
-            // This makes corners stretch relative to the smoothly moving center
-            self.corner_cursor.destination = .{
-                floaty_pos.x + cell_width * 0.5,
-                floaty_pos.y + cell_height * 0.5,
-            };
-
-            // Get animated corner positions
+            const floaty = self.cursor_animation.getPosition();
+            self.corner_cursor.destination = .{ floaty.x + cell_width * 0.5, floaty.y + cell_height * 0.5 };
             const corners = self.corner_cursor.getCorners();
 
             self.uniforms.cursor_corner_tl = corners[0];
             self.uniforms.cursor_corner_tr = corners[1];
             self.uniforms.cursor_corner_br = corners[2];
             self.uniforms.cursor_corner_bl = corners[3];
-            // Set cursor_use_corners - type depends on backend (bool for Metal, u32 for OpenGL)
             self.uniforms.cursor_use_corners = if (@TypeOf(self.uniforms.cursor_use_corners) == bool) true else 1;
             self.uniforms.cursor_offset_x = 0;
             self.uniforms.cursor_offset_y = 0;
 
-            const alpha: u8 = 255;
-
-            // Render cursor glyph
-            const cursor_color_rgb = terminal.color.RGB{
-                .r = @intCast((default_fg >> 16) & 0xFF),
-                .g = @intCast((default_fg >> 8) & 0xFF),
-                .b = @intCast(default_fg & 0xFF),
-            };
-
-            // Get cursor shape from current mode
-            const cursor_mode = nvim.getCurrentCursorMode();
-            const cursor_shape = if (cursor_mode) |mode| mode.shape orelse .block else .block;
-            const cell_percentage = if (cursor_mode) |mode| mode.cell_percentage orelse 0.25 else 0.25;
-
-            // Update corner positions if cursor shape changed
-            if (self.last_cursor_shape == null or self.last_cursor_shape.? != cursor_shape) {
-                const corner_shape: animation.CornerCursorAnimation.CursorShape = switch (cursor_shape) {
+            // Shape change → sonicboom + corner shape update.
+            if (self.last_cursor_shape == null or self.last_cursor_shape.? != cursor.shape) {
+                const corner_shape: animation.CornerCursorAnimation.CursorShape = switch (cursor.shape) {
                     .block => .block,
                     .vertical => .vertical,
                     .horizontal => .horizontal,
                 };
-                self.corner_cursor.setCursorShape(corner_shape, cell_percentage);
-
-                // Trigger sonicboom on mode change (shape change = insert↔normal)
+                self.corner_cursor.setCursorShape(corner_shape, cursor.cell_percentage);
                 if (self.last_cursor_shape != null) {
-                    const scroll_off = self.uniforms.pixel_scroll_offset_y;
-                    self.sonicboom_center_x = target_pixel_x + cell_width * 0.5;
-                    self.sonicboom_center_y = target_pixel_y + cell_height * 0.5 - scroll_off;
+                    self.sonicboom_center_x = target_px + cell_width * 0.5;
+                    self.sonicboom_center_y = target_py + cell_height * 0.5 - self.uniforms.pixel_scroll_offset_y;
                     self.sonicboom_time = 0.001;
                     self.sonicboom_active = true;
                 }
-                self.last_cursor_shape = cursor_shape;
+                self.last_cursor_shape = cursor.shape;
             }
 
-            // Select the appropriate sprite based on cursor shape
-            const cursor_sprite: font.Sprite = switch (cursor_shape) {
+            const sprite: font.Sprite = switch (cursor.shape) {
                 .block => .cursor_rect,
                 .vertical => .cursor_bar,
                 .horizontal => .cursor_underline,
             };
-
-            // Render cursor sprite
             const render = self.font_grid.renderGlyph(
                 self.alloc,
                 font.sprite_index,
-                @intFromEnum(cursor_sprite),
-                .{
-                    .cell_width = 1,
-                    .grid_metrics = self.grid_metrics,
-                },
-            ) catch {
-                return;
-            };
+                @intFromEnum(sprite),
+                .{ .cell_width = 1, .grid_metrics = self.grid_metrics },
+            ) catch return;
 
-            // Map Neovim cursor shape to Ghostty cursor style for setCursor
-            const ghostty_cursor_style: renderer.CursorStyle = switch (cursor_shape) {
+            const fg = cursor.color;
+            const style: renderer.CursorStyle = switch (cursor.shape) {
                 .block => .block,
                 .vertical => .bar,
                 .horizontal => .underline,
             };
-
-            // Add cursor using setCursor - this marks it with is_cursor_glyph
-            // so the shader applies cursor_offset_x/y for animation
-            // NOTE: Don't apply pixel_offset_y here - cursor animation already accounts for scroll
-            // via dest_pixel_y adjustment above. Double-applying causes bounce.
             self.cells.setCursor(.{
                 .atlas = .grayscale,
                 .bools = .{ .is_cursor_glyph = true },
-                .grid_pos = .{ screen_col, screen_row },
-                .color = .{ cursor_color_rgb.r, cursor_color_rgb.g, cursor_color_rgb.b, alpha },
+                .grid_pos = .{ cursor.screen_col, cursor.screen_row },
+                .color = .{ @intCast((fg >> 16) & 0xFF), @intCast((fg >> 8) & 0xFF), @intCast(fg & 0xFF), 255 },
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
-                .bearings = .{
-                    @intCast(render.glyph.offset_x),
-                    @intCast(render.glyph.offset_y),
-                },
-                .pixel_offset_y = 0, // Scroll handled by cursor_offset_y
-            }, ghostty_cursor_style);
+                .bearings = .{ @intCast(render.glyph.offset_x), @intCast(render.glyph.offset_y) },
+                .pixel_offset_y = 0,
+            }, style);
         }
 
-        /// Add a glyph from Neovim cell content
-        /// pixel_offset_y: Per-cell pixel offset for smooth scrolling (in pixels, can be fractional)
-        fn addNeovimGlyph(
+        /// Render a single GUI cell's text glyph + decorations at (x, y).
+        fn addGuiGlyph(
             self: *Self,
             x: u16,
             y: u16,
             text: []const u8,
             fg_color: u32,
-            hl_attr: neovim_gui.HlAttr,
+            style: gui_protocol.CellStyle,
             pixel_offset_y: f32,
         ) !void {
-            // Decode the first codepoint from text
-            // Handle invalid UTF-8 gracefully instead of panicking
             if (text.len == 0) return;
 
-            // Get the byte length of the first UTF-8 sequence
-            const seq_len = std.unicode.utf8ByteSequenceLength(text[0]) catch {
-                return;
-            };
+            const seq_len = std.unicode.utf8ByteSequenceLength(text[0]) catch return;
             if (text.len < seq_len) return;
-
-            const codepoint = std.unicode.utf8Decode(text[0..seq_len]) catch {
-                return;
-            };
-
-            // Skip spaces and null
+            const codepoint = std.unicode.utf8Decode(text[0..seq_len]) catch return;
             if (codepoint == ' ' or codepoint == 0) return;
 
-            // Check for explicit presentation selectors in multi-codepoint text.
-            // Neovim sends VS15 (U+FE0E) for text presentation and VS16 (U+FE0F)
-            // for emoji presentation as trailing codepoints in the cell text.
+            // Scan for VS15/VS16 variation selectors after the base codepoint.
             var explicit_presentation: ?font.Presentation = null;
             if (text.len > seq_len) {
-                // Scan remaining codepoints for variation selectors
                 var off: usize = seq_len;
                 while (off < text.len) {
                     const next_len = std.unicode.utf8ByteSequenceLength(text[off]) catch break;
                     if (off + next_len > text.len) break;
                     const next_cp = std.unicode.utf8Decode(text[off..][0..next_len]) catch break;
-                    if (next_cp == 0xFE0E) {
-                        explicit_presentation = .text;
-                    } else if (next_cp == 0xFE0F) {
-                        explicit_presentation = .emoji;
-                    }
+                    if (next_cp == 0xFE0E) explicit_presentation = .text;
+                    if (next_cp == 0xFE0F) explicit_presentation = .emoji;
                     off += next_len;
                 }
             }
 
-            // Determine font style based on highlight attributes
-            const font_style: font.Style = if (hl_attr.bold and hl_attr.italic)
+            const font_style: font.Style = if (style.bold and style.italic)
                 .bold_italic
-            else if (hl_attr.bold)
+            else if (style.bold)
                 .bold
-            else if (hl_attr.italic)
+            else if (style.italic)
                 .italic
             else
                 .regular;
 
-            // Determine cell width: Neovim sends empty string for the continuation
-            // (right half) cell of wide characters.  Wide emoji/CJK are 2 cells.
-            // We detect this by checking the `double_width` flag on the GridCell,
-            // but since that isn't set by the protocol parser, we use a heuristic:
-            // pass null presentation so the font system auto-detects emoji vs text
-            // from the Unicode Character Database.
-            const cell_width: u2 = 1; // TODO: detect from Neovim protocol
-
-            // Try to render the codepoint.  Pass null presentation to let the
-            // font system auto-detect emoji vs text from the UCD, unless we
-            // found an explicit variation selector.
+            const cell_width: u2 = 1; // TODO: wide char detection
             const render_result = self.font_grid.renderCodepoint(
                 self.alloc,
                 codepoint,
                 font_style,
-                explicit_presentation, // null = auto-detect from UCD
-                .{
-                    .cell_width = cell_width,
-                    .grid_metrics = self.grid_metrics,
-                },
+                explicit_presentation,
+                .{ .cell_width = cell_width, .grid_metrics = self.grid_metrics },
             ) catch return;
-
             const render = render_result orelse return;
-
-            // Skip invisible glyphs (0 width or height)
             if (render.glyph.width == 0 or render.glyph.height == 0) return;
 
-            // Convert pixel offset to 8.8 fixed-point format for GPU
             const fixed_offset: i16 = @intFromFloat(std.math.clamp(pixel_offset_y * 256.0, -32768.0, 32767.0));
 
-            // Select atlas based on actual presentation (color emoji → color atlas)
             try self.cells.add(self.alloc, .text, .{
                 .atlas = switch (render.presentation) {
                     .emoji => .color,
@@ -2775,14 +2394,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     @intCast(fg_color & 0xFF),
                     255,
                 },
-                .glyph_pos = .{
-                    render.glyph.atlas_x,
-                    render.glyph.atlas_y,
-                },
-                .glyph_size = .{
-                    render.glyph.width,
-                    render.glyph.height,
-                },
+                .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
+                .glyph_size = .{ render.glyph.width, render.glyph.height },
                 .bearings = .{
                     @intCast(render.glyph.offset_x),
                     @intCast(render.glyph.offset_y),
@@ -2790,31 +2403,23 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .pixel_offset_y = fixed_offset,
             });
 
-            // Handle underline
-            if (hl_attr.underline or hl_attr.undercurl) {
-                const underline_style: terminal.Attribute.Underline = if (hl_attr.undercurl)
-                    .curly
-                else
-                    .single;
-
-                const underline_color = terminal.color.RGB{
+            if (style.underline or style.undercurl) {
+                const ul_style: terminal.Attribute.Underline = if (style.undercurl) .curly else .single;
+                const fg_rgb = terminal.color.RGB{
                     .r = @intCast((fg_color >> 16) & 0xFF),
                     .g = @intCast((fg_color >> 8) & 0xFF),
                     .b = @intCast(fg_color & 0xFF),
                 };
-
-                self.addUnderline(x, y, underline_style, underline_color, 255, pixel_offset_y) catch {};
+                self.addUnderline(x, y, ul_style, fg_rgb, 255, pixel_offset_y) catch {};
             }
 
-            // Handle strikethrough
-            if (hl_attr.strikethrough) {
-                const strike_color = terminal.color.RGB{
+            if (style.strikethrough) {
+                const fg_rgb = terminal.color.RGB{
                     .r = @intCast((fg_color >> 16) & 0xFF),
                     .g = @intCast((fg_color >> 8) & 0xFF),
                     .b = @intCast(fg_color & 0xFF),
                 };
-
-                self.addStrikethrough(x, y, strike_color, 255, pixel_offset_y) catch {};
+                self.addStrikethrough(x, y, fg_rgb, 255, pixel_offset_y) catch {};
             }
         }
 
@@ -3101,7 +2706,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         /// Add a glyph from panel content to the GPU cell buffer.
-        /// Simplified version of addNeovimGlyph that works with panel Cell attributes.
+        /// Simplified glyph renderer for panel Cell attributes.
         fn addPanelGlyph(
             self: *Self,
             x: u16,
@@ -3322,7 +2927,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             // Set rendering uniforms for terminal mode too
-            // (For Neovim GUI mode, these are set in rebuildCellsFromNeovim)
+            // (For GUI mode, these are set in rebuildCellsFromGui)
             if (self.nvim_gui == null) {
                 self.uniforms.matte_intensity = self.config.matte_rendering;
                 self.uniforms.text_gamma = self.config.text_gamma;

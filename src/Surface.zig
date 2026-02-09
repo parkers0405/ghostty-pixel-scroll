@@ -4329,13 +4329,11 @@ pub fn scrollCallback(
 
         // If we're scrolling up or down, then send a mouse event.
         if (self.isMouseReporting()) {
-            // Invert for TUI apps: the mouse protocol button 4/5 convention
-            // is opposite to what natural scroll produces, so we swap them.
             for (0..@abs(y.delta)) |_| {
                 const pos = try self.rt_surface.getCursorPos();
                 try self.mouseReport(switch (y.direction()) {
-                    .up_right => .five,
-                    .down_left => .four,
+                    .up_right => .four,
+                    .down_left => .five,
                 }, .press, self.mouse.mods, pos);
             }
 

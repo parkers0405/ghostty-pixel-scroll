@@ -706,16 +706,17 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     config.link.links.items,
                 );
 
-                // When neovim-gui or pixel-scroll is active and animation values
-                // are at their zero defaults, apply sensible defaults automatically.
-                // Users who explicitly want no animation can use a tiny value like 0.001.
+                // When neovim-gui is active and animation values are at their
+                // zero defaults, apply sensible defaults automatically.
+                // Terminal mode (pixel-scroll) does NOT get auto-defaults —
+                // if the user sets scroll-animation-duration=0, respect it.
+                // Users who explicitly want no animation can set 0.
                 const nvim_active = config.@"neovim-gui".len > 0;
-                const smooth_mode = nvim_active or config.@"pixel-scroll";
-                const cursor_dur = if (smooth_mode and config.@"cursor-animation-duration" == 0)
+                const cursor_dur = if (nvim_active and config.@"cursor-animation-duration" == 0)
                     @as(f32, 0.06)
                 else
                     config.@"cursor-animation-duration";
-                const scroll_dur = if (smooth_mode and config.@"scroll-animation-duration" == 0)
+                const scroll_dur = if (nvim_active and config.@"scroll-animation-duration" == 0)
                     @as(f32, 0.3) // Match Neovide's default scroll_animation_length (0.3s)
                 else
                     config.@"scroll-animation-duration";
@@ -1587,25 +1588,38 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.draw_mutex.lock();
                 defer self.draw_mutex.unlock();
 
-                // Smooth scroll animations using CriticallyDampedSpring (Neovide-style).
+                // Smooth scroll animations using CriticallyDampedSpring.
                 //
-                // Both primary and alternate screens use the same spring approach
-                // as the Neovim GUI: accumulate scroll deltas into a spring that
-                // decays toward 0 with adaptive catchup for rapid scrolling.
+                // Spring animation is ONLY used for the alternate screen (TUI apps
+                // like Neovim) where scroll regions need animated transitions.
+                // The primary screen (terminal scrollback) uses direct pixel offset
+                // from the trackpad/mouse — no spring, no delay, no bounce.
                 const scroll_threshold: f32 = 1.0;
                 const scroll_jump_total = self.terminal_state.scroll_jump;
-                const scroll_jump_viewport = self.terminal_state.scroll_jump_viewport;
-                const scroll_jump_output = self.terminal_state.scroll_jump_output;
+
+                // Primary screen: no spring animation. Always snap immediately.
+                // The pixel scroll offset from the trackpad already provides
+                // smooth sub-line scrolling; adding a spring on top causes
+                // bouncy/laggy behavior and visual artifacts.
+                self.user_scroll_spring.reset();
 
                 if (self.config.scroll_animation_duration <= 0) {
-                    // If scroll animation is disabled, always snap.
-                    self.user_scroll_spring.reset();
+                    // If scroll animation is disabled, snap TUI spring too.
                     self.tui_scroll_spring.reset();
                     self.scroll_animating = false;
                 } else {
                     const in_alternate = critical.tui_in_alternate;
 
                     if (in_alternate) {
+                        // Reset TUI spring when scroll region boundaries change.
+                        // This prevents stale spring offsets from being applied
+                        // to a new region (e.g., when nvim-cmp popup opens/closes).
+                        const new_top = self.terminal_state.scroll_region_top;
+                        const new_bottom = self.terminal_state.scroll_region_bottom;
+                        if (new_top != self.scroll_region_top or new_bottom != self.scroll_region_bottom) {
+                            self.tui_scroll_spring.reset();
+                        }
+
                         // Alternate screen (TUI): CriticallyDampedSpring (same as Neovim GUI).
                         // Spring position is in lines. Accumulate scroll deltas.
                         if (@abs(scroll_jump_total) >= scroll_threshold) {
@@ -1617,33 +1631,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             self.scroll_animating = true;
                         }
                     } else {
-                        // Primary screen: CriticallyDampedSpring for ALL scroll events.
-                        // Both user scroll AND output arrival get the same spring animation,
-                        // matching the Neovim GUI's eased bounce feel.
-
-                        // Reset spring when viewport returns to bottom with no pending animation.
-                        if (critical.just_recentered and self.user_scroll_spring.position == 0) {
-                            self.user_scroll_spring.reset();
-                        }
-
-                        // When pixel scrolling is active, viewport jumps are just
-                        // data-loading. Don't add spring animation for them.
-                        const pixel_scrolling_active = critical.mouse.pixel_scroll_offset_y != 0;
-
-                        // User scroll (viewport movement via mouse wheel, page-up, etc.)
-                        // When output arrives at bottom, the viewport jump is from output,
-                        // not user action — but we still want to animate it.
-                        if (!pixel_scrolling_active and @abs(scroll_jump_viewport) >= scroll_threshold) {
-                            self.user_scroll_spring.position += scroll_jump_viewport;
-                            self.scroll_animating = true;
-                        }
-
-                        // Output arrival: new content pushing the viewport down.
-                        // Animate with the same spring for that nice eased bounce.
-                        if (critical.viewport_at_bottom and @abs(scroll_jump_output) >= scroll_threshold) {
-                            self.user_scroll_spring.position += scroll_jump_output;
-                            self.scroll_animating = true;
-                        }
+                        // Primary screen: no spring. Reset TUI spring too since
+                        // we're not in alternate mode.
+                        self.tui_scroll_spring.reset();
+                        self.scroll_animating = false;
                     }
                 }
 
@@ -2883,27 +2874,18 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     // Fixed animation_length per frame (no adaptive catchup — that breaks
                     // the analytical solution's stability and causes overshoot/bounce).
                     if (is_terminal and self.scroll_animating) {
-                        var any_scroll_anim = false;
                         const scroll_len = self.config.scroll_animation_duration;
                         // zeta: 1.0 = critically damped (no overshoot).
                         // bounciness > 0 lowers zeta below 1.0 = underdamped (oscillation).
                         const scroll_zeta = 1.0 - (self.config.scroll_animation_bounciness * 0.6);
 
-                        // Primary screen: user scroll spring (position in lines)
-                        if (self.user_scroll_spring.position != 0) {
-                            if (self.user_scroll_spring.update(dt, scroll_len, scroll_zeta)) {
-                                any_scroll_anim = true;
-                            }
-                        }
-
-                        // Alternate screen (TUI): scroll spring (position in lines)
+                        // Only the TUI spring is animated now. The primary screen
+                        // user_scroll_spring is always kept at 0 (no animation).
                         if (self.tui_scroll_spring.position != 0) {
-                            if (self.tui_scroll_spring.update(dt, scroll_len, scroll_zeta)) {
-                                any_scroll_anim = true;
-                            }
+                            self.scroll_animating = self.tui_scroll_spring.update(dt, scroll_len, scroll_zeta);
+                        } else {
+                            self.scroll_animating = false;
                         }
-
-                        self.scroll_animating = any_scroll_anim;
                     }
 
                     // Sonicboom VFX (both modes)
@@ -2949,17 +2931,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // For Neovim GUI mode, pixel_scroll_offset_y is set in updateFrameNeovim
             // Don't override it here
             if (self.nvim_gui == null) {
-                // Terminal scrollback: CriticallyDampedSpring provides smooth visual offset.
+                // Terminal pixel scroll offset for smooth scrolling.
                 //
                 // Ghostty renders with an extra row above AND below the viewport.
                 // At rest, pixel_scroll_offset_y = cell_h hides the top extra row.
-                // During animation, the spring position (in lines) shifts content visually.
                 //
-                // Key difference from Neovim GUI: the terminal viewport has ALREADY moved
-                // (data is loaded at the new position). The spring represents the visual
-                // offset from that new data position back toward where we came from.
-                // So the FULL spring position (not just fractional) contributes to the
-                // pixel offset. As the spring decays to 0, the visual catches up to the data.
+                // Primary screen: direct pixel offset from trackpad/mouse only.
+                // No spring animation — the input device provides smoothness.
+                //
+                // Alternate screen (TUI): fixed cell_h offset, with the TUI spring
+                // providing animated scroll within the scroll region.
 
                 if (self.in_alternate_screen) {
                     // Alternate screen: fixed cell_h shift, spring offset via tui_scroll_offset_y.
@@ -2972,19 +2953,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.uniforms.tui_scroll_region_top = self.scroll_region_top + 1;
                     self.uniforms.tui_scroll_region_bottom = self.scroll_region_bottom + 1;
                 } else {
-                    // Primary screen: spring position (lines) → pixel offset.
-                    // The full spring position matters here since the viewport already moved.
-                    const spring_pixel_offset = self.user_scroll_spring.position * cell_h;
+                    // Primary screen: direct pixel offset only (no spring).
+                    // The trackpad/mouse provides sub-line offset; no animation delay.
+                    const direct_offset = self.scroll_pixel_offset;
 
-                    // Also incorporate the direct pixel scroll offset from trackpad.
-                    const smooth_pixel_offset = self.scroll_pixel_offset + spring_pixel_offset;
-
-                    // Clamp the smooth offset to ±cell_h (one cell of travel).
-                    // The grid only has 1 extra row in each direction, so we can't
-                    // visually shift more than 1 cell. Larger spring values simply
-                    // animate faster through this 1-cell window as the spring decays.
-                    const clamped_smooth = std.math.clamp(smooth_pixel_offset, -cell_h, cell_h);
-                    const base_offset = cell_h - clamped_smooth;
+                    // Clamp to ±cell_h (one extra row in each direction).
+                    const clamped = std.math.clamp(direct_offset, -cell_h, cell_h);
+                    const base_offset = cell_h - clamped;
                     // base_offset is in [0, 2*cell_h]. Must stay > 0 so the bg shader
                     // knows pixel scroll is active and applies the extra-row adjustment.
                     self.uniforms.pixel_scroll_offset_y = @max(@round(base_offset), @as(f32, 1.0));

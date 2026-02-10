@@ -8,6 +8,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const gui = @import("../gui_protocol.zig");
+const markdown = @import("markdown.zig");
 const neovim_gui = @import("main.zig");
 const NeovimGui = neovim_gui.NeovimGui;
 const RenderedWindow = neovim_gui.RenderedWindow;
@@ -155,27 +156,84 @@ fn windowToGui(w: *RenderedWindow, is_float: bool, cell_h: f32) gui.GuiWindow {
 // reads happen. This is safe because rendering is single-threaded.
 // ---------------------------------------------------------------------------
 
-/// Per-frame nvim pointer. Set by buildGuiState, read by cell wrappers.
-/// Single-threaded render loop means no races.
+/// Per-frame state. Set before cell reads, used by cell wrappers.
+/// Single-threaded render loop — no races.
 var frame_nvim: ?*NeovimGui = null;
+var frame_markdown: bool = false;
+var frame_cursor_row: u32 = 0;
+var frame_default_bg: u32 = 0;
 
-/// Must be called before any cell reads (buildGuiState does this).
+pub fn isMarkdownActive() bool {
+    return frame_markdown;
+}
+
 pub fn setFrameNvim(nvim: *NeovimGui) void {
     frame_nvim = nvim;
+    frame_cursor_row = @intCast(nvim.cursor_row);
+    frame_default_bg = nvim.default_background;
+    cached_row_valid = false;
+
+    frame_markdown = false;
+    if (nvim.current_filetype) |ft| {
+        frame_markdown = std.mem.eql(u8, ft, "markdown") or std.mem.eql(u8, ft, "md");
+    }
+}
+
+// Row cache for markdown restyling. We cache one row at a time since
+// the renderer reads left-to-right, row-by-row. When the row changes,
+// we restyle the new row and cache it.
+var cached_row_id: u64 = std.math.maxInt(u64); // window id
+var cached_row_num: u32 = std.math.maxInt(u32);
+var cached_row_is_scroll: bool = false;
+var cached_row: [512]gui.GuiCell = undefined;
+var cached_row_len: u32 = 0;
+var cached_row_valid: bool = false;
+
+fn fillAndRestyleRow(w: *const RenderedWindow, nvim: *const NeovimGui, row: u32, is_scroll: bool) void {
+    if (cached_row_valid and cached_row_id == w.id and cached_row_num == row and cached_row_is_scroll == is_scroll) return;
+
+    const width = w.getRenderWidth();
+    const limit = @min(width, 512);
+    var i: u32 = 0;
+    while (i < limit) : (i += 1) {
+        const gc = if (is_scroll) w.getScrollbackCellByInnerRow(row, i) else w.getCell(row, i);
+        if (gc) |c| {
+            cached_row[i] = gridCellToGui(c, nvim);
+        } else {
+            cached_row[i] = .{ .style = .{ .fg = nvim.default_foreground, .bg = nvim.default_background } };
+        }
+    }
+    cached_row_len = limit;
+    cached_row_id = w.id;
+    cached_row_num = row;
+    cached_row_is_scroll = is_scroll;
+    cached_row_valid = true;
+
+    if (frame_markdown) {
+        // For scroll cells, inner_row is relative to the scrollable region.
+        // cursor_row is grid-local (includes margins). Adjust to match.
+        const cursor_for_row = if (is_scroll)
+            frame_cursor_row -| w.viewport_margins.top
+        else
+            frame_cursor_row;
+        markdown.restyleLine(cached_row[0..limit], limit, row, cursor_for_row, frame_default_bg);
+    }
 }
 
 fn getCellWrapper(ctx: *const anyopaque, row: u32, col: u32) ?gui.GuiCell {
     const w: *const RenderedWindow = @ptrCast(@alignCast(ctx));
     const nvim = frame_nvim orelse return null;
-    const gc = w.getCell(row, col) orelse return null;
-    return gridCellToGui(gc, nvim);
+    fillAndRestyleRow(w, nvim, row, false);
+    if (col >= cached_row_len) return null;
+    return cached_row[col];
 }
 
 fn getScrollCellWrapper(ctx: *const anyopaque, inner_row: u32, col: u32) ?gui.GuiCell {
     const w: *const RenderedWindow = @ptrCast(@alignCast(ctx));
     const nvim = frame_nvim orelse return null;
-    const gc = w.getScrollbackCellByInnerRow(inner_row, col) orelse return null;
-    return gridCellToGui(gc, nvim);
+    fillAndRestyleRow(w, nvim, inner_row, true);
+    if (col >= cached_row_len) return null;
+    return cached_row[col];
 }
 
 /// Convert a neovim GridCell + hl_id into a backend-agnostic GuiCell.

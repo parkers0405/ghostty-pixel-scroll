@@ -40,6 +40,10 @@ pub const CellStyle = struct {
     strikethrough: bool = false,
     reverse: bool = false,
     blend: u8 = 0,
+    /// Row height multiplier. 1.0 = normal row, 2.0 = double height.
+    /// The renderer uses this to compute per-row Y offsets in the
+    /// row_y SSBO, giving heading rows more vertical space.
+    row_height: f32 = 1.0,
 };
 
 /// A cell with text + resolved style. Same 16-byte text buffer as Neovim's

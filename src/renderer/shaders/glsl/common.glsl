@@ -50,6 +50,15 @@ layout(binding = 1, std140) uniform Globals {
     uniform vec4 window_rects[16];         // Window pixel rects: {x, y, w, h}
 };
 
+// Variable row heights and per-cell X offsets.
+// row_y[i] = pixel Y of row i's top edge.
+// row_h[i] = pixel height of row i.
+// cell_x[flat_index] = pixel X of cell at flat_index (row * cols + col).
+// For uniform grids: row_y[i] = i * cell_size.y, cell_x[i] = col * cell_size.x.
+layout(binding = 2, std430) readonly buffer RowLayout { float row_y[]; };
+layout(binding = 3, std430) readonly buffer RowHeights { float row_h[]; };
+layout(binding = 4, std430) readonly buffer CellXOffsets { float cell_x[]; };
+
 // Bools
 const uint CURSOR_WIDE = 1u;
 const uint USE_DISPLAY_P3 = 2u;
@@ -180,3 +189,23 @@ vec4 load_color(
 }
 
 //----------------------------------------------------------------------------//
+// Variable Row Height Helpers
+//----------------------------------------------------------------------------//
+
+int findRow(float pixel_y) {
+    uvec2 gs = unpack2u16(grid_size_packed_2u16);
+    int rows = int(gs.y);
+    if (rows <= 0) return 0;
+    int lo = 0, hi = rows - 1;
+    while (lo < hi) {
+        int mid = (lo + hi + 1) / 2;
+        if (row_y[mid] <= pixel_y) lo = mid; else hi = mid - 1;
+    }
+    return lo;
+}
+
+ivec2 gridPosFromPixel(vec2 coord) {
+    int col = int(floor(coord.x / cell_size.x));
+    int row = findRow(coord.y);
+    return ivec2(col, row);
+}

@@ -57,8 +57,9 @@ void main() {
     bool cursor_wide = (bools & CURSOR_WIDE) != 0;
     bool use_linear_blending = (bools & USE_LINEAR_BLENDING) != 0;
 
-    // Convert the grid x, y into world space x, y by accounting for cell size
-    vec2 cell_pos = cell_size * vec2(grid_pos);
+    // Grid to pixel. Both axes use per-cell offsets for variable sizing.
+    uint flat_idx = grid_pos.y * grid_size.x + grid_pos.x;
+    vec2 cell_pos = vec2(cell_x[flat_idx], row_y[grid_pos.y]);
 
     int vid = gl_VertexID;
 
@@ -79,7 +80,10 @@ void main() {
     vec2 size = vec2(glyph_size);
     vec2 offset = vec2(bearings);
 
-    offset.y = cell_size.y - offset.y;
+    // Bearing is relative to cell_size.y (the font's native cell height).
+    // For taller rows, center the text vertically within the extra space.
+    float extra_h = row_h[grid_pos.y] - cell_size.y;
+    offset.y = cell_size.y - offset.y + extra_h * 0.5;
 
     // Calculate the final position of the cell which uses our glyph size
     // and glyph offset to create the correct bounding box for the glyph.

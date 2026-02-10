@@ -161,6 +161,17 @@ pub const Event = union(enum) {
     // Tabline events (ext_tabline)
     tabline_update: TablineUpdate,
 
+    // Ghostty custom notifications
+    buf_info: BufInfo,
+
+    pub const BufInfo = struct {
+        filetype: []const u8,
+
+        pub fn deinit(self: *BufInfo, alloc: Allocator) void {
+            if (self.filetype.len > 0) alloc.free(self.filetype);
+        }
+    };
+
     pub const GridResize = struct {
         grid: u64,
         width: u64,
@@ -573,6 +584,7 @@ pub const Event = union(enum) {
             .hl_group_set => |*hgs| hgs.deinit(alloc),
             .popupmenu_show => |*ps| ps.deinit(alloc),
             .tabline_update => |*tu| tu.deinit(alloc),
+            .buf_info => |*bi| bi.deinit(alloc),
             else => {},
         }
     }
@@ -1080,6 +1092,8 @@ pub const IoThread = struct {
                     self.processRedraw(notif.params) catch |err| {
                         log.debug("Redraw processing error: {}", .{err});
                     };
+                } else if (std.mem.eql(u8, notif.method, "ghostty_buf_info")) {
+                    self.processGhosttyBufInfo(notif.params);
                 }
             },
             .Response => |resp| {
@@ -1103,6 +1117,20 @@ pub const IoThread = struct {
         }
 
         return {};
+    }
+
+    fn processGhosttyBufInfo(self: *Self, params: Payload) void {
+        const args = switch (params) {
+            .arr => |arr| arr,
+            else => return,
+        };
+        if (args.len < 1) return;
+        const ft_str = switch (args[0]) {
+            .str => |s| s.value(),
+            else => return,
+        };
+        const owned = self.alloc.dupe(u8, ft_str) catch return;
+        self.event_queue.push(.{ .buf_info = .{ .filetype = owned } }) catch return;
     }
 
     fn processRedraw(self: *Self, params: Payload) !void {

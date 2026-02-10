@@ -92,6 +92,10 @@ pub const NeovimGui = struct {
     /// Whether cursor style is enabled (from mode_info_set)
     cursor_style_enabled: bool = true,
 
+    /// Filetype of the main editor buffer (ignores popups/noice/nvim-tree).
+    /// Used by the adapter to decide per-filetype rendering (e.g. markdown).
+    current_filetype: ?[]const u8 = null,
+
     /// Neovide-style cursor renderer with trail and particles
     cursor_renderer: CursorRenderer = CursorRenderer.init(),
 
@@ -160,6 +164,7 @@ pub const NeovimGui = struct {
         self.hl_attrs.deinit();
 
         if (self.cursor_modes.len > 0) self.alloc.free(self.cursor_modes);
+        if (self.current_filetype) |ft| self.alloc.free(ft);
         if (self.title.len > 0) self.alloc.free(self.title);
         if (self.icon.len > 0) self.alloc.free(self.icon);
 
@@ -259,6 +264,17 @@ pub const NeovimGui = struct {
         try self.io.?.start();
         self.ready = true;
         try self.io.?.resizeUi(self.grid_width, self.grid_height);
+
+        // Ask neovim to notify us when the buffer filetype changes.
+        self.io.?.sendCommand(
+            "autocmd BufEnter,FileType * call rpcnotify(0, 'ghostty_buf_info', &filetype)",
+        ) catch {};
+
+        // For markdown buffers: disable concealment (we do our own rendering),
+        // hide line numbers (Notion-like clean look), and set wrap.
+        self.io.?.sendCommand(
+            "autocmd FileType markdown setlocal conceallevel=0 nonumber norelativenumber signcolumn=no wrap linebreak",
+        ) catch {};
     }
 
     /// Build a unique socket path under XDG_RUNTIME_DIR (or /tmp as fallback).
@@ -526,6 +542,29 @@ pub const NeovimGui = struct {
             .nvim_exited => {
                 self.exited = true;
                 self.dirty = true;
+            },
+            .buf_info => |data| {
+                // Ignore transient buffers (popups, file trees, command lines).
+                // Only track filetype for real editor buffers.
+                const dominated_filetypes = [_][]const u8{
+                    "NvimTree",      "noice",          "TelescopePrompt", "TelescopeResults",
+                    "notify",        "lazy",           "mason",           "help",
+                    "qf",            "packer",         "alpha",           "dashboard",
+                    "neo-tree",      "Trouble",        "toggleterm",      "WhichKey",
+                    "DressingInput", "DressingSelect", "",
+                };
+                var dominated = false;
+                for (&dominated_filetypes) |ft| {
+                    if (std.mem.eql(u8, data.filetype, ft)) {
+                        dominated = true;
+                        break;
+                    }
+                }
+                if (!dominated) {
+                    if (self.current_filetype) |old| self.alloc.free(old);
+                    self.current_filetype = self.alloc.dupe(u8, data.filetype) catch null;
+                    self.dirty = true;
+                }
             },
         }
     }

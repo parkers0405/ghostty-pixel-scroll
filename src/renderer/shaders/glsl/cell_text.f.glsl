@@ -39,7 +39,7 @@ void main() {
         uvec2 grid_size = unpack2u16(grid_size_packed_2u16);
         vec2 adjusted_coord = gl_FragCoord.xy;
         adjusted_coord.y += pixel_scroll_offset_y;
-        ivec2 dest_grid_pos = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
+        ivec2 dest_grid_pos = gridPosFromPixel(adjusted_coord - grid_padding.wx);
         
         if (dest_grid_pos.x >= 0 && dest_grid_pos.x < int(grid_size.x) &&
             dest_grid_pos.y >= 0 && dest_grid_pos.y < int(grid_size.y)) {
@@ -60,7 +60,7 @@ void main() {
         uvec2 tui_region = unpack2u16(tui_scroll_region_packed);
         vec2 adj = gl_FragCoord.xy;
         adj.y += pixel_scroll_offset_y;
-        ivec2 frag_grid = ivec2(floor((adj - grid_padding.wx) / cell_size));
+        ivec2 frag_grid = gridPosFromPixel(adj - grid_padding.wx);
         if (in_data.cell_grid_pos.y >= tui_region.x &&
             in_data.cell_grid_pos.y <= tui_region.y) {
             if (frag_grid.y < int(tui_region.x) || frag_grid.y > int(tui_region.y)) {

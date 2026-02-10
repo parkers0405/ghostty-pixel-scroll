@@ -29,13 +29,11 @@ vec4 cell_bg() {
     // Use the SHIFTED position so the padding check correctly excludes extra rows
     // regardless of the current scroll offset value.
     bool has_extra_rows = (pixel_scroll_offset_y > 0.0);
-    ivec2 unshifted_grid_pos = ivec2(floor((gl_FragCoord.xy - grid_padding.wx) / cell_size));
+    ivec2 unshifted_grid_pos = gridPosFromPixel(gl_FragCoord.xy - grid_padding.wx);
     int visible_rows = has_extra_rows ? int(grid_size.y) - 2 : int(grid_size.y);
     bool in_padding;
     if (has_extra_rows) {
-        // Check in shifted space: rows [1, grid_size.y-2] are visible content.
-        // Row 0 is the extra top row, row grid_size.y-1 is the extra bottom row.
-        ivec2 shifted_grid_pos = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
+        ivec2 shifted_grid_pos = gridPosFromPixel(adjusted_coord - grid_padding.wx);
         in_padding = (shifted_grid_pos.y < 1 || shifted_grid_pos.y >= int(grid_size.y) - 1);
     } else {
         in_padding = (unshifted_grid_pos.y < 0 || unshifted_grid_pos.y >= visible_rows);
@@ -45,14 +43,14 @@ vec4 cell_bg() {
     bool in_tui_scroll_region = false;
     uvec2 tui_region = unpack2u16(tui_scroll_region_packed);
     if (tui_scroll_offset_y != 0.0) {
-        ivec2 pre_grid_pos = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
+        ivec2 pre_grid_pos = gridPosFromPixel(adjusted_coord - grid_padding.wx);
         if (pre_grid_pos.y >= int(tui_region.x) && pre_grid_pos.y <= int(tui_region.y)) {
             adjusted_coord.y += tui_scroll_offset_y;
             in_tui_scroll_region = true;
         }
     }
     
-    ivec2 grid_pos = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
+    ivec2 grid_pos = gridPosFromPixel(adjusted_coord - grid_padding.wx);
 
     // Clamp grid_pos.y to scroll region for shifted pixels
     if (in_tui_scroll_region) {
@@ -73,7 +71,7 @@ vec4 cell_bg() {
         if (offset_i16 != 0) {
             float per_cell_offset_y = round(float(offset_i16) / 256.0);
             adjusted_coord.y -= per_cell_offset_y;
-            ivec2 new_grid_pos = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
+            ivec2 new_grid_pos = gridPosFromPixel(adjusted_coord - grid_padding.wx);
             
             // Check if the new position is a fixed cell (statusline)
             // If so, don't use that cell's color - keep the original scrolling cell's color
@@ -107,7 +105,7 @@ vec4 cell_bg() {
         // since unshifted may not correctly identify top/bottom padding.
         bool is_top_padding;
         if (has_extra_rows) {
-            ivec2 shifted_gp = ivec2(floor((adjusted_coord - grid_padding.wx) / cell_size));
+            ivec2 shifted_gp = gridPosFromPixel(adjusted_coord - grid_padding.wx);
             is_top_padding = (shifted_gp.y < 1);
         } else {
             is_top_padding = (unshifted_grid_pos.y < 0);

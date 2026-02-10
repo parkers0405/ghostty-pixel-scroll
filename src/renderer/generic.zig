@@ -169,6 +169,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
         /// The font structures.
         font_grid: *font.SharedGrid,
+        /// Proportional font index within the main font_grid's collection.
+        /// Set lazily when markdown mode first activates. null = not loaded.
+        markdown_font_idx: ?font.Collection.Index = null,
+        /// Precomputed advance widths for ASCII chars in the proportional font.
+        /// Indexed by codepoint (0-127). 0 = use default cell_width.
+        markdown_advances: [128]f32 = .{0} ** 128,
         font_shaper: font.Shaper,
         font_shaper_cache: font.ShaperCache,
 
@@ -300,6 +306,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Scratch buffers for the neovim→gui adapter. Reused across frames.
         nvim_adapter_state: nvim_adapter.AdapterState = .{},
 
+        /// Per-row Y offsets and heights for variable row height rendering.
+        row_y_data: [256]f32 = undefined,
+        row_h_data: [256]f32 = undefined,
+        /// Per-cell X pixel offsets (flat array: row * cols + col).
+        /// Default: col * cell_size.x. Proportional mode computes from glyph advances.
+        cell_x_data: [32768]f32 = undefined,
+
         /// Panel GUI state. When set, the renderer composites the panel
         /// alongside the terminal content.
         panel: ?*panel_gui_mod.PanelGui = null,
@@ -402,6 +415,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             uniforms_cursor: UniformBuffer,
             cells: CellTextBuffer,
             cells_bg: CellBgBuffer,
+            row_y: FloatBuffer,
+            row_h: FloatBuffer,
+            cell_x: FloatBuffer,
 
             grayscale: Texture,
             grayscale_modified: usize = 0,
@@ -427,6 +443,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const CellBgBuffer = Buffer(shaderpkg.CellBg);
             const CellTextBuffer = Buffer(shaderpkg.CellText);
             const BgImageBuffer = Buffer(shaderpkg.BgImage);
+            const FloatBuffer = Buffer(f32);
 
             pub fn init(api: GraphicsAPI, custom_shaders: bool) !FrameState {
                 // Uniform buffer contains exactly 1 uniform struct. The
@@ -449,6 +466,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 errdefer cells.deinit();
                 var cells_bg = try CellBgBuffer.init(api.bgBufferOptions(), 1);
                 errdefer cells_bg.deinit();
+                var row_y_buf = try FloatBuffer.init(api.bgBufferOptions(), 1);
+                errdefer row_y_buf.deinit();
+                var row_h_buf = try FloatBuffer.init(api.bgBufferOptions(), 1);
+                errdefer row_h_buf.deinit();
+                var cell_x_buf = try FloatBuffer.init(api.bgBufferOptions(), 1);
+                errdefer cell_x_buf.deinit();
 
                 // Create a GPU buffer for our background image info.
                 var bg_image_buffer = try BgImageBuffer.init(
@@ -490,6 +513,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .uniforms_cursor = uniforms_cursor,
                     .cells = cells,
                     .cells_bg = cells_bg,
+                    .row_y = row_y_buf,
+                    .row_h = row_h_buf,
+                    .cell_x = cell_x_buf,
                     .bg_image_buffer = bg_image_buffer,
                     .grayscale = grayscale,
                     .color = color,
@@ -503,6 +529,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.uniforms_cursor.deinit();
                 self.cells.deinit();
                 self.cells_bg.deinit();
+                self.row_y.deinit();
+                self.row_h.deinit();
+                self.cell_x.deinit();
                 self.grayscale.deinit();
                 self.color.deinit();
                 self.bg_image_buffer.deinit();
@@ -898,6 +927,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
                 // Fonts
                 .font_grid = options.font_grid,
+                .markdown_font_idx = null,
                 .font_shaper = font_shaper,
                 .font_shaper_cache = font.ShaperCache.init(),
 
@@ -1312,6 +1342,64 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // an outdated atlas from the old grid and this can cause garbage
             // to be rendered.
             self.markDirty();
+        }
+
+        /// Add a proportional sans-serif font to the existing font grid's
+        /// collection. Glyphs share the same atlas as monospace — no extra
+        /// textures needed. We store the collection index so addGuiGlyph can
+        /// reference it directly for markdown content.
+        fn initMarkdownFont(self: *Self) void {
+            if (self.markdown_font_idx != null) return;
+
+            const Disco = font.Discover;
+            if (comptime Disco == void) return;
+
+            var disco = Disco.init();
+            defer disco.deinit();
+
+            var disco_it = disco.discover(self.alloc, .{
+                .family = "sans-serif",
+                .size = @floatFromInt(self.grid_metrics.cell_height),
+                .monospace = false,
+            }) catch return;
+            defer disco_it.deinit();
+
+            const deferred = disco_it.next() catch return orelse return;
+
+            // Add as a non-fallback entry so we get a stable index.
+            const idx = self.font_grid.resolver.collection.addDeferred(self.alloc, deferred, .{
+                .style = .regular,
+                .fallback = true,
+                .size_adjustment = .none,
+            }) catch return;
+
+            self.markdown_font_idx = idx;
+
+            // Load the face and precompute ASCII advance widths.
+            const face = self.font_grid.resolver.collection.getFace(idx) catch {
+                self.markdown_font_idx = null;
+                return;
+            };
+            // Query advance for each ASCII char by loading glyphs.
+            // The face's ft_mutex is held per-call by glyphIndex.
+            for (32..127) |cp| {
+                if (face.glyphIndex(@intCast(cp))) |gi| {
+                    // Use renderGlyph to get the glyph metrics (it caches).
+                    const result = self.font_grid.renderGlyph(
+                        self.alloc,
+                        idx,
+                        gi,
+                        .{ .grid_metrics = self.grid_metrics },
+                    ) catch continue;
+                    // Glyph width is a reasonable proxy for advance.
+                    self.markdown_advances[cp] = @floatFromInt(result.glyph.width);
+                }
+            }
+            // Default space width — if not set, use half cell width.
+            if (self.markdown_advances[' '] == 0)
+                self.markdown_advances[' '] = @floatFromInt(self.grid_metrics.cell_width / 2);
+
+            log.info("proportional font loaded with advance table", .{});
         }
 
         /// Update uniforms that are based on the font grid.
@@ -1890,6 +1978,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const needs_rebuild = content_dirty or scroll_dirty;
 
             if (needs_rebuild) {
+                // Load proportional font on first markdown detection.
+                if (nvim_adapter.isMarkdownActive()) self.initMarkdownFont();
+
                 // Build generic GuiState via the adapter, then render.
                 nvim_adapter.setFrameNvim(nvim);
                 const gui_state = nvim_adapter.buildGuiState(
@@ -1964,6 +2055,59 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             }
 
             const default_bg = state.config.default_bg;
+            const base_cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+
+            // Compute per-row Y offsets. For each row, check if the first
+            // window's cells specify a row_height > 1.0 (e.g. headings).
+            // The cumulative Y offset gives each row its pixel position.
+            {
+                var y_accum: f32 = 0;
+                const row_limit = @min(@as(u32, rows), 256);
+                for (0..row_limit) |r| {
+                    self.row_y_data[r] = y_accum;
+                    // Check first window for row_height on this row.
+                    var rh: f32 = base_cell_h;
+                    if (windows.len > 0) {
+                        const w = windows[0];
+                        if (w.getCell(w.ctx, @intCast(r), 0)) |cell| {
+                            if (cell.style.row_height != 1.0 and cell.style.row_height > 0.1) {
+                                rh = base_cell_h * cell.style.row_height;
+                            }
+                        }
+                    }
+                    self.row_h_data[r] = rh;
+                    y_accum += rh;
+                }
+            }
+
+            // Compute per-cell X offsets from precomputed advance table.
+            const base_cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
+            if (self.markdown_font_idx != null) {
+                const rl = @min(@as(u32, rows), 256);
+                for (0..rl) |r| {
+                    var x_accum: f32 = 0;
+                    for (0..cols) |c| {
+                        const flat = r * cols + c;
+                        if (flat >= 32768) break;
+                        self.cell_x_data[flat] = x_accum;
+
+                        var advance: f32 = base_cell_w;
+                        if (windows.len > 0) {
+                            const w = windows[0];
+                            if (w.getCell(w.ctx, @intCast(r), @intCast(c))) |cell| {
+                                const t = cell.getText();
+                                if (t.len > 0) {
+                                    const cp_byte = t[0];
+                                    if (cp_byte < 128 and self.markdown_advances[cp_byte] > 0) {
+                                        advance = self.markdown_advances[cp_byte];
+                                    }
+                                }
+                            }
+                        }
+                        x_accum += advance;
+                    }
+                }
+            }
 
             // Fill grid with default bg.
             const bg_r: u8 = @intCast((default_bg >> 16) & 0xFF);
@@ -2369,15 +2513,60 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             else
                 .regular;
 
-            const cell_width: u2 = 1; // TODO: wide char detection
-            const render_result = self.font_grid.renderCodepoint(
-                self.alloc,
-                codepoint,
-                font_style,
-                explicit_presentation,
-                .{ .cell_width = cell_width, .grid_metrics = self.grid_metrics },
-            ) catch return;
-            const render = render_result orelse return;
+            // Scale grid metrics for tall rows (headings).
+            var glyph_metrics = self.grid_metrics;
+            if (style.row_height > 1.0 and style.row_height <= 3.0) {
+                const s = style.row_height;
+                glyph_metrics.cell_height = @intFromFloat(@as(f32, @floatFromInt(glyph_metrics.cell_height)) * s);
+                glyph_metrics.cell_baseline = @intFromFloat(@as(f32, @floatFromInt(glyph_metrics.cell_baseline)) * s);
+            }
+
+            // Use proportional font for markdown content when available.
+            // We look up the glyph in the proportional face directly and
+            // call renderGlyph to bypass the codepoint resolver (which would
+            // pick the monospace font). The glyph goes into the shared atlas.
+            var cell_width: u2 = 1;
+            var render_result: ?font.SharedGrid.Render = null;
+            if (self.markdown_font_idx) |md_idx| {
+                const face = self.font_grid.resolver.collection.getFace(md_idx) catch null;
+                if (face) |f| {
+                    const glyph_idx = f.glyphIndex(codepoint);
+                    if (glyph_idx) |gi| {
+                        render_result = self.font_grid.renderGlyph(
+                            self.alloc,
+                            md_idx,
+                            gi,
+                            .{ .cell_width = cell_width, .grid_metrics = glyph_metrics },
+                        ) catch null;
+                    }
+                }
+            }
+            // Fallback to monospace if proportional lookup failed.
+            if (render_result == null) {
+                render_result = self.font_grid.renderCodepoint(
+                    self.alloc,
+                    codepoint,
+                    font_style,
+                    explicit_presentation,
+                    .{ .cell_width = cell_width, .grid_metrics = glyph_metrics },
+                ) catch return;
+            }
+            var render = render_result orelse return;
+            if (render.presentation == .emoji and cell_width == 1) {
+                cell_width = 2;
+                const emoji_result = self.font_grid.renderCodepoint(
+                    self.alloc,
+                    codepoint,
+                    font_style,
+                    .emoji,
+                    .{
+                        .cell_width = cell_width,
+                        .constraint_width = 2,
+                        .grid_metrics = glyph_metrics,
+                    },
+                ) catch return;
+                render = emoji_result orelse return;
+            }
             if (render.glyph.width == 0 or render.glyph.height == 0) return;
 
             const fixed_offset: i16 = @intFromFloat(std.math.clamp(pixel_offset_y * 256.0, -32768.0, 32767.0));
@@ -2814,6 +3003,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.draw_mutex.lock();
             defer self.draw_mutex.unlock();
 
+            // Default: uniform grid. GUI mode overrides for variable heights/widths.
+            {
+                const ch: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                const cw: f32 = @floatFromInt(self.grid_metrics.cell_width);
+                const rlimit = @min(@as(u32, self.cells.size.rows), 256);
+                var i: u32 = 0;
+                while (i < rlimit) : (i += 1) {
+                    self.row_y_data[i] = @as(f32, @floatFromInt(i)) * ch;
+                    self.row_h_data[i] = ch;
+                }
+                const cols = self.cells.size.columns;
+                const total = @min(@as(u32, rlimit) * cols, 32768);
+                i = 0;
+                while (i < total) : (i += 1) {
+                    const col = i % cols;
+                    self.cell_x_data[i] = @as(f32, @floatFromInt(col)) * cw;
+                }
+            }
+
             // If our swap chain is defunct (e.g., after displayUnrealized but before
             // displayRealized), we can't draw. This can happen during window moves
             // on Wayland/Hyprland where GTK unrealizes but doesn't immediately re-realize.
@@ -3146,6 +3354,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             try frame.uniforms.sync(&.{self.uniforms});
 
             try frame.cells_bg.sync(self.cells.bg_cells);
+
+            // Sync layout buffers for variable row heights and cell X offsets.
+            const row_count = self.cells.size.rows;
+            try frame.row_y.sync(self.row_y_data[0..row_count]);
+            try frame.row_h.sync(self.row_h_data[0..row_count]);
+            const cell_count = @min(@as(u32, row_count) * self.cells.size.columns, 32768);
+            try frame.cell_x.sync(self.cell_x_data[0..cell_count]);
+
             const fg_count = try frame.cells.syncFromArrayLists(self.cells.fg_rows.lists);
 
             // If our background image buffer has changed, sync it.
@@ -3213,7 +3429,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     pass.step(.{
                         .pipeline = self.shaders.pipelines.bg_color,
                         .uniforms = frame.uniforms.buffer,
-                        .buffers = &.{ null, frame.cells_bg.buffer },
+                        .buffers = &.{ null, frame.cells_bg.buffer, frame.row_y.buffer, frame.row_h.buffer, frame.cell_x.buffer },
                         .draw = .{ .type = .triangle, .vertex_count = 3 },
                     });
                 }
@@ -3231,7 +3447,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 pass.step(.{
                     .pipeline = self.shaders.pipelines.cell_bg,
                     .uniforms = frame.uniforms.buffer,
-                    .buffers = &.{ null, frame.cells_bg.buffer },
+                    .buffers = &.{ null, frame.cells_bg.buffer, frame.row_y.buffer, frame.row_h.buffer, frame.cell_x.buffer },
                     .draw = .{ .type = .triangle, .vertex_count = 3 },
                 });
 
@@ -3250,6 +3466,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .buffers = &.{
                         frame.cells.buffer,
                         frame.cells_bg.buffer,
+                        frame.row_y.buffer,
+                        frame.row_h.buffer,
+                        frame.cell_x.buffer,
                     },
                     .textures = &.{
                         frame.grayscale,

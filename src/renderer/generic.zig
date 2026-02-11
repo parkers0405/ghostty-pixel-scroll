@@ -310,6 +310,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Scratch buffers for the neovim→gui adapter. Reused across frames.
         nvim_adapter_state: nvim_adapter.AdapterState = .{},
 
+        /// Neovim image preview state.
+        nvim_image_token_seen: u64 = 0,
+        nvim_image_active: bool = false,
+        nvim_image_size: struct {
+            width: u32 = 0,
+            height: u32 = 0,
+        } = .{},
+        nvim_image_window_id: ?u64 = null,
+
         /// Panel GUI state. When set, the renderer composites the panel
         /// alongside the terminal content.
         panel: ?*panel_gui_mod.PanelGui = null,
@@ -1875,6 +1884,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.draw_mutex.lock();
             defer self.draw_mutex.unlock();
 
+            const preview_changed = self.updateNvimImagePreview(nvim, now);
+            self.nvim_image_window_id = null;
+            if (self.nvim_image_active) {
+                if (nvim.getWindow(nvim.cursor_grid)) |window| {
+                    self.nvim_image_window_id = window.id;
+                }
+            }
+
             // Don't use global pixel_scroll_offset_y for Neovim mode
             // Each window has its own scroll animation handled via per-cell offsets
             self.uniforms.pixel_scroll_offset_y = 0;
@@ -1897,7 +1914,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            const needs_rebuild = content_dirty or scroll_dirty;
+            const needs_rebuild = content_dirty or scroll_dirty or preview_changed;
 
             if (needs_rebuild) {
                 // Build generic GuiState via the adapter, then render.
@@ -1943,6 +1960,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
+            self.updateNvimImagePlacement(nvim);
+
             const bg = nvim.default_background;
             self.uniforms.bg_color = .{
                 @intCast((bg >> 16) & 0xFF),
@@ -1951,6 +1970,182 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 @intFromFloat(@round(self.config.background_opacity * 255.0)),
             };
             self.font_shaper.endFrame();
+        }
+
+        fn updateNvimImagePreview(self: *Self, nvim: *neovim_gui.NeovimGui, now: std.time.Instant) bool {
+            if (self.nvim_image_token_seen == nvim.image_preview_token) return false;
+            self.nvim_image_token_seen = nvim.image_preview_token;
+
+            var new_active = false;
+            var new_size = self.nvim_image_size;
+            new_size.width = 0;
+            new_size.height = 0;
+            var image_updated = false;
+
+            const path = nvim.image_preview_path;
+            if (path.len > 0 and std.mem.indexOf(u8, path, "://") == null) {
+                const ext = std.fs.path.extension(path);
+                const ext_type = FileType.guessFromExtension(ext);
+                if (ext_type != .unknown) {
+                    new_active = true;
+
+                    const file_open = if (std.fs.path.isAbsolute(path))
+                        std.fs.openFileAbsolute(path, .{})
+                    else
+                        std.fs.cwd().openFile(path, .{});
+
+                    if (file_open) |file| {
+                        defer file.close();
+                        load_image: {
+                            const contents = file.readToEndAlloc(
+                                self.alloc,
+                                std.math.maxInt(u32),
+                            ) catch |err| {
+                                log.warn("error reading image preview file \"{s}\": {}", .{ path, err });
+                                break :load_image;
+                            };
+                            defer self.alloc.free(contents);
+
+                            const detected = FileType.detect(contents);
+                            const file_type = if (detected == .unknown) ext_type else detected;
+
+                            switch (file_type) {
+                                .png => {
+                                    const image_data = wuffs.png.decode(self.alloc, contents) catch |err| {
+                                        log.warn("error decoding png preview \"{s}\": {}", .{ path, err });
+                                        break :load_image;
+                                    };
+                                    defer self.alloc.free(image_data.data);
+
+                                    self.images.previewUpdate(
+                                        self.alloc,
+                                        .{
+                                            .width = image_data.width,
+                                            .height = image_data.height,
+                                            .pixel_format = .rgba,
+                                            .data = image_data.data.ptr,
+                                        },
+                                        now,
+                                    ) catch |err| {
+                                        log.warn("error updating preview image err={}", .{err});
+                                        break :load_image;
+                                    };
+                                    new_size.width = image_data.width;
+                                    new_size.height = image_data.height;
+                                    image_updated = true;
+                                },
+                                .jpeg => {
+                                    const image_data = wuffs.jpeg.decode(self.alloc, contents) catch |err| {
+                                        log.warn("error decoding jpeg preview \"{s}\": {}", .{ path, err });
+                                        break :load_image;
+                                    };
+                                    defer self.alloc.free(image_data.data);
+
+                                    self.images.previewUpdate(
+                                        self.alloc,
+                                        .{
+                                            .width = image_data.width,
+                                            .height = image_data.height,
+                                            .pixel_format = .rgba,
+                                            .data = image_data.data.ptr,
+                                        },
+                                        now,
+                                    ) catch |err| {
+                                        log.warn("error updating preview image err={}", .{err});
+                                        break :load_image;
+                                    };
+                                    new_size.width = image_data.width;
+                                    new_size.height = image_data.height;
+                                    image_updated = true;
+                                },
+                                .unknown => {
+                                    new_active = false;
+                                },
+                                else => |f| {
+                                    log.warn("unsupported preview file type {} for \"{s}\"", .{ f, path });
+                                },
+                            }
+                        }
+                    } else |err| {
+                        log.warn("error opening image preview file \"{s}\": {}", .{ path, err });
+                    }
+                }
+            }
+
+            if (!image_updated) {
+                self.images.previewUpdate(self.alloc, null, now) catch |err| {
+                    log.warn("error clearing preview image err={}", .{err});
+                };
+            }
+
+            self.nvim_image_active = new_active;
+            self.nvim_image_size = new_size;
+            return true;
+        }
+
+        fn updateNvimImagePlacement(self: *Self, nvim: *neovim_gui.NeovimGui) void {
+            var placement: ?imagepkg.Placement = null;
+
+            if (self.nvim_image_active and self.nvim_image_size.width > 0 and self.nvim_image_size.height > 0) {
+                if (nvim.getWindow(nvim.cursor_grid)) |window| {
+                    const render_width = window.getRenderWidth();
+                    const render_height = window.getRenderHeight();
+                    const margin_top = window.viewport_margins.top;
+                    const margin_bottom = window.viewport_margins.bottom;
+
+                    const inner_rows = render_height -| margin_top -| margin_bottom;
+                    const inner_cols = render_width;
+
+                    if (inner_rows > 0 and inner_cols > 0) {
+                        const cell_w: f32 = @floatFromInt(self.grid_metrics.cell_width);
+                        const cell_h: f32 = @floatFromInt(self.grid_metrics.cell_height);
+
+                        const avail_w: f32 = @as(f32, @floatFromInt(inner_cols)) * cell_w;
+                        const avail_h: f32 = @as(f32, @floatFromInt(inner_rows)) * cell_h;
+
+                        const img_w: f32 = @floatFromInt(self.nvim_image_size.width);
+                        const img_h: f32 = @floatFromInt(self.nvim_image_size.height);
+
+                        if (avail_w > 0 and avail_h > 0 and img_w > 0 and img_h > 0) {
+                            const scale = @min(avail_w / img_w, avail_h / img_h);
+                            if (scale > 0) {
+                                const dest_w_f = img_w * scale;
+                                const dest_h_f = img_h * scale;
+
+                                const dest_w: u32 = @intFromFloat(@round(dest_w_f));
+                                const dest_h: u32 = @intFromFloat(@round(dest_h_f));
+
+                                if (dest_w > 0 and dest_h > 0) {
+                                    const offset_x_f = if (avail_w > dest_w_f) (avail_w - dest_w_f) / 2 else 0;
+                                    const offset_y_f = if (avail_h > dest_h_f) (avail_h - dest_h_f) / 2 else 0;
+
+                                    const win_col: i32 = @intFromFloat(window.grid_position[0]);
+                                    const win_row: i32 = @intFromFloat(window.grid_position[1]);
+
+                                    placement = .{
+                                        .image_id = .nvim_preview,
+                                        .x = win_col,
+                                        .y = win_row + @as(i32, @intCast(margin_top)),
+                                        .z = 0,
+                                        .width = dest_w,
+                                        .height = dest_h,
+                                        .cell_offset_x = @intFromFloat(@floor(offset_x_f)),
+                                        .cell_offset_y = @intFromFloat(@floor(offset_y_f)),
+                                        .source_x = 0,
+                                        .source_y = 0,
+                                        .source_width = self.nvim_image_size.width,
+                                        .source_height = self.nvim_image_size.height,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            self.images.previewSetPlacement(self.alloc, placement) catch |err| {
+                log.warn("error updating preview placement err={}", .{err});
+            };
         }
 
         /// Rebuild GPU cells from a GuiState (produced by any backend adapter).
@@ -2069,6 +2264,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 const render_height = window.render_height;
                 const is_float = window.window_type != .root;
                 const is_msg = window.window_type == .message;
+                const skip_text = self.nvim_image_active and self.nvim_image_window_id != null and window.id == self.nvim_image_window_id.?;
                 const win_opacity: u8 = @intFromFloat(std.math.clamp(window.opacity * 255.0, 0.0, 255.0));
                 const scroll_offset = window.scroll_pixel_offset;
                 const bg_offset_fixed: i16 = @intFromFloat(std.math.clamp(scroll_offset * 256.0, -32768.0, 32767.0));
@@ -2177,7 +2373,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                             }
 
                             // Text — occlusion-gated, extra row gets text (clipped by shader).
-                            if (owns_cell or is_extra) {
+                            if (!skip_text and (owns_cell or is_extra)) {
                                 const text = c.getText();
                                 if (text.len > 0) {
                                     const eff_offset: f32 = if (is_float) 0 else scroll_offset;
@@ -3280,6 +3476,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     self.shaders.pipelines.image,
                     &pass,
                     .kitty_below_text,
+                );
+
+                // Neovim GUI image preview (beneath text).
+                self.images.draw(
+                    &self.api,
+                    self.shaders.pipelines.image,
+                    &pass,
+                    .nvim_preview,
                 );
 
                 // Text.

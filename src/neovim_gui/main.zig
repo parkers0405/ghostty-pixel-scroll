@@ -116,6 +116,10 @@ pub const NeovimGui = struct {
     /// Window icon name from Neovim (set_icon event, rarely used)
     icon: []const u8 = "",
 
+    /// Image preview path and change token (from ghostty_image notifications)
+    image_preview_path: []const u8 = "",
+    image_preview_token: u64 = 0,
+
     /// Neovim options received via option_set event
     /// Key is the option name (owned), value is the option value
     options: std.StringHashMap(OptionValue),
@@ -162,6 +166,7 @@ pub const NeovimGui = struct {
         if (self.cursor_modes.len > 0) self.alloc.free(self.cursor_modes);
         if (self.title.len > 0) self.alloc.free(self.title);
         if (self.icon.len > 0) self.alloc.free(self.icon);
+        if (self.image_preview_path.len > 0) self.alloc.free(self.image_preview_path);
 
         var opt_it = self.options.iterator();
         while (opt_it.next()) |entry| {
@@ -259,6 +264,38 @@ pub const NeovimGui = struct {
         try self.io.?.start();
         self.ready = true;
         try self.io.?.resizeUi(self.grid_width, self.grid_height);
+
+        self.installImagePreviewAutocmd() catch |err| {
+            log.warn("failed to install image preview autocmd: {}", .{err});
+        };
+    }
+
+    fn installImagePreviewAutocmd(self: *Self) !void {
+        if (self.io == null) return;
+        const cmd =
+            "lua if vim.g.ghostty_image_preview ~= 1 then " ++
+            "vim.g.ghostty_image_preview = 1 " ++
+            "local chan = vim.v.channel " ++
+            "if type(chan) ~= 'number' then " ++
+            "local uis = vim.api.nvim_list_uis() " ++
+            "if uis and uis[1] and type(uis[1].chan) == 'number' then chan = uis[1].chan end " ++
+            "end " ++
+            "vim.g.ghostty_channel = chan " ++
+            "local function ghostty_send() " ++
+            "local c = vim.g.ghostty_channel " ++
+            "if type(c) ~= 'number' then return end " ++
+            "local bt = vim.bo.buftype " ++
+            "local name = '' " ++
+            "if bt == nil or bt == '' then " ++
+            "name = vim.api.nvim_buf_get_name(0) " ++
+            "if name == nil or name == '' then name = '' else name = vim.fn.fnamemodify(name, ':p') end " ++
+            "end " ++
+            "vim.rpcnotify(c, 'ghostty_image', name) " ++
+            "end " ++
+            "vim.api.nvim_create_autocmd({'BufEnter','BufWinEnter','WinEnter'}, {callback = ghostty_send}) " ++
+            "ghostty_send() " ++
+            "end";
+        try self.io.?.sendCommand(cmd);
     }
 
     /// Build a unique socket path under XDG_RUNTIME_DIR (or /tmp as fallback).
@@ -396,6 +433,15 @@ pub const NeovimGui = struct {
                 }
                 // Dupe since event.deinit will free the original
                 self.icon = self.alloc.dupe(u8, new_icon) catch "";
+            },
+            .image_preview => |path| {
+                if (self.image_preview_path.len > 0) {
+                    self.alloc.free(self.image_preview_path);
+                }
+                // Dupe since event.deinit will free the original
+                self.image_preview_path = self.alloc.dupe(u8, path) catch "";
+                self.image_preview_token +%= 1;
+                self.dirty = true;
             },
             .win_viewport_margins => |data| {
                 self.handleWinViewportMargins(data);

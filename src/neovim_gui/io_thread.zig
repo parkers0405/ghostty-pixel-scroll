@@ -126,6 +126,7 @@ pub const Event = union(enum) {
     restart, // Neovim is restarting (preserves state)
     set_title: []const u8, // Window title from Neovim
     set_icon: []const u8, // Window icon name (rarely used)
+    image_preview: []const u8, // Image preview path from Neovim
     win_viewport_margins: WinViewportMargins,
     win_external_pos: WinExternalPos,
     nvim_exited, // Neovim process exited (:q, :qall, etc.)
@@ -560,6 +561,7 @@ pub const Event = union(enum) {
             .option_set => |*os| os.deinit(alloc),
             .set_title => |title| alloc.free(title),
             .set_icon => |icon| alloc.free(icon),
+            .image_preview => |path| alloc.free(path),
             .mode_info_set => |*mis| mis.deinit(alloc),
             .cmdline_show => |*cs| cs.deinit(alloc),
             .cmdline_special_char => |*csc| csc.deinit(alloc),
@@ -1080,6 +1082,28 @@ pub const IoThread = struct {
                     self.processRedraw(notif.params) catch |err| {
                         log.debug("Redraw processing error: {}", .{err});
                     };
+                } else if (std.mem.eql(u8, notif.method, "ghostty_image")) {
+                    const params = notif.params;
+                    const arr = switch (params) {
+                        .arr => |a| a,
+                        else => return {},
+                    };
+                    const path = if (arr.len > 0) switch (arr[0]) {
+                        .str => |s| s.value(),
+                        else => "",
+                    } else "";
+
+                    const duped = self.alloc.dupe(u8, path) catch return {};
+                    self.event_queue.push(.{ .image_preview = duped }) catch {
+                        self.alloc.free(duped);
+                        return {};
+                    };
+
+                    if (self.nvim_gui) |nvim_ptr| {
+                        const neovim_gui = @import("main.zig");
+                        const nvim: *neovim_gui.NeovimGui = @ptrCast(@alignCast(nvim_ptr));
+                        nvim.triggerRenderWakeup();
+                    }
                 }
             },
             .Response => |resp| {

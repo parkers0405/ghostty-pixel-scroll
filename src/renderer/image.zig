@@ -33,6 +33,9 @@ pub const State = struct {
     /// on frame builds and are generally more expensive to handle.
     kitty_virtual: bool,
 
+    /// Image preview placements for Neovim GUI.
+    preview_placements: std.ArrayListUnmanaged(Placement),
+
     /// Overlays
     overlay_placements: std.ArrayListUnmanaged(Placement),
 
@@ -42,6 +45,7 @@ pub const State = struct {
         .kitty_bg_end = 0,
         .kitty_text_end = 0,
         .kitty_virtual = false,
+        .preview_placements = .empty,
         .overlay_placements = .empty,
     };
 
@@ -52,6 +56,7 @@ pub const State = struct {
             self.images.deinit(alloc);
         }
         self.kitty_placements.deinit(alloc);
+        self.preview_placements.deinit(alloc);
         self.overlay_placements.deinit(alloc);
     }
 
@@ -94,6 +99,7 @@ pub const State = struct {
         kitty_below_bg,
         kitty_below_text,
         kitty_above_text,
+        nvim_preview,
         overlay,
     };
 
@@ -112,6 +118,7 @@ pub const State = struct {
             .kitty_below_bg => self.kitty_placements.items[0..self.kitty_bg_end],
             .kitty_below_text => self.kitty_placements.items[self.kitty_bg_end..self.kitty_text_end],
             .kitty_above_text => self.kitty_placements.items[self.kitty_text_end..],
+            .nvim_preview => self.preview_placements.items,
             .overlay => self.overlay_placements.items,
         };
 
@@ -229,6 +236,41 @@ pub const State = struct {
         });
     }
 
+    /// Update our Neovim image preview state. Null value deletes any existing preview.
+    pub fn previewUpdate(
+        self: *State,
+        alloc: Allocator,
+        pending_: ?Image.Pending,
+        transmit_time: std.time.Instant,
+    ) !void {
+        const pending = pending_ orelse {
+            if (self.images.getPtr(.nvim_preview)) |data| {
+                data.image.markForUnload();
+            }
+            return;
+        };
+
+        try self.prepImage(
+            alloc,
+            .nvim_preview,
+            transmit_time,
+            pending,
+        );
+    }
+
+    /// Set a single Neovim preview placement (or clear if null).
+    pub fn previewSetPlacement(
+        self: *State,
+        alloc: Allocator,
+        placement: ?Placement,
+    ) !void {
+        self.preview_placements.clearRetainingCapacity();
+        if (placement) |p| {
+            try self.preview_placements.ensureUnusedCapacity(alloc, 1);
+            self.preview_placements.appendAssumeCapacity(p);
+        }
+    }
+
     /// Returns true if the Kitty graphics state requires an update based
     /// on the terminal state and our internal state.
     ///
@@ -281,6 +323,7 @@ pub const State = struct {
                     },
 
                     .overlay => {},
+                    .nvim_preview => {},
                 }
             }
         }
@@ -661,16 +704,24 @@ pub const Id = union(enum) {
     /// image for now. In the future we can support layers here if we want.
     overlay,
 
+    /// Neovim GUI image preview.
+    nvim_preview,
+
     /// Z-ordering tie-breaker for images with the same z value.
     pub fn zLessThan(lhs: Id, rhs: Id) bool {
         // If our tags aren't the same, we sort by tag.
         if (std.meta.activeTag(lhs) != std.meta.activeTag(rhs)) {
-            return switch (lhs) {
-                // Kitty images always sort before (lower z) non-kitty images.
-                .kitty => true,
-
-                .overlay => false,
+            const lhs_order: u8 = switch (lhs) {
+                .kitty => 0,
+                .nvim_preview => 1,
+                .overlay => 2,
             };
+            const rhs_order: u8 = switch (rhs) {
+                .kitty => 0,
+                .nvim_preview => 1,
+                .overlay => 2,
+            };
+            return lhs_order < rhs_order;
         }
 
         switch (lhs) {
@@ -680,7 +731,7 @@ pub const Id = union(enum) {
             },
 
             // No sensical ordering
-            .overlay => return false,
+            .overlay, .nvim_preview => return false,
         }
     }
 };

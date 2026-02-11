@@ -269,6 +269,10 @@ pub const Uniforms = extern struct {
     /// Whether to use corner-based cursor rendering
     cursor_use_corners: bool align(1) = false,
 
+    /// Smooth blink opacity for cursor (0.0 = fully hidden, 1.0 = fully visible).
+    /// Applied in the shader to both the cursor glyph and text-under-cursor recoloring.
+    cursor_blink_opacity: f32 align(4) = 1.0,
+
     /// Sonicboom VFX: expanding ring effect on cursor arrival
     /// center = pixel position, radius = current expansion, alpha = fade (0-1)
     sonicboom_center: [2]f32 align(8) = .{ -100, -100 },

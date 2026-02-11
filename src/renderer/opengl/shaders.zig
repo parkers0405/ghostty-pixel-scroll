@@ -215,6 +215,9 @@ pub const Uniforms = extern struct {
     /// Whether to use corner-based cursor rendering (as u32 for GLSL std140 alignment)
     cursor_use_corners: u32 align(4) = 0,
 
+    /// Smooth blink opacity for cursor (0.0 = fully hidden, 1.0 = fully visible).
+    cursor_blink_opacity: f32 align(4) = 1.0,
+
     /// Sonicboom VFX: expanding ring effect on cursor arrival
     sonicboom_center: [2]f32 align(8) = .{ -100, -100 },
     sonicboom_radius: f32 align(4) = 0,

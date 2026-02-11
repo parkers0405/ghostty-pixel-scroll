@@ -223,6 +223,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Whether cursor animation is currently active (needs continuous render)
         cursor_animating: bool = false,
 
+        /// Smooth cursor blink opacity (0.0 = fully hidden, 1.0 = fully visible).
+        /// Instead of hard on/off blink, we smoothly fade the cursor opacity so
+        /// the blink integrates nicely with spring-based cursor animations.
+        cursor_blink_opacity: f32 = 1.0,
+        cursor_blink_target: f32 = 1.0,
+        cursor_blink_animating: bool = false,
+        cursor_blink_visible_raw: bool = true,
+        /// Whether the Neovim GUI cursor wants blinking (from mode_info blinkon > 0)
+        nvim_cursor_blink: bool = false,
+
         /// Last cursor style for detecting mode changes (insert↔normal) to trigger sonicboom
         last_cursor_style_for_boom: ?renderer.CursorStyle = null,
 
@@ -647,6 +657,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cursor_color: ?configpkg.Config.TerminalColor,
             cursor_opacity: f64,
             cursor_text: ?configpkg.Config.TerminalColor,
+            cursor_style_blink: ?bool,
             background: terminal.color.RGB,
             background_opacity: f64,
             background_opacity_cells: bool,
@@ -747,6 +758,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .cursor_color = config.@"cursor-color",
                     .cursor_text = config.@"cursor-text",
                     .cursor_opacity = @max(0, @min(1, config.@"cursor-opacity")),
+                    .cursor_style_blink = config.@"cursor-style-blink",
 
                     .background = config.background.toTerminalRGB(),
                     .foreground = config.foreground.toTerminalRGB(),
@@ -1181,6 +1193,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             return self.cursor_animating or
                 self.scroll_animating or
                 self.sonicboom_active or
+                self.cursor_blink_animating or
                 // In Neovim GUI mode we also need to keep running while
                 // events are pending (dirty flag means content changed)
                 (self.nvim_gui != null and self.nvim_gui.?.dirty) or
@@ -1346,6 +1359,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.panel = state.panel;
             self.real_screen_width = state.real_screen_width;
             self.real_screen_height = state.real_screen_height;
+
+            // Store the raw blink timer state early so it's available in both
+            // Neovim GUI and terminal paths (Neovim GUI returns early below).
+            self.cursor_blink_visible_raw = cursor_blink_visible;
 
             // If in Neovim GUI mode, use a separate update path
             if (self.nvim_gui) |nvim| {
@@ -1641,13 +1658,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // Track alternate screen state before rebuilding cells (affects row offsets).
                 self.in_alternate_screen = critical.tui_in_alternate;
 
-                // Build our GPU cells
+                // Always pass blink_visible=true so the cursor style is never null
+                // due to blinking. The visual blink is handled via smooth opacity
+                // fade in drawFrame, which integrates nicely with spring animations.
                 self.rebuildCells(
                     critical.preedit,
                     renderer.cursorStyle(&self.terminal_state, .{
                         .preedit = critical.preedit != null,
                         .focused = self.focused,
-                        .blink_visible = cursor_blink_visible,
+                        .blink_visible = true,
                     }),
                     &critical.links,
                 ) catch |err| {
@@ -2259,7 +2278,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
                 self.last_cursor_grid_pos = .{ cursor.screen_col, cursor.screen_row };
                 self.last_cursor_scroll_pos = cursor.scroll_pos;
+
+                // Reset blink to fully visible when cursor moves
+                self.cursor_blink_opacity = 1.0;
+                self.cursor_blink_target = 1.0;
+                self.cursor_blink_animating = false;
             }
+
+            // Store Neovim GUI cursor blink state for the smooth blink system
+            self.nvim_cursor_blink = cursor.blink;
 
             const floaty = self.cursor_animation.getPosition();
             self.corner_cursor.destination = .{ floaty.x + cell_width * 0.5, floaty.y + cell_height * 0.5 };
@@ -2827,7 +2854,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // --- Terminal mode timing with sub-stepping & proper fallback ---
             const now = std.time.Instant.now() catch return;
-            const any_anim = self.cursor_animating or self.scroll_animating or self.sonicboom_active;
+
+            // Update smooth blink opacity target from the raw timer state.
+            // Terminal mode: terminal_state.cursor.blinking + timer toggle.
+            // Neovim GUI mode: cursor-style-blink config overrides Neovim's mode_info.
+            //   null → use Neovim's blinkon setting; true → force blink; false → force no blink.
+            {
+                const should_blink = if (self.nvim_gui != null)
+                    (self.config.cursor_style_blink orelse self.nvim_cursor_blink)
+                else
+                    self.terminal_state.cursor.blinking;
+
+                if (!should_blink) {
+                    self.cursor_blink_target = 1.0;
+                } else {
+                    self.cursor_blink_target = if (self.cursor_blink_visible_raw) 1.0 else 0.0;
+                }
+            }
+
+            const any_anim = self.cursor_animating or self.scroll_animating or self.sonicboom_active or self.cursor_blink_animating;
 
             // Use display refresh period as fallback dt (first frame / time went backwards)
             const fallback_dt_ns: f32 = @floatFromInt(self.display_refresh_ns);
@@ -2906,6 +2951,25 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         }
                     }
                 }
+            }
+
+            // Smooth blink opacity transition (outside sub-stepping — simple lerp).
+            // This runs every frame regardless of other animations.
+            {
+                const blink_speed: f32 = 8.0;
+                const diff = self.cursor_blink_target - self.cursor_blink_opacity;
+                if (@abs(diff) < 0.01) {
+                    self.cursor_blink_opacity = self.cursor_blink_target;
+                    self.cursor_blink_animating = false;
+                } else {
+                    self.cursor_blink_opacity += diff * blink_speed * raw_dt;
+                    self.cursor_blink_opacity = std.math.clamp(self.cursor_blink_opacity, 0.0, 1.0);
+                    self.cursor_blink_animating = true;
+                }
+
+                // Push blink opacity to the shader uniform so the cursor glyph
+                // and text-under-cursor recoloring both fade smoothly.
+                self.uniforms.cursor_blink_opacity = self.cursor_blink_opacity;
             }
 
             // Set rendering uniforms for terminal mode too
@@ -4327,6 +4391,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         self.corner_cursor.snap(target_pixel_x, target_pixel_y, cell_width, cell_height);
                     }
                     self.last_cursor_grid_pos = .{ cursor_x, cursor_y };
+
+                    // Reset blink to fully visible when cursor moves (like Neovide).
+                    // This ensures the cursor appears immediately on keystroke.
+                    self.cursor_blink_opacity = 1.0;
+                    self.cursor_blink_target = 1.0;
+                    self.cursor_blink_animating = false;
                 }
 
                 // Map terminal cursor style to corner cursor shape

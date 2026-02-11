@@ -33,6 +33,7 @@ struct Uniforms {
   float2 cursor_corner_br;  // Bottom-right corner pixel position
   float2 cursor_corner_bl;  // Bottom-left corner pixel position
   bool cursor_use_corners;  // Whether to use corner-based rendering
+  float cursor_blink_opacity; // Smooth blink opacity (0=hidden, 1=visible)
 
   // Sonicboom VFX
   float2 sonicboom_center;     // Pixel position of ring center
@@ -871,6 +872,12 @@ vertex CellTextVertexOut cell_text_vertex(
     true
   );
 
+  // Apply smooth blink opacity to cursor glyph.
+  // This fades the cursor shape during blink instead of hard on/off.
+  if ((in.bools & IS_CURSOR_GLYPH) != 0) {
+    out.color *= uniforms.cursor_blink_opacity;
+  }
+
   // Get the BG color
   out.bg_color = load_color(
     bg_colors[in.grid_pos.y * uniforms.grid_size.x + in.grid_pos.x],
@@ -905,12 +912,15 @@ vertex CellTextVertexOut cell_text_vertex(
 
   // If this cell is the cursor cell, but we're not processing
   // the cursor glyph itself, then we need to change the color.
+  // Lerp between original text color and cursor color based on blink opacity
+  // so text smoothly transitions back to normal during blink-off.
   if ((in.bools & IS_CURSOR_GLYPH) == 0 && is_cursor_pos) {
-    out.color = load_color(
+    float4 cursor_text_color = load_color(
       uniforms.cursor_color,
       uniforms.use_display_p3,
       true
     );
+    out.color = mix(out.color, cursor_text_color, uniforms.cursor_blink_opacity);
   }
 
   return out;

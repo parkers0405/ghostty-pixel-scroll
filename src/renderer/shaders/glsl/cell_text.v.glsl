@@ -149,6 +149,12 @@ void main() {
     // Get our color. We always fetch a linearized version to
     // make it easier to handle minimum contrast calculations.
     out_data.color = load_color(color, true);
+
+    // Apply smooth blink opacity to cursor glyph.
+    // This fades the cursor shape during blink instead of hard on/off.
+    if ((glyph_bools & IS_CURSOR_GLYPH) != 0u) {
+        out_data.color *= cursor_blink_opacity;
+    }
     // Get the BG color
     out_data.bg_color = load_color(
             unpack4u8(cells[grid_pos.y * grid_size.x + grid_pos.x].color),
@@ -174,7 +180,10 @@ void main() {
 
     // If this cell is the cursor cell, but we're not processing
     // the cursor glyph itself, then we need to change the color.
+    // Lerp between original text color and cursor color based on blink opacity
+    // so text smoothly transitions back to normal during blink-off.
     if ((glyph_bools & IS_CURSOR_GLYPH) == 0 && is_cursor_pos) {
-        out_data.color = load_color(unpack4u8(cursor_color_packed_4u8), use_linear_blending);
+        vec4 cursor_text_color = load_color(unpack4u8(cursor_color_packed_4u8), use_linear_blending);
+        out_data.color = mix(out_data.color, cursor_text_color, cursor_blink_opacity);
     }
 }

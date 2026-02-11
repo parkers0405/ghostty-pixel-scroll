@@ -32,6 +32,7 @@ layout(binding = 1, std140) uniform Globals {
     uniform vec2 cursor_corner_br;  // Bottom-right corner
     uniform vec2 cursor_corner_bl;  // Bottom-left corner
     uniform uint cursor_use_corners;  // Whether to use corner-based rendering (as uint for alignment)
+    uniform float cursor_blink_opacity; // Smooth blink opacity (0=hidden, 1=visible)
     // Sonicboom VFX
     uniform vec2 sonicboom_center;     // Pixel position of ring center
     uniform float sonicboom_radius;    // Current ring radius in pixels

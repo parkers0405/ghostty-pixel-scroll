@@ -46,6 +46,15 @@ pub const EventQueue = struct {
         try self.events.append(self.alloc, event);
     }
 
+    /// Push an entire batch of events atomically (called from I/O thread
+    /// after accumulating a complete Neovim redraw notification).
+    /// The render thread will see either all or none of the batch.
+    pub fn pushAll(self: *Self, batch: []const Event) !void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.events.appendSlice(self.alloc, batch);
+    }
+
     /// Pop all events (called from render thread)
     pub fn popAll(self: *Self, out: *std.ArrayListUnmanaged(Event)) void {
         self.mutex.lock();
@@ -620,6 +629,11 @@ pub const IoThread = struct {
     write_mutex: std.Thread.Mutex = .{},
     write_queue: std.ArrayListUnmanaged([]const u8) = .empty,
 
+    // Local batch buffer for accumulating a complete Neovim redraw notification
+    // before pushing atomically to the event queue. This prevents the render thread
+    // from seeing partial batches (e.g. grid_line without win_viewport_margins).
+    redraw_batch: std.ArrayListUnmanaged(Event) = .empty,
+
     // Thread control
     should_stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
@@ -1129,11 +1143,18 @@ pub const IoThread = struct {
         return {};
     }
 
+    fn pushRedrawEvent(self: *Self, event: Event) !void {
+        try self.redraw_batch.append(self.alloc, event);
+    }
+
     fn processRedraw(self: *Self, params: Payload) !void {
         const events = switch (params) {
             .arr => |arr| arr,
             else => return,
         };
+
+        self.redraw_batch.clearRetainingCapacity();
+        var has_flush = false;
 
         for (events) |event_batch| {
             const batch = switch (event_batch) {
@@ -1147,6 +1168,10 @@ pub const IoThread = struct {
                 else => continue,
             };
 
+            if (std.mem.eql(u8, event_name, "flush")) {
+                has_flush = true;
+            }
+
             // Process each set of arguments
             for (batch[1..]) |args_payload| {
                 const args = switch (args_payload) {
@@ -1159,6 +1184,19 @@ pub const IoThread = struct {
                 };
             }
         }
+
+        if (self.redraw_batch.items.len > 0) {
+            try self.event_queue.pushAll(self.redraw_batch.items);
+            
+            // Wake up renderer if we processed a flush
+            if (has_flush) {
+                if (self.nvim_gui) |nvim_ptr| {
+                    const neovim_gui = @import("main.zig");
+                    const nvim: *neovim_gui.NeovimGui = @ptrCast(@alignCast(nvim_ptr));
+                    nvim.triggerRenderWakeup();
+                }
+            }
+        }
     }
 
     fn processEvent(self: *Self, name: []const u8, args: []const Payload) !void {
@@ -1168,7 +1206,7 @@ pub const IoThread = struct {
                 const width = extractU64(args[1]) orelse return;
                 const height = extractU64(args[2]) orelse return;
                 log.debug("grid_resize: grid={} {}x{}", .{ grid, width, height });
-                try self.event_queue.push(.{ .grid_resize = .{
+                try self.pushRedrawEvent(.{ .grid_resize = .{
                     .grid = grid,
                     .width = width,
                     .height = height,
@@ -1178,7 +1216,7 @@ pub const IoThread = struct {
             try self.handleGridLine(args);
         } else if (std.mem.eql(u8, name, "grid_scroll")) {
             if (args.len >= 7) {
-                try self.event_queue.push(.{ .grid_scroll = .{
+                try self.pushRedrawEvent(.{ .grid_scroll = .{
                     .grid = extractU64(args[0]) orelse return,
                     .top = extractU64(args[1]) orelse return,
                     .bot = extractU64(args[2]) orelse return,
@@ -1191,18 +1229,18 @@ pub const IoThread = struct {
         } else if (std.mem.eql(u8, name, "grid_clear")) {
             if (args.len >= 1) {
                 if (extractU64(args[0])) |grid| {
-                    try self.event_queue.push(.{ .grid_clear = grid });
+                    try self.pushRedrawEvent(.{ .grid_clear = grid });
                 }
             }
         } else if (std.mem.eql(u8, name, "grid_destroy")) {
             if (args.len >= 1) {
                 if (extractU64(args[0])) |grid| {
-                    try self.event_queue.push(.{ .grid_destroy = grid });
+                    try self.pushRedrawEvent(.{ .grid_destroy = grid });
                 }
             }
         } else if (std.mem.eql(u8, name, "grid_cursor_goto")) {
             if (args.len >= 3) {
-                try self.event_queue.push(.{ .grid_cursor_goto = .{
+                try self.pushRedrawEvent(.{ .grid_cursor_goto = .{
                     .grid = extractU64(args[0]) orelse return,
                     .row = extractU64(args[1]) orelse return,
                     .col = extractU64(args[2]) orelse return,
@@ -1219,7 +1257,7 @@ pub const IoThread = struct {
                 // For now, use 0 as placeholder since we don't really need it
                 const win = extractU64(args[1]) orelse 0;
                 log.debug("win_pos: grid={} win={} row={} col={} {}x{}", .{ grid, win, start_row, start_col, width, height });
-                try self.event_queue.push(.{ .win_pos = .{
+                try self.pushRedrawEvent(.{ .win_pos = .{
                     .grid = grid,
                     .win = win,
                     .start_row = start_row,
@@ -1261,7 +1299,7 @@ pub const IoThread = struct {
                 if (use_screen_pos) {
                     // Use the pre-calculated screen position from Neovim
                     // This is simpler and more reliable than calculating from anchor
-                    try self.event_queue.push(.{
+                    try self.pushRedrawEvent(.{
                         .win_float_pos = .{
                             .grid = grid,
                             .win = win,
@@ -1297,7 +1335,7 @@ pub const IoThread = struct {
                         .NW;
 
                     log.debug("win_float_pos: grid={} anchor={s} anchor_grid={} row={d:.1} col={d:.1} zindex={}", .{ grid, anchor_str, anchor_grid, anchor_row, anchor_col, zindex });
-                    try self.event_queue.push(.{ .win_float_pos = .{
+                    try self.pushRedrawEvent(.{ .win_float_pos = .{
                         .grid = grid,
                         .win = win,
                         .anchor = anchor,
@@ -1315,13 +1353,13 @@ pub const IoThread = struct {
         } else if (std.mem.eql(u8, name, "win_hide")) {
             if (args.len >= 1) {
                 if (extractU64(args[0])) |grid| {
-                    try self.event_queue.push(.{ .win_hide = grid });
+                    try self.pushRedrawEvent(.{ .win_hide = grid });
                 }
             }
         } else if (std.mem.eql(u8, name, "win_close")) {
             if (args.len >= 1) {
                 if (extractU64(args[0])) |grid| {
-                    try self.event_queue.push(.{ .win_close = grid });
+                    try self.pushRedrawEvent(.{ .win_close = grid });
                 }
             }
         } else if (std.mem.eql(u8, name, "win_viewport")) {
@@ -1333,7 +1371,7 @@ pub const IoThread = struct {
                 }
                 // Note: args[1] is 'win' which is an ext type (window handle), not a u64
                 // We don't need it for scroll animation, so just skip it
-                try self.event_queue.push(.{
+                try self.pushRedrawEvent(.{
                     .win_viewport = .{
                         .grid = grid,
                         .win = 0, // Not used - the real win is an ext type we can't extract
@@ -1355,7 +1393,7 @@ pub const IoThread = struct {
                 const zindex = if (args.len >= 5) extractU64(args[4]) orelse 200 else 200;
                 const compindex: ?u64 = if (args.len >= 6) extractU64(args[5]) else null;
                 log.debug("msg_set_pos: grid={} row={} scrolled={} zindex={} compindex={any}", .{ grid, row, scrolled, zindex, compindex });
-                try self.event_queue.push(.{ .msg_set_pos = .{
+                try self.pushRedrawEvent(.{ .msg_set_pos = .{
                     .grid = grid,
                     .row = row,
                     .scrolled = scrolled,
@@ -1367,20 +1405,14 @@ pub const IoThread = struct {
             try self.handleHlAttrDefine(args);
         } else if (std.mem.eql(u8, name, "default_colors_set")) {
             if (args.len >= 3) {
-                try self.event_queue.push(.{ .default_colors_set = .{
+                try self.pushRedrawEvent(.{ .default_colors_set = .{
                     .fg = @intCast(extractU64(args[0]) orelse 0xffffff),
                     .bg = @intCast(extractU64(args[1]) orelse 0x1d1f21),
                     .sp = @intCast(extractU64(args[2]) orelse 0xff0000),
                 } });
             }
         } else if (std.mem.eql(u8, name, "flush")) {
-            try self.event_queue.push(.flush);
-            // IMMEDIATELY wake up renderer on flush - this is the key to zero latency
-            if (self.nvim_gui) |nvim_ptr| {
-                const neovim_gui = @import("main.zig");
-                const nvim: *neovim_gui.NeovimGui = @ptrCast(@alignCast(nvim_ptr));
-                nvim.triggerRenderWakeup();
-            }
+            try self.pushRedrawEvent(.flush);
         } else if (std.mem.eql(u8, name, "mode_info_set")) {
             try self.handleModeInfoSet(args);
         } else if (std.mem.eql(u8, name, "mode_change")) {
@@ -1389,22 +1421,22 @@ pub const IoThread = struct {
                 const mode_idx = extractU64(args[1]) orelse 0;
                 const mode_name = if (args[0] == .str) args[0].str.value() else "unknown";
                 log.debug("mode_change: mode='{s}' idx={}", .{ mode_name, mode_idx });
-                try self.event_queue.push(.{ .mode_change = .{
+                try self.pushRedrawEvent(.{ .mode_change = .{
                     .mode_idx = mode_idx,
                 } });
             }
         } else if (std.mem.eql(u8, name, "busy_start")) {
-            try self.event_queue.push(.busy_start);
+            try self.pushRedrawEvent(.busy_start);
         } else if (std.mem.eql(u8, name, "busy_stop")) {
-            try self.event_queue.push(.busy_stop);
+            try self.pushRedrawEvent(.busy_stop);
         } else if (std.mem.eql(u8, name, "mouse_on")) {
-            try self.event_queue.push(.mouse_on);
+            try self.pushRedrawEvent(.mouse_on);
         } else if (std.mem.eql(u8, name, "mouse_off")) {
-            try self.event_queue.push(.mouse_off);
+            try self.pushRedrawEvent(.mouse_off);
         } else if (std.mem.eql(u8, name, "suspend")) {
-            try self.event_queue.push(.suspend_event);
+            try self.pushRedrawEvent(.suspend_event);
         } else if (std.mem.eql(u8, name, "restart")) {
-            try self.event_queue.push(.restart);
+            try self.pushRedrawEvent(.restart);
         } else if (std.mem.eql(u8, name, "set_title")) {
             if (args.len >= 1) {
                 const title = switch (args[0]) {
@@ -1413,7 +1445,7 @@ pub const IoThread = struct {
                 };
                 // Dupe the string since args will be freed
                 const duped = try self.alloc.dupe(u8, title);
-                try self.event_queue.push(.{ .set_title = duped });
+                try self.pushRedrawEvent(.{ .set_title = duped });
             }
         } else if (std.mem.eql(u8, name, "set_icon")) {
             if (args.len >= 1) {
@@ -1423,7 +1455,7 @@ pub const IoThread = struct {
                 };
                 // Dupe the string since args will be freed
                 const duped = try self.alloc.dupe(u8, icon);
-                try self.event_queue.push(.{ .set_icon = duped });
+                try self.pushRedrawEvent(.{ .set_icon = duped });
             }
         } else if (std.mem.eql(u8, name, "win_viewport_margins")) {
             // win_viewport_margins: [grid, win, top, bottom, left, right]
@@ -1437,7 +1469,7 @@ pub const IoThread = struct {
                 const left = extractU64(args[4]) orelse 0;
                 const right = extractU64(args[5]) orelse 0;
                 log.debug("win_viewport_margins PARSED: grid={} win={} top={} bottom={} left={} right={}", .{ grid, win, top, bottom, left, right });
-                try self.event_queue.push(.{ .win_viewport_margins = .{
+                try self.pushRedrawEvent(.{ .win_viewport_margins = .{
                     .grid = grid,
                     .win = win,
                     .top = top,
@@ -1452,7 +1484,7 @@ pub const IoThread = struct {
                 const grid = extractU64(args[0]) orelse return;
                 const win = extractU64(args[1]) orelse 0;
                 log.debug("win_external_pos: grid={} win={}", .{ grid, win });
-                try self.event_queue.push(.{ .win_external_pos = .{
+                try self.pushRedrawEvent(.{ .win_external_pos = .{
                     .grid = grid,
                     .win = win,
                 } });
@@ -1487,7 +1519,7 @@ pub const IoThread = struct {
                 errdefer self.alloc.free(duped_name);
 
                 log.debug("option_set: {s} = {}", .{ duped_name, value });
-                try self.event_queue.push(.{ .option_set = .{
+                try self.pushRedrawEvent(.{ .option_set = .{
                     .name = duped_name,
                     .value = value,
                 } });
@@ -1498,14 +1530,14 @@ pub const IoThread = struct {
         } else if (std.mem.eql(u8, name, "cmdline_hide")) {
             // cmdline_hide: [level]
             if (args.len >= 1) {
-                try self.event_queue.push(.{ .cmdline_hide = .{
+                try self.pushRedrawEvent(.{ .cmdline_hide = .{
                     .level = extractU64(args[0]) orelse 0,
                 } });
             }
         } else if (std.mem.eql(u8, name, "cmdline_pos")) {
             // cmdline_pos: [pos, level]
             if (args.len >= 2) {
-                try self.event_queue.push(.{ .cmdline_pos = .{
+                try self.pushRedrawEvent(.{ .cmdline_pos = .{
                     .pos = extractU64(args[0]) orelse 0,
                     .level = extractU64(args[1]) orelse 0,
                 } });
@@ -1518,7 +1550,7 @@ pub const IoThread = struct {
                     else => return,
                 };
                 const duped_char = try self.alloc.dupe(u8, char);
-                try self.event_queue.push(.{ .cmdline_special_char = .{
+                try self.pushRedrawEvent(.{ .cmdline_special_char = .{
                     .character = duped_char,
                     .shift = extractBool(args[1]),
                     .level = extractU64(args[2]) orelse 0,
@@ -1527,7 +1559,7 @@ pub const IoThread = struct {
         } else if (std.mem.eql(u8, name, "cmdline_block_show")) {
             try self.handleCmdlineBlockShow(args);
         } else if (std.mem.eql(u8, name, "cmdline_block_hide")) {
-            try self.event_queue.push(.cmdline_block_hide);
+            try self.pushRedrawEvent(.cmdline_block_hide);
         } else if (std.mem.eql(u8, name, "cmdline_block_append")) {
             try self.handleCmdlineBlockAppend(args);
         }
@@ -1535,7 +1567,7 @@ pub const IoThread = struct {
         else if (std.mem.eql(u8, name, "msg_show")) {
             try self.handleMsgShow(args);
         } else if (std.mem.eql(u8, name, "msg_clear")) {
-            try self.event_queue.push(.msg_clear);
+            try self.pushRedrawEvent(.msg_clear);
         } else if (std.mem.eql(u8, name, "msg_showmode")) {
             try self.handleMsgShowMode(args);
         } else if (std.mem.eql(u8, name, "msg_showcmd")) {
@@ -1554,7 +1586,7 @@ pub const IoThread = struct {
                     else => return,
                 };
                 const duped_name = try self.alloc.dupe(u8, name_str);
-                try self.event_queue.push(.{ .hl_group_set = .{
+                try self.pushRedrawEvent(.{ .hl_group_set = .{
                     .name = duped_name,
                     .hl_id = extractU64(args[1]) orelse 0,
                 } });
@@ -1564,7 +1596,7 @@ pub const IoThread = struct {
         else if (std.mem.eql(u8, name, "win_extmark")) {
             // win_extmark: [grid, win, ...] - simplified for now
             if (args.len >= 2) {
-                try self.event_queue.push(.{ .win_extmark = .{
+                try self.pushRedrawEvent(.{ .win_extmark = .{
                     .grid = extractU64(args[0]) orelse return,
                     .win = extractU64(args[1]) orelse 0,
                 } });
@@ -1576,12 +1608,12 @@ pub const IoThread = struct {
         } else if (std.mem.eql(u8, name, "popupmenu_select")) {
             // popupmenu_select: [selected]
             if (args.len >= 1) {
-                try self.event_queue.push(.{ .popupmenu_select = .{
+                try self.pushRedrawEvent(.{ .popupmenu_select = .{
                     .selected = extractI64(args[0]) orelse -1,
                 } });
             }
         } else if (std.mem.eql(u8, name, "popupmenu_hide")) {
-            try self.event_queue.push(.popupmenu_hide);
+            try self.pushRedrawEvent(.popupmenu_hide);
         }
         // Tabline events (ext_tabline)
         else if (std.mem.eql(u8, name, "tabline_update")) {
@@ -1655,7 +1687,7 @@ pub const IoThread = struct {
             });
         }
 
-        try self.event_queue.push(.{ .grid_line = .{
+        try self.pushRedrawEvent(.{ .grid_line = .{
             .grid = grid,
             .row = row,
             .col_start = col_start,
@@ -1723,7 +1755,7 @@ pub const IoThread = struct {
             attr.blend = @intCast(extractU64(v) orelse 0);
         }
 
-        try self.event_queue.push(.{ .hl_attr_define = .{
+        try self.pushRedrawEvent(.{ .hl_attr_define = .{
             .id = id,
             .attr = attr,
         } });
@@ -1793,7 +1825,7 @@ pub const IoThread = struct {
             try cursor_modes.append(self.alloc, cursor_mode);
         }
 
-        try self.event_queue.push(.{ .mode_info_set = .{
+        try self.pushRedrawEvent(.{ .mode_info_set = .{
             .cursor_style_enabled = cursor_style_enabled,
             .cursor_modes = try cursor_modes.toOwnedSlice(self.alloc),
         } });
@@ -1870,7 +1902,7 @@ pub const IoThread = struct {
         const indent = extractU64(args[4]) orelse 0;
         const level = extractU64(args[5]) orelse 0;
 
-        try self.event_queue.push(.{ .cmdline_show = .{
+        try self.pushRedrawEvent(.{ .cmdline_show = .{
             .content = content,
             .pos = pos,
             .firstc = duped_firstc,
@@ -1906,7 +1938,7 @@ pub const IoThread = struct {
             try lines.append(self.alloc, line);
         }
 
-        try self.event_queue.push(.{ .cmdline_block_show = .{
+        try self.pushRedrawEvent(.{ .cmdline_block_show = .{
             .lines = try lines.toOwnedSlice(self.alloc),
         } });
     }
@@ -1917,7 +1949,7 @@ pub const IoThread = struct {
         if (args.len < 1) return;
 
         const line = try self.parseStyledContent(args[0]);
-        try self.event_queue.push(.{ .cmdline_block_append = .{
+        try self.pushRedrawEvent(.{ .cmdline_block_append = .{
             .line = line,
         } });
     }
@@ -1945,7 +1977,7 @@ pub const IoThread = struct {
 
         const replace_last = extractBool(args[2]);
 
-        try self.event_queue.push(.{ .msg_show = .{
+        try self.pushRedrawEvent(.{ .msg_show = .{
             .kind = kind,
             .content = content,
             .replace_last = replace_last,
@@ -1958,7 +1990,7 @@ pub const IoThread = struct {
         if (args.len < 1) return;
 
         const content = try self.parseStyledContent(args[0]);
-        try self.event_queue.push(.{ .msg_showmode = .{
+        try self.pushRedrawEvent(.{ .msg_showmode = .{
             .content = content,
         } });
     }
@@ -1969,7 +2001,7 @@ pub const IoThread = struct {
         if (args.len < 1) return;
 
         const content = try self.parseStyledContent(args[0]);
-        try self.event_queue.push(.{ .msg_showcmd = .{
+        try self.pushRedrawEvent(.{ .msg_showcmd = .{
             .content = content,
         } });
     }
@@ -1980,7 +2012,7 @@ pub const IoThread = struct {
         if (args.len < 1) return;
 
         const content = try self.parseStyledContent(args[0]);
-        try self.event_queue.push(.{ .msg_ruler = .{
+        try self.pushRedrawEvent(.{ .msg_ruler = .{
             .content = content,
         } });
     }
@@ -2027,7 +2059,7 @@ pub const IoThread = struct {
             });
         }
 
-        try self.event_queue.push(.{ .msg_history_show = .{
+        try self.pushRedrawEvent(.{ .msg_history_show = .{
             .entries = try entries.toOwnedSlice(self.alloc),
         } });
     }
@@ -2092,7 +2124,7 @@ pub const IoThread = struct {
             });
         }
 
-        try self.event_queue.push(.{ .popupmenu_show = .{
+        try self.pushRedrawEvent(.{ .popupmenu_show = .{
             .items = try items.toOwnedSlice(self.alloc),
             .selected = extractI64(args[1]) orelse -1,
             .row = extractU64(args[2]) orelse 0,
@@ -2148,7 +2180,7 @@ pub const IoThread = struct {
             });
         }
 
-        try self.event_queue.push(.{ .tabline_update = .{
+        try self.pushRedrawEvent(.{ .tabline_update = .{
             .current_tab = current_tab,
             .tabs = try tabs.toOwnedSlice(self.alloc),
         } });

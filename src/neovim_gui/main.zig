@@ -63,6 +63,9 @@ pub const NeovimGui = struct {
 
     /// NormalFloat highlight ID (for floating window backgrounds)
     normal_float_hl_id: ?u64 = null,
+    /// WinBar highlight IDs (for auto-detecting winbar when margins are missing)
+    winbar_hl_id: ?u64 = null,
+    winbar_nc_hl_id: ?u64 = null,
 
     /// Whether we're connected and ready
     ready: bool = false,
@@ -548,6 +551,10 @@ pub const NeovimGui = struct {
             .hl_group_set => |data| {
                 if (std.mem.eql(u8, data.name, "NormalFloat")) {
                     self.normal_float_hl_id = data.hl_id;
+                } else if (std.mem.eql(u8, data.name, "WinBar")) {
+                    self.winbar_hl_id = data.hl_id;
+                } else if (std.mem.eql(u8, data.name, "WinBarNC")) {
+                    self.winbar_nc_hl_id = data.hl_id;
                 }
                 self.dirty = true;
             },
@@ -816,7 +823,7 @@ pub const NeovimGui = struct {
     fn flush(self: *Self) void {
         var it = self.windows.valueIterator();
         while (it.next()) |window_ptr| {
-            window_ptr.*.flush();
+            window_ptr.*.flush(self.winbar_hl_id, self.winbar_nc_hl_id);
         }
         self.dirty = true;
     }

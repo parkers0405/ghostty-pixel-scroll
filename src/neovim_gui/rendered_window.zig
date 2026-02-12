@@ -776,9 +776,37 @@ pub const RenderedWindow = struct {
 
     /// Flush pending updates - called after Neovim's "flush" event
     /// This is where we update the scrollback buffer and animation (Neovide-style)
-    pub fn flush(self: *Self) void {
+    pub fn flush(self: *Self, winbar_hl_id: ?u64, winbar_nc_hl_id: ?u64) void {
         if (!self.valid) return;
         if (self.actual_lines == null or self.scrollback_lines == null) return;
+
+        // Fallback: If margin_top is 0 but row 0 has WinBar highlight, force margin_top=1.
+        // This handles cases where Neovim fails to send win_viewport_margins (e.g. reused grid race).
+        // Without this, the winbar is treated as scrollable content and bounces/stretches during scroll.
+        if (self.viewport_margins.top == 0 and self.grid_height > 1 and (winbar_hl_id != null or winbar_nc_hl_id != null)) {
+            if (self.actual_lines.?.getConst(0)) |line| {
+                // Check first few cells for WinBar highlight
+                const check_limit = @min(line.cells.len, 5);
+                var has_winbar = false;
+                for (line.cells[0..check_limit]) |cell| {
+                    if (cell.hl_id != 0) {
+                        if (winbar_hl_id) |id| {
+                            if (cell.hl_id == id) has_winbar = true;
+                        }
+                        if (!has_winbar and winbar_nc_hl_id != null) {
+                            if (cell.hl_id == winbar_nc_hl_id.?) has_winbar = true;
+                        }
+                        if (has_winbar) break;
+                    }
+                }
+                if (has_winbar) {
+                    self.viewport_margins.top = 1;
+                    // Reset animation since margins changed (implicitly)
+                    self.scroll_animation.reset();
+                    self.scroll_delta = 0;
+                }
+            }
+        }
 
         var scrollback = &self.scrollback_lines.?;
         const actual = &self.actual_lines.?;

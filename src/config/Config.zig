@@ -823,6 +823,16 @@ palette: Palette = .{},
 ///   * `false`
 @"cursor-style-blink": ?bool = null,
 
+/// Controls whether cursor blinking uses a smooth fade or a hard on/off toggle.
+/// When `true`, the cursor smoothly fades in and out. When `false`, the cursor
+/// blinks with the default instant on/off style (Ghostty default behavior).
+///
+/// Valid values are:
+///
+///   * `true` (default)
+///   * `false`
+@"cursor-blink-smooth": bool = true,
+
 /// The color of the text under the cursor. If this is not set, a default will
 /// be chosen.
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.

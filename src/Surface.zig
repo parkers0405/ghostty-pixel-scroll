@@ -4864,46 +4864,11 @@ pub fn mouseButtonCallback(
         // Get cursor position
         const pos = try self.rt_surface.getCursorPos();
 
-        // Track multi-clicks for double/triple click support (left button only)
-        var click_count: u8 = 1;
-        if (button == .left and action == .press) {
-            // If we move our cursor too much between clicks then we reset
-            // the multi-click state.
-            if (self.mouse.left_click_count > 0) {
-                const max_distance: f64 = @floatFromInt(self.size.cell.width);
-                const distance = @sqrt(
-                    std.math.pow(f64, pos.x - self.mouse.left_click_xpos, 2) +
-                        std.math.pow(f64, pos.y - self.mouse.left_click_ypos, 2),
-                );
-                if (distance > max_distance) self.mouse.left_click_count = 0;
-            }
-
-            // Setup our click counter and timer
-            if (std.time.Instant.now()) |now| {
-                if (self.mouse.left_click_count > 0) {
-                    const since = now.since(self.mouse.left_click_time);
-                    if (since > self.config.mouse_interval) {
-                        self.mouse.left_click_count = 0;
-                    }
-                }
-                self.mouse.left_click_time = now;
-                self.mouse.left_click_count += 1;
-                if (self.mouse.left_click_count > 3) self.mouse.left_click_count = 1;
-            } else |_| {
-                self.mouse.left_click_count = 1;
-            }
-
-            // Store click position for tracking distance
-            self.mouse.left_click_xpos = pos.x;
-            self.mouse.left_click_ypos = pos.y;
-
-            click_count = self.mouse.left_click_count;
-        }
-
-        // Convert action to Neovim action string
-        const nvim_action = switch (action) {
-            .press => neovim_gui.nvim_input.toNeovimMouseAction(true, click_count),
-            .release => neovim_gui.nvim_input.toNeovimMouseAction(false, 0),
+        // Neovide approach: send raw "press"/"release" to Neovim and let
+        // Neovim handle double/triple-click detection via its own `mousetime`.
+        const nvim_action: []const u8 = switch (action) {
+            .press => "press",
+            .release => "release",
         };
 
         // Convert modifiers to Neovim modifier string

@@ -613,11 +613,13 @@ fn drawCallback(
 
     if (t.renderer.nvim_gui != null or t.renderer.panel != null) {
         // For Neovim GUI mode, we need a full updateFrame + draw when
-        // there are active animations or pending events to process.
-        // When idle (timer running only for custom shader animation),
-        // just draw to update shader uniforms without the heavier
-        // updateFrame path.
-        if (t.renderer.hasAnimations()) {
+        // there are content-affecting animations (cursor slide, scroll,
+        // sonicboom) or pending events.  Blink-only animation does NOT
+        // need updateFrame — it only updates the cursor_blink_opacity
+        // uniform in drawFrame.  Calling updateFrame for blink would
+        // clobber last_frame_time, causing drawFrame's raw_dt to be ~0
+        // which freezes the blink lerp and burns CPU without progress.
+        if (t.renderer.needsFullUpdate()) {
             _ = renderCallback(t, undefined, undefined, {});
         } else {
             t.drawFrame(false);

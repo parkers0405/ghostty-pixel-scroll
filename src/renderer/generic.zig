@@ -230,6 +230,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         cursor_blink_target: f32 = 1.0,
         cursor_blink_animating: bool = false,
         cursor_blink_visible_raw: bool = true,
+        last_blink_time: ?std.time.Instant = null,
         /// Whether the Neovim GUI cursor wants blinking (from mode_info blinkon > 0)
         nvim_cursor_blink: bool = false,
 
@@ -667,6 +668,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             cursor_opacity: f64,
             cursor_text: ?configpkg.Config.TerminalColor,
             cursor_style_blink: ?bool,
+            cursor_blink_smooth: bool,
             background: terminal.color.RGB,
             background_opacity: f64,
             background_opacity_cells: bool,
@@ -768,6 +770,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .cursor_text = config.@"cursor-text",
                     .cursor_opacity = @max(0, @min(1, config.@"cursor-opacity")),
                     .cursor_style_blink = config.@"cursor-style-blink",
+                    .cursor_blink_smooth = config.@"cursor-blink-smooth",
 
                     .background = config.background.toTerminalRGB(),
                     .foreground = config.foreground.toTerminalRGB(),
@@ -1207,6 +1210,20 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 // events are pending (dirty flag means content changed)
                 (self.nvim_gui != null and self.nvim_gui.?.dirty) or
                 // Panel GUI: keep running while panel is animating or has new content
+                (self.panel != null and (self.panel.?.isDirty() or self.panel.?.isVisible()));
+        }
+
+        /// True if content-affecting animations are active that require a full
+        /// updateFrame (cell rebuild + animation sub-stepping). Blink-only
+        /// animation is excluded because it only needs drawFrame to update
+        /// the cursor_blink_opacity uniform — calling updateFrame for blink
+        /// would set last_frame_time, causing drawFrame's raw_dt to be ~0
+        /// which freezes the blink lerp.
+        pub fn needsFullUpdate(self: *const Self) bool {
+            return self.cursor_animating or
+                self.scroll_animating or
+                self.sonicboom_active or
+                (self.nvim_gui != null and self.nvim_gui.?.dirty) or
                 (self.panel != null and (self.panel.?.isDirty() or self.panel.?.isVisible()));
         }
 
@@ -2475,7 +2492,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.last_cursor_grid_pos = .{ cursor.screen_col, cursor.screen_row };
                 self.last_cursor_scroll_pos = cursor.scroll_pos;
 
-                // Reset blink to fully visible when cursor moves
                 self.cursor_blink_opacity = 1.0;
                 self.cursor_blink_target = 1.0;
                 self.cursor_blink_animating = false;
@@ -3149,22 +3165,33 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            // Smooth blink opacity transition (outside sub-stepping — simple lerp).
-            // This runs every frame regardless of other animations.
+            // Smooth blink opacity transition with independent timing.
+            // Uses its own last_blink_time so the lerp works correctly even
+            // when updateFrameNeovim clobbers last_frame_time (raw_dt ≈ 0).
             {
-                const blink_speed: f32 = 8.0;
-                const diff = self.cursor_blink_target - self.cursor_blink_opacity;
-                if (@abs(diff) < 0.01) {
+                if (self.config.cursor_blink_smooth) {
+                    const blink_dt: f32 = if (self.last_blink_time) |last| blk: {
+                        if (now.order(last) == .lt) break :blk fallback_dt;
+                        const dt_ns: f32 = @floatFromInt(now.since(last));
+                        break :blk @min(dt_ns / @as(f32, @floatFromInt(std.time.ns_per_s)), 0.1);
+                    } else fallback_dt;
+                    self.last_blink_time = now;
+
+                    const blink_speed: f32 = 8.0;
+                    const diff = self.cursor_blink_target - self.cursor_blink_opacity;
+                    if (@abs(diff) < 0.01) {
+                        self.cursor_blink_opacity = self.cursor_blink_target;
+                        self.cursor_blink_animating = false;
+                    } else {
+                        self.cursor_blink_opacity += diff * blink_speed * blink_dt;
+                        self.cursor_blink_opacity = std.math.clamp(self.cursor_blink_opacity, 0.0, 1.0);
+                        self.cursor_blink_animating = true;
+                    }
+                } else {
                     self.cursor_blink_opacity = self.cursor_blink_target;
                     self.cursor_blink_animating = false;
-                } else {
-                    self.cursor_blink_opacity += diff * blink_speed * raw_dt;
-                    self.cursor_blink_opacity = std.math.clamp(self.cursor_blink_opacity, 0.0, 1.0);
-                    self.cursor_blink_animating = true;
                 }
 
-                // Push blink opacity to the shader uniform so the cursor glyph
-                // and text-under-cursor recoloring both fade smoothly.
                 self.uniforms.cursor_blink_opacity = self.cursor_blink_opacity;
             }
 
@@ -4596,8 +4623,6 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     }
                     self.last_cursor_grid_pos = .{ cursor_x, cursor_y };
 
-                    // Reset blink to fully visible when cursor moves (like Neovide).
-                    // This ensures the cursor appears immediately on keystroke.
                     self.cursor_blink_opacity = 1.0;
                     self.cursor_blink_target = 1.0;
                     self.cursor_blink_animating = false;

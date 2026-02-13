@@ -308,6 +308,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// windows instead of terminal_state.
         nvim_gui: ?*neovim_gui.NeovimGui = null,
 
+        /// Collab state pointer for reading peer cursors.
+        collab_state: ?*@import("../collab/main.zig").CollabState = null,
+
+        /// Scratch buffer for peer cursors (rebuilt each frame from CollabState).
+        peer_cursor_buf: [8]gui_protocol.PeerCursor = undefined,
+        peer_cursor_count: u8 = 0,
+
         /// Scratch buffers for the neovim→gui adapter. Reused across frames.
         nvim_adapter_state: nvim_adapter.AdapterState = .{},
 
@@ -1380,9 +1387,10 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             //     );
             // }
 
-            // Update nvim_gui and panel pointers from state
+            // Update nvim_gui, panel, and collab pointers from state
             self.nvim_gui = state.nvim_gui;
             self.panel = state.panel;
+            self.collab_state = state.collab_state;
             self.real_screen_width = state.real_screen_width;
             self.real_screen_height = state.real_screen_height;
 
@@ -1960,7 +1968,41 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         }
                     }
                 } else {
-                    try self.rebuildCellsFromGui(gui_state);
+                    // Inject peer cursors from collab state if active
+                    var gui_state_with_peers = gui_state;
+                    if (self.collab_state) |cs| {
+                        const collab_main = @import("../collab/main.zig");
+                        var raw_peers: [collab_main.MAX_PEERS]?collab_main.CollabState.PeerCursor = undefined;
+                        _ = cs.getPeers(&raw_peers);
+                        self.peer_cursor_count = 0;
+
+                        // Get our current file for same-buffer detection
+                        const our_file = if (self.nvim_gui) |ng| ng.current_file else "";
+
+                        for (raw_peers[0..collab_main.MAX_PEERS]) |maybe_peer| {
+                            if (maybe_peer) |peer| {
+                                if (self.peer_cursor_count >= 8) break;
+                                var pc = gui_protocol.PeerCursor{
+                                    .color = peer.color,
+                                    .grid_row = peer.cursor_row,
+                                    .grid_col = peer.cursor_col,
+                                    .mode = @enumFromInt(@intFromEnum(peer.mode)),
+                                    .name_len = peer.name_len,
+                                };
+                                @memcpy(&pc.name, &peer.name);
+
+                                // Same-buffer detection
+                                const peer_file = peer.getFileName();
+                                pc.same_buffer = (our_file.len > 0 and peer_file.len > 0 and
+                                    std.mem.eql(u8, our_file, peer_file));
+
+                                self.peer_cursor_buf[self.peer_cursor_count] = pc;
+                                self.peer_cursor_count += 1;
+                            }
+                        }
+                        gui_state_with_peers.peer_cursors = self.peer_cursor_buf[0..self.peer_cursor_count];
+                    }
+                    try self.rebuildCellsFromGui(gui_state_with_peers);
                 }
                 self.cells_rebuilt = true;
             }
@@ -2454,6 +2496,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
 
             // Cursor
             self.renderGuiCursor(state.cursor);
+
+            // Peer cursors (collab ghost cursors with color + name label)
+            for (state.peer_cursors) |peer| {
+                self.renderPeerCursor(peer);
+            }
         }
 
         /// Render the GUI cursor with spring animation and corner stretching.
@@ -2557,6 +2604,98 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .bearings = .{ @intCast(render.glyph.offset_x), @intCast(render.glyph.offset_y) },
                 .pixel_offset_y = 0,
             }, style);
+        }
+
+        /// Render a peer's ghost cursor: a colored block at their grid position.
+        /// Uses the same sprite as the main cursor but tinted to the peer's color
+        /// and at reduced opacity. Appends directly to fg_rows.lists[0] so it
+        /// draws in the same pass as the main cursor.
+        fn renderPeerCursor(self: *Self, peer: gui_protocol.PeerCursor) void {
+            if (!peer.same_buffer) return;
+
+            const col: u16 = @intCast(@min(peer.grid_col, if (self.cells.size.columns > 0) self.cells.size.columns - 1 else 0));
+            const row: u16 = @intCast(@min(peer.grid_row, if (self.cells.size.rows > 0) self.cells.size.rows - 1 else 0));
+
+            if (row >= self.cells.size.rows or col >= self.cells.size.columns) return;
+
+            // Determine cursor shape from peer's vim mode
+            const sprite: font.Sprite = switch (peer.mode) {
+                .insert => .cursor_bar,
+                .replace => .cursor_underline,
+                else => .cursor_rect,
+            };
+
+            const render = self.font_grid.renderGlyph(
+                self.alloc,
+                font.sprite_index,
+                @intFromEnum(sprite),
+                .{ .cell_width = 1, .grid_metrics = self.grid_metrics },
+            ) catch return;
+
+            const color = peer.color;
+            const r: u8 = @intCast((color >> 16) & 0xFF);
+            const g: u8 = @intCast((color >> 8) & 0xFF);
+            const b: u8 = @intCast(color & 0xFF);
+
+            // Ghost cursor at 60% opacity
+            const ghost_cell: shaderpkg.CellText = .{
+                .atlas = .grayscale,
+                .bools = .{ .is_cursor_glyph = true },
+                .grid_pos = .{ col, row },
+                .color = .{ r, g, b, 153 }, // 60% of 255
+                .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
+                .glyph_size = .{ render.glyph.width, render.glyph.height },
+                .bearings = .{ @intCast(render.glyph.offset_x), @intCast(render.glyph.offset_y) },
+                .pixel_offset_y = 0,
+            };
+
+            // Append to cursor list (lists[0]) without clearing -- main cursor already there
+            self.cells.fg_rows.lists[0].appendAssumeCapacity(ghost_cell);
+
+            // Render the peer's name label above the cursor
+            self.renderPeerNameLabel(peer, col, row);
+        }
+
+        /// Render a floating name label above a peer's ghost cursor.
+        /// Shows the peer's display name in their cursor color, one row above.
+        fn renderPeerNameLabel(self: *Self, peer: gui_protocol.PeerCursor, col: u16, row: u16) void {
+            const name = peer.getName();
+            if (name.len == 0) return;
+            if (row == 0) return; // no room above
+
+            const label_row = row - 1;
+            const color = peer.color;
+            const r: u8 = @intCast((color >> 16) & 0xFF);
+            const g: u8 = @intCast((color >> 8) & 0xFF);
+            const b: u8 = @intCast(color & 0xFF);
+
+            // Render each character of the name as a text glyph in the peer's color
+            var x = col;
+            for (name) |ch| {
+                if (x >= self.cells.size.columns) break;
+
+                // Render the glyph
+                const glyph_render = self.font_grid.renderGlyph(
+                    self.alloc,
+                    font.sprite_index,
+                    @as(u32, ch),
+                    .{ .cell_width = 1, .grid_metrics = self.grid_metrics },
+                ) catch continue;
+
+                const label_cell: shaderpkg.CellText = .{
+                    .atlas = .grayscale,
+                    .bools = .{},
+                    .grid_pos = .{ x, label_row },
+                    .color = .{ r, g, b, 200 }, // slightly dimmer than full
+                    .glyph_pos = .{ glyph_render.glyph.atlas_x, glyph_render.glyph.atlas_y },
+                    .glyph_size = .{ glyph_render.glyph.width, glyph_render.glyph.height },
+                    .bearings = .{ @intCast(glyph_render.glyph.offset_x), @intCast(glyph_render.glyph.offset_y) },
+                    .pixel_offset_y = 0,
+                };
+
+                self.cells.fg_rows.lists[0].appendAssumeCapacity(label_cell);
+                x += 1;
+            }
         }
 
         /// Render a single GUI cell's text glyph + decorations at (x, y).

@@ -9,6 +9,7 @@ const renderer = @import("../renderer.zig");
 const animation = @import("../animation.zig");
 const neovim_gui = @import("../neovim_gui/main.zig");
 const panel_gui = @import("../panel_gui/main.zig");
+const collab_mod = @import("../collab/main.zig");
 
 /// The mutex that must be held while reading any of the data in the
 /// members of this state. Note that the state itself is NOT protected
@@ -30,6 +31,9 @@ nvim_gui: ?*neovim_gui.NeovimGui = null,
 /// Panel GUI state. When set, the renderer composites the panel alongside
 /// the main terminal content with slide animation.
 panel: ?*panel_gui.PanelGui = null,
+
+/// Collab state. When set, the renderer draws peer ghost cursors.
+collab_state: ?*collab_mod.CollabState = null,
 
 /// The real (full) screen dimensions, before panel reservation.
 /// The renderer uses these to know where to draw the panel content.

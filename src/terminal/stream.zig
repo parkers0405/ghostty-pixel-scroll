@@ -2085,6 +2085,22 @@ pub fn Stream(comptime Handler: type) type {
                     }
                 },
 
+                .collab_share => {
+                    // OSC 1342 - Start collab session (share)
+                    if (@hasField(@TypeOf(self.handler), "surface_mailbox")) {
+                        log.info("OSC 1342 received - starting collab share", .{});
+                        _ = self.handler.surface_mailbox.push(.collab_share, .{ .instant = {} });
+                    }
+                },
+
+                .collab_join => {
+                    // OSC 1343 - Join collab session
+                    if (@hasField(@TypeOf(self.handler), "surface_mailbox")) {
+                        log.info("OSC 1343 received - joining collab session", .{});
+                        _ = self.handler.surface_mailbox.push(.collab_join, .{ .instant = {} });
+                    }
+                },
+
                 .conemu_output_environment_variable,
                 .conemu_run_process,
                 .kitty_text_sizing,

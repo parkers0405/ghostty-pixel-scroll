@@ -140,6 +140,9 @@ pub const Event = union(enum) {
     win_external_pos: WinExternalPos,
     nvim_exited, // Neovim process exited (:q, :qall, etc.)
 
+    // Collab presence from injected Lua autocmd (ghostty_presence RPC)
+    collab_presence: CollabPresence,
+
     // Message events (ext_messages)
     msg_show: MsgShow,
     msg_clear,
@@ -170,6 +173,17 @@ pub const Event = union(enum) {
 
     // Tabline events (ext_tabline)
     tabline_update: TablineUpdate,
+
+    pub const CollabPresence = struct {
+        row: u32,
+        col: u32,
+        file_name: []const u8,
+        mode: u8, // 'n'=normal, 'i'=insert, 'v'=visual, 'c'=command, 'R'=replace
+
+        pub fn deinit(self: *CollabPresence, alloc: Allocator) void {
+            if (self.file_name.len > 0) alloc.free(self.file_name);
+        }
+    };
 
     pub const GridResize = struct {
         grid: u64,
@@ -584,6 +598,7 @@ pub const Event = union(enum) {
             .hl_group_set => |*hgs| hgs.deinit(alloc),
             .popupmenu_show => |*ps| ps.deinit(alloc),
             .tabline_update => |*tu| tu.deinit(alloc),
+            .collab_presence => |*cp| cp.deinit(alloc),
             else => {},
         }
     }
@@ -1096,6 +1111,44 @@ pub const IoThread = struct {
                     self.processRedraw(notif.params) catch |err| {
                         log.debug("Redraw processing error: {}", .{err});
                     };
+                } else if (std.mem.eql(u8, notif.method, "ghostty_presence")) {
+                    // Collab presence: ghostty_presence(row, col, filename, mode)
+                    const params = notif.params;
+                    const arr = switch (params) {
+                        .arr => |a| a,
+                        else => return {},
+                    };
+                    if (arr.len >= 4) {
+                        const row: u32 = switch (arr[0]) {
+                            .uint => |v| @intCast(v),
+                            .int => |v| @intCast(@max(0, v)),
+                            else => 0,
+                        };
+                        const col: u32 = switch (arr[1]) {
+                            .uint => |v| @intCast(v),
+                            .int => |v| @intCast(@max(0, v)),
+                            else => 0,
+                        };
+                        const file_name = switch (arr[2]) {
+                            .str => |s| s.value(),
+                            else => "",
+                        };
+                        const mode_str = switch (arr[3]) {
+                            .str => |s| s.value(),
+                            else => "n",
+                        };
+                        const mode_char: u8 = if (mode_str.len > 0) mode_str[0] else 'n';
+                        const duped_file = self.alloc.dupe(u8, file_name) catch return {};
+                        self.event_queue.push(.{ .collab_presence = .{
+                            .row = row,
+                            .col = col,
+                            .file_name = duped_file,
+                            .mode = mode_char,
+                        } }) catch {
+                            self.alloc.free(duped_file);
+                            return {};
+                        };
+                    }
                 } else if (std.mem.eql(u8, notif.method, "ghostty_image")) {
                     const params = notif.params;
                     const arr = switch (params) {
@@ -1187,7 +1240,7 @@ pub const IoThread = struct {
 
         if (self.redraw_batch.items.len > 0) {
             try self.event_queue.pushAll(self.redraw_batch.items);
-            
+
             // Wake up renderer if we processed a flush
             if (has_flush) {
                 if (self.nvim_gui) |nvim_ptr| {

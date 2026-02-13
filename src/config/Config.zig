@@ -997,6 +997,17 @@ palette: Palette = .{},
 /// When neovim-gui is active and this is 0, defaults to 8.0 automatically.
 @"neovim-corner-radius": f32 = 0.0,
 
+/// Your display name for collaborative sessions. Other participants see
+/// this name floating above your cursor in their terminal. If unset,
+/// defaults to your system username.
+@"collab-name": []const u8 = "",
+
+/// Your cursor color in collaborative sessions. Other participants see
+/// your cursor rendered in this color with a spring-animated trail.
+/// Format: standard hex color (e.g. #7aa2f7, #f7768e, #9ece6a).
+/// If unset, defaults to a bright blue (#7aa2f7).
+@"collab-color": Color = .{ .r = 0x7a, .g = 0xa2, .b = 0xf7 },
+
 /// Configure slide-out panels for running TUI programs (lazygit, lazydocker,
 /// htop, etc.) alongside your terminal. Panels slide in from the side or
 /// bottom with smooth spring animations and a draggable resize handle.

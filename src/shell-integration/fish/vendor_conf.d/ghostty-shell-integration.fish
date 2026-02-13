@@ -227,3 +227,16 @@ ghostty_exit
 if set -q GHOSTTY_NVIM_GUI_ALIAS; and test -n "$GHOSTTY_NVIM_GUI_ALIAS"
     eval "function $GHOSTTY_NVIM_GUI_ALIAS; printf '\\e]1338\\a'; end"
 end
+
+# Collab session commands
+function ghostty-share
+    printf '\e]1342\a'
+end
+
+function ghostty-join
+    if test (count $argv) -eq 0
+        echo "Usage: ghostty-join <host:port>"
+        return 1
+    end
+    printf '\e]1343;%s\a' $argv[1]
+end

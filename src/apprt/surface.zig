@@ -114,6 +114,12 @@ pub const Message = union(enum) {
     /// Toggle panel GUI (triggered by OSC 1339)
     toggle_panel_gui: void,
 
+    /// Start collab session (triggered by OSC 1342)
+    collab_share: void,
+
+    /// Join collab session (triggered by OSC 1343)
+    collab_join: void,
+
     pub const ReportTitleStyle = enum {
         csi_21_t,
 

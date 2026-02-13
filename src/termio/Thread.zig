@@ -343,6 +343,14 @@ fn drainMailbox(
                 log.info("termio: toggle_panel_gui message - forwarding to surface", .{});
                 _ = io.surface_mailbox.push(.toggle_panel_gui, .{ .forever = {} });
             },
+            .collab_share => {
+                log.info("termio: collab_share message - forwarding to surface", .{});
+                _ = io.surface_mailbox.push(.collab_share, .{ .forever = {} });
+            },
+            .collab_join => {
+                log.info("termio: collab_join message - forwarding to surface", .{});
+                _ = io.surface_mailbox.push(.collab_join, .{ .forever = {} });
+            },
             .write_small => |v| try io.queueWrite(
                 data,
                 v.data[0..v.len],

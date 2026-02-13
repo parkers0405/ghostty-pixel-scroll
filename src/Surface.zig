@@ -38,6 +38,7 @@ const inspectorpkg = @import("inspector/main.zig");
 const SurfaceMouse = @import("surface_mouse.zig");
 const neovim_gui = @import("neovim_gui/main.zig");
 const panel_gui = @import("panel_gui/main.zig");
+const collab = @import("collab/main.zig");
 
 const log = std.log.scoped(.surface);
 
@@ -132,6 +133,9 @@ nvim_gui: ?*neovim_gui.NeovimGui = null,
 /// Panel GUI - slide-out panels for TUI programs (lazygit, lazydocker, etc.)
 /// Supports up to 4 concurrent panels.
 panels: [4]?*panel_gui.PanelGui = .{null} ** 4,
+
+/// Collab session state (multiplayer terminal sharing).
+collab_state: ?*collab.CollabState = null,
 
 /// The full (real) screen width/height before panel reservation.
 /// When a panel is open, we reduce self.size.screen to make the terminal
@@ -369,6 +373,10 @@ const DerivedConfig = struct {
     panel_gui_1: ?[]const u8,
     panel_gui_2: ?[]const u8,
     panel_gui_size: f32,
+    collab_name: []const u8,
+    collab_color_r: u8,
+    collab_color_g: u8,
+    collab_color_b: u8,
 
     const Link = struct {
         regex: oni.Regex,
@@ -460,6 +468,13 @@ const DerivedConfig = struct {
             else
                 null,
             .panel_gui_size = config.@"panel-gui-size",
+            .collab_name = if (config.@"collab-name".len > 0)
+                try alloc.dupe(u8, config.@"collab-name")
+            else
+                "",
+            .collab_color_r = config.@"collab-color".r,
+            .collab_color_g = config.@"collab-color".g,
+            .collab_color_b = config.@"collab-color".b,
 
             // Assignments happen sequentially so we have to do this last
             // so that the memory is captured from allocs above.
@@ -913,6 +928,87 @@ pub fn close(self: *Surface) void {
 /// Check if this surface is in Neovim GUI mode
 pub fn isNeovimGuiMode(self: *const Surface) bool {
     return self.nvim_gui != null;
+}
+
+/// Start hosting a collab session. Creates the CollabState, starts the
+/// TCP server, and logs the join code.
+pub fn startCollabHost(self: *Surface) !void {
+    if (self.collab_state != null) {
+        log.info("collab session already active", .{});
+        return;
+    }
+
+    const config = self.config;
+    const profile = collab.Profile.fromConfig(
+        config.collab_name,
+        config.collab_color_r,
+        config.collab_color_g,
+        config.collab_color_b,
+    );
+
+    var state = try self.alloc.create(collab.CollabState);
+    state.* = collab.CollabState.init(self.alloc);
+    state.setGlobalInstance();
+    try state.startHost(profile);
+
+    self.collab_state = state;
+    self.renderer_state.collab_state = state;
+
+    // Wire presence callback on Neovim GUI if active
+    if (self.nvim_gui) |nvim| {
+        nvim.collab_presence_callback = &collabPresenceForward;
+    }
+
+    // Log the join code
+    var code_buf: [64]u8 = undefined;
+    const code_len = state.getJoinCode(&code_buf);
+    if (code_len > 0) {
+        log.info("collab session started! join code: {s}", .{code_buf[0..code_len]});
+    }
+}
+
+/// Standalone callback for forwarding Neovim presence to CollabState.
+fn collabPresenceForward(row: u32, col: u32, file: []const u8, mode_char: u8) void {
+    const cs = collab.CollabState.global_instance orelse return;
+    var presence = collab.protocol.Presence{
+        .peer_id = cs.local_profile.peer_id,
+        .cursor_row = row,
+        .cursor_col = col,
+        .mode = switch (mode_char) {
+            'i' => .insert,
+            'v', 'V' => .visual,
+            'c', ':' => .command,
+            'R' => .replace,
+            else => .normal,
+        },
+    };
+    presence.setFileName(file);
+    cs.sendPresence(presence);
+}
+
+/// Join an existing collab session.
+pub fn joinCollabSession(self: *Surface, host: []const u8, port: u16) !void {
+    if (self.collab_state != null) {
+        log.info("collab session already active", .{});
+        return;
+    }
+
+    const config = self.config;
+    const profile = collab.Profile.fromConfig(
+        config.collab_name,
+        config.collab_color_r,
+        config.collab_color_g,
+        config.collab_color_b,
+    );
+
+    var state = try self.alloc.create(collab.CollabState);
+    state.* = collab.CollabState.init(self.alloc);
+    state.setGlobalInstance();
+    try state.joinSession(profile, host, port);
+
+    self.collab_state = state;
+    self.renderer_state.collab_state = state;
+    log.info("joined collab session at {s}:{d}", .{ host, port });
 }
 
 /// Initialize Neovim GUI mode for this surface
@@ -1665,6 +1761,20 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             self.togglePanel("panel") catch |err| {
                 log.err("failed to toggle panel GUI: {}", .{err});
             };
+        },
+
+        .collab_share => {
+            // OSC 1342 - Start collab session
+            log.info("starting collab session via OSC 1342", .{});
+            self.startCollabHost() catch |err| {
+                log.err("failed to start collab session: {}", .{err});
+            };
+        },
+
+        .collab_join => {
+            // OSC 1343 - Join collab session
+            log.info("joining collab session via OSC 1343", .{});
+            // TODO: parse host:port from OSC params
         },
     }
 }

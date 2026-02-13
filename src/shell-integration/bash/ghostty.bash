@@ -258,3 +258,13 @@ precmd_functions+=(__ghostty_precmd)
 if [[ -n "$GHOSTTY_NVIM_GUI_ALIAS" ]]; then
     eval "${GHOSTTY_NVIM_GUI_ALIAS}() { builtin printf '\\e]1338\\a'; }"
 fi
+
+# Collab session commands: ghostty-share starts hosting, ghostty-join connects.
+ghostty-share() { builtin printf '\e]1342\a'; }
+ghostty-join() {
+    if [[ -z "$1" ]]; then
+        builtin echo "Usage: ghostty-join <host:port>"
+        return 1
+    fi
+    builtin printf '\e]1343;%s\a' "$1"
+}

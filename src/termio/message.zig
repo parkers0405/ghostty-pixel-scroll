@@ -88,6 +88,12 @@ pub const Message = union(enum) {
     /// Toggle panel GUI (triggered by OSC 1339)
     toggle_panel_gui: void,
 
+    /// Start collab session (triggered by OSC 1342)
+    collab_share: void,
+
+    /// Join collab session (triggered by OSC 1343)
+    collab_join: void,
+
     /// Return a write request for the given data. This will use
     /// write_small if it fits or write_alloc otherwise. This should NOT
     /// be used for stable pointers which can be manually set to write_stable.

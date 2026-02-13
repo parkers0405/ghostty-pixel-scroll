@@ -404,6 +404,16 @@ _ghostty_deferred_init() {
     if [[ -n "$GHOSTTY_NVIM_GUI_ALIAS" ]]; then
         eval "${GHOSTTY_NVIM_GUI_ALIAS}() { builtin print -nu \$_ghostty_fd '\\e]1338\\a'; }"
     fi
+
+    # Collab session commands
+    ghostty-share() { builtin print -nu $_ghostty_fd '\e]1342\a'; }
+    ghostty-join() {
+        if [[ -z "$1" ]]; then
+            builtin echo "Usage: ghostty-join <host:port>"
+            return 1
+        fi
+        builtin print -nu $_ghostty_fd "\e]1343;$1\a"
+    }
 }
 
 _entrypoint

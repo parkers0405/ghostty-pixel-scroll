@@ -81,6 +81,10 @@ pub const NeovimGui = struct {
     /// Function to call notify on the wakeup
     render_wakeup_notify: ?*const fn (*anyopaque) void = null,
 
+    /// Collab presence callback: called when Neovim reports cursor position.
+    /// Surface sets this to forward presence to CollabState.
+    collab_presence_callback: ?*const fn (row: u32, col: u32, file: []const u8, mode: u8) void = null,
+
     /// Cursor position
     cursor_grid: u64 = 1,
     cursor_row: u64 = 0,
@@ -122,6 +126,9 @@ pub const NeovimGui = struct {
     /// Image preview path and change token (from ghostty_image notifications)
     image_preview_path: []const u8 = "",
     image_preview_token: u64 = 0,
+
+    /// Current buffer file name (from collab presence, for same-buffer detection)
+    current_file: []const u8 = "",
 
     /// Neovim options received via option_set event
     /// Key is the option name (owned), value is the option value
@@ -170,6 +177,7 @@ pub const NeovimGui = struct {
         if (self.title.len > 0) self.alloc.free(self.title);
         if (self.icon.len > 0) self.alloc.free(self.icon);
         if (self.image_preview_path.len > 0) self.alloc.free(self.image_preview_path);
+        if (self.current_file.len > 0) self.alloc.free(self.current_file);
 
         var opt_it = self.options.iterator();
         while (opt_it.next()) |entry| {
@@ -271,6 +279,9 @@ pub const NeovimGui = struct {
         self.installImagePreviewAutocmd() catch |err| {
             log.warn("failed to install image preview autocmd: {}", .{err});
         };
+        self.installCollabPresenceAutocmd() catch |err| {
+            log.warn("failed to install collab presence autocmd: {}", .{err});
+        };
     }
 
     fn installImagePreviewAutocmd(self: *Self) !void {
@@ -297,6 +308,36 @@ pub const NeovimGui = struct {
             "end " ++
             "vim.api.nvim_create_autocmd({'BufEnter','BufWinEnter','WinEnter'}, {callback = ghostty_send}) " ++
             "ghostty_send() " ++
+            "end";
+        try self.io.?.sendCommand(cmd);
+    }
+
+    /// Install collab presence autocmds - sends cursor position and buffer name
+    /// to Ghostty on every CursorMoved event via rpcnotify. This is what makes
+    /// peer ghost cursors work. Injected at runtime, no Neovim plugin needed.
+    fn installCollabPresenceAutocmd(self: *Self) !void {
+        if (self.io == null) return;
+        const cmd =
+            "lua if vim.g.ghostty_collab ~= 1 then " ++
+            "vim.g.ghostty_collab = 1 " ++
+            "local chan = vim.g.ghostty_channel " ++
+            "if type(chan) ~= 'number' then " ++
+            "local uis = vim.api.nvim_list_uis() " ++
+            "if uis and uis[1] and type(uis[1].chan) == 'number' then chan = uis[1].chan end " ++
+            "end " ++
+            "if type(chan) ~= 'number' then return end " ++
+            "local function ghostty_presence() " ++
+            "local c = vim.g.ghostty_channel " ++
+            "if type(c) ~= 'number' then return end " ++
+            "local pos = vim.api.nvim_win_get_cursor(0) " ++
+            "local name = vim.api.nvim_buf_get_name(0) or '' " ++
+            "if name ~= '' then name = vim.fn.fnamemodify(name, ':~:.') end " ++
+            "local m = vim.fn.mode() " ++
+            "vim.rpcnotify(c, 'ghostty_presence', pos[1], pos[2], name, m) " ++
+            "end " ++
+            "vim.api.nvim_create_autocmd({" ++
+            "'CursorMoved','CursorMovedI','ModeChanged','BufEnter','WinEnter'" ++
+            "}, {callback = ghostty_presence}) " ++
             "end";
         try self.io.?.sendCommand(cmd);
     }
@@ -445,6 +486,18 @@ pub const NeovimGui = struct {
                 self.image_preview_path = self.alloc.dupe(u8, path) catch "";
                 self.image_preview_token +%= 1;
                 self.dirty = true;
+            },
+            .collab_presence => |data| {
+                // Store our current file for same-buffer detection
+                if (self.current_file.len > 0) {
+                    self.alloc.free(self.current_file);
+                }
+                self.current_file = self.alloc.dupe(u8, data.file_name) catch "";
+
+                // Forward to CollabState via callback (Surface sets this up)
+                if (self.collab_presence_callback) |cb| {
+                    cb(data.row, data.col, data.file_name, data.mode);
+                }
             },
             .win_viewport_margins => |data| {
                 self.handleWinViewportMargins(data);

@@ -158,6 +158,12 @@ pub const Command = union(Key) {
     /// Ghostty: Toggle panel GUI (OSC 1339)
     toggle_panel_gui: void,
 
+    /// Ghostty: Start collab session / share (OSC 1342)
+    collab_share: void,
+
+    /// Ghostty: Join collab session (OSC 1343)
+    collab_join: void,
+
     pub const SemanticPrompt = parsers.semantic_prompt.Command;
 
     pub const Key = LibEnum(
@@ -189,6 +195,8 @@ pub const Command = union(Key) {
             "kitty_text_sizing",
             "enter_neovim_gui",
             "toggle_panel_gui",
+            "collab_share",
+            "collab_join",
         },
     );
 
@@ -350,6 +358,9 @@ pub const Parser = struct {
         @"1337",
         @"1338",
         @"1339",
+        @"134",
+        @"1342",
+        @"1343",
     };
 
     pub fn init(alloc: ?Allocator) Parser {
@@ -413,6 +424,8 @@ pub const Parser = struct {
             .kitty_text_sizing,
             .enter_neovim_gui,
             .toggle_panel_gui,
+            .collab_share,
+            .collab_join,
             => {},
         }
 
@@ -567,6 +580,7 @@ pub const Parser = struct {
             .@"13" => switch (c) {
                 ';' => if (self.ensureAllocator()) self.writeToFixed(),
                 '3' => self.state = .@"133",
+                '4' => self.state = .@"134",
                 else => self.state = .invalid,
             },
 
@@ -618,6 +632,19 @@ pub const Parser = struct {
             .@"1337",
             .@"1338",
             .@"1339",
+            => switch (c) {
+                ';' => self.writeToFixed(),
+                else => self.state = .invalid,
+            },
+
+            .@"134" => switch (c) {
+                '2' => self.state = .@"1342",
+                '3' => self.state = .@"1343",
+                else => self.state = .invalid,
+            },
+
+            .@"1342",
+            .@"1343",
             => switch (c) {
                 ';' => self.writeToFixed(),
                 else => self.state = .invalid,
@@ -718,6 +745,20 @@ pub const Parser = struct {
                 // OSC 1339 - Toggle panel GUI
                 // Usage: printf '\e]1339\a'
                 self.command = .toggle_panel_gui;
+                return &self.command;
+            },
+
+            .@"1342" => {
+                // OSC 1342 - Start collab session (share)
+                // Usage: printf '\e]1342\a'
+                self.command = .collab_share;
+                return &self.command;
+            },
+
+            .@"1343" => {
+                // OSC 1343 - Join collab session
+                // Usage: printf '\e]1343;host:port\a'
+                self.command = .collab_join;
                 return &self.command;
             },
         };

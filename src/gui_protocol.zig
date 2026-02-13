@@ -14,6 +14,43 @@ pub const GuiState = struct {
     cursor: GuiCursor,
     config: GuiConfig,
     scroll_animating: bool,
+    /// Peer cursors from collab session (null-terminated slice, up to 8).
+    peer_cursors: []const PeerCursor = &.{},
+};
+
+/// A remote peer's cursor, rendered as a colored ghost cursor with name label.
+/// The renderer draws these with the same spring animation as the local cursor,
+/// but tinted to the peer's chosen color and at reduced opacity.
+pub const PeerCursor = struct {
+    /// Display name (shown as floating label above the cursor).
+    name: [32]u8 = .{0} ** 32,
+    name_len: u8 = 0,
+
+    /// Cursor color as 0xRRGGBB (from their collab-color config).
+    color: u32 = 0x7aa2f7,
+
+    /// Grid position in cells.
+    grid_row: u32 = 0,
+    grid_col: u32 = 0,
+
+    /// Whether this peer is in the same buffer as us.
+    /// If false, the renderer can show a dimmed indicator or hide the cursor.
+    same_buffer: bool = false,
+
+    /// Vim mode (for cursor shape: block=normal, bar=insert, underline=replace).
+    mode: PeerMode = .normal,
+
+    pub const PeerMode = enum(u8) {
+        normal = 0,
+        insert = 1,
+        visual = 2,
+        command = 3,
+        replace = 4,
+    };
+
+    pub fn getName(self: *const PeerCursor) []const u8 {
+        return self.name[0..self.name_len];
+    }
 };
 
 /// Frame-level config the renderer needs from the backend.

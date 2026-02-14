@@ -386,12 +386,11 @@ pub const NeovimGui = struct {
             "if not c then return end " ++
             "local ok, pos = pcall(vim.api.nvim_win_get_cursor, 0) " ++
             "if not ok then return end " ++
-            "local sp = vim.fn.screenpos(0, pos[1], pos[2] + 1) " ++
-            "if sp.row == 0 then return end " ++
+            "local wc = vim.fn.wincol() " ++
             "local name = vim.api.nvim_buf_get_name(0) or '' " ++
             "if name ~= '' then name = vim.fn.fnamemodify(name, ':~:.') end " ++
             "local m = vim.fn.mode() " ++
-            "vim.rpcnotify(c, 'ghostty_presence', sp.row - 1, sp.col - 1, name, m) " ++
+            "vim.rpcnotify(c, 'ghostty_presence', pos[1], wc, name, m) " ++
             "end " ++
             "vim.api.nvim_create_autocmd({" ++
             "'CursorMoved','CursorMovedI','ModeChanged','BufEnter','WinEnter'" ++

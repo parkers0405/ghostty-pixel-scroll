@@ -1978,15 +1978,58 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         _ = cs.getPeers(&raw_peers);
                         self.peer_cursor_count = 0;
 
+                        // Find the receiver's cursor window to get topline + position
+                        const cursor_win: ?*@import("../neovim_gui/rendered_window.zig").RenderedWindow =
+                            nvim.windows.get(nvim.cursor_grid);
+                        const my_file = nvim.current_file;
+
                         for (raw_peers[0..collab_main.MAX_PEERS]) |maybe_peer| {
                             if (maybe_peer) |peer| {
                                 if (self.peer_cursor_count >= 8) break;
 
-                                // Simple passthrough: peer sends screen coords, we render at those coords
+                                const peer_file = peer.getFileName();
+
+                                // Different file → skip (don't show ghost cursor)
+                                if (my_file.len == 0 or peer_file.len == 0 or
+                                    !std.mem.eql(u8, my_file, peer_file))
+                                    continue;
+
+                                // Convert peer's buffer coords to receiver's screen coords.
+                                // peer.cursor_row = 1-based buffer line (from nvim_win_get_cursor pos[1])
+                                // peer.cursor_col = 1-based window column (from wincol() — includes gutter)
+                                // cursor_win.topline = 0-based top visible buffer line (from win_viewport)
+                                const win = cursor_win orelse continue;
+                                const topline: u32 = @intCast(@min(win.topline, std.math.maxInt(u32)));
+                                const peer_line_0: u32 = if (peer.cursor_row > 0) peer.cursor_row - 1 else 0;
+
+                                // Off-screen check: peer line before topline
+                                if (peer_line_0 < topline) continue;
+
+                                const lines_from_top: u32 = peer_line_0 - topline;
+                                const margin_top: u32 = @intCast(win.viewport_margins.top);
+                                const margin_bot: u32 = @intCast(win.viewport_margins.bottom);
+                                const content_height: u32 = if (win.grid_height > margin_top + margin_bot)
+                                    win.grid_height - margin_top - margin_bot
+                                else
+                                    win.grid_height;
+
+                                // Off-screen check: peer line below visible area
+                                if (lines_from_top >= content_height) continue;
+
+                                // Screen position:
+                                // Row: grid_position[1] + margin_top (winbar rows) + lines from topline
+                                // Col: grid_position[0] + (wincol - 1). wincol() already includes
+                                //      the gutter (signcolumn + line numbers) so no margin_left needed.
+                                const win_row: u32 = @intFromFloat(@max(0, win.grid_position[1]));
+                                const win_col: u32 = @intFromFloat(@max(0, win.grid_position[0]));
+                                const screen_row = win_row + margin_top + lines_from_top;
+                                const peer_wincol_0: u32 = if (peer.cursor_col > 0) peer.cursor_col - 1 else 0;
+                                const screen_col = win_col + peer_wincol_0;
+
                                 var pc = gui_protocol.PeerCursor{
                                     .color = peer.color,
-                                    .grid_row = peer.cursor_row,
-                                    .grid_col = peer.cursor_col,
+                                    .grid_row = screen_row,
+                                    .grid_col = screen_col,
                                     .mode = @enumFromInt(@intFromEnum(peer.mode)),
                                     .name_len = peer.name_len,
                                     .same_buffer = true,
@@ -2610,8 +2653,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// and at reduced opacity. Appends directly to fg_rows.lists[0] so it
         /// draws in the same pass as the main cursor.
         fn renderPeerCursor(self: *Self, peer: gui_protocol.PeerCursor) void {
-            // TODO: re-enable same_buffer check once file path matching is verified
-            // if (!peer.same_buffer) return;
+            if (!peer.same_buffer) return;
 
             const col: u16 = @intCast(@min(peer.grid_col, if (self.cells.size.columns > 0) self.cells.size.columns - 1 else 0));
             const row: u16 = @intCast(@min(peer.grid_row, if (self.cells.size.rows > 0) self.cells.size.rows - 1 else 0));

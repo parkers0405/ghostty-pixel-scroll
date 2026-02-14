@@ -959,12 +959,20 @@ pub fn startCollabHost(self: *Surface) !void {
         nvim.collab_presence_callback = &collabPresenceForward;
     }
 
-    // Log the join code
-    var code_buf: [64]u8 = undefined;
-    const code_len = state.getJoinCode(&code_buf);
-    if (code_len > 0) {
-        log.info("collab session started! join code: {s}", .{code_buf[0..code_len]});
+    // Write join info to temp file so shell integration can display it
+    const server = state.server orelse return;
+    const port = server.port;
+    {
+        const file = std.fs.createFileAbsolute("/tmp/ghostty-collab-info", .{}) catch |err| {
+            log.warn("failed to write collab info file: {}", .{err});
+            return;
+        };
+        defer file.close();
+        var buf: [128]u8 = undefined;
+        const info_str = std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{port}) catch return;
+        file.writeAll(info_str) catch {};
     }
+    log.info("collab session started on port {d}", .{port});
 }
 
 /// Standalone callback for forwarding Neovim presence to CollabState.
@@ -1093,6 +1101,11 @@ pub fn initNeovimGui(self: *Surface) !void {
         }.notify,
     );
 
+    // Wire collab presence callback if a session is active
+    if (self.collab_state != null) {
+        nvim.collab_presence_callback = &collabPresenceForward;
+    }
+
     log.info("Neovim GUI mode initialized successfully", .{});
 }
 
@@ -1144,6 +1157,11 @@ pub fn initNeovimGuiWithCwd(self: *Surface, cwd: ?[]const u8) !void {
             }
         }.notify,
     );
+
+    // Wire collab presence callback if a session is active
+    if (self.collab_state != null) {
+        nvim.collab_presence_callback = &collabPresenceForward;
+    }
 
     log.info("Neovim GUI mode initialized with cwd: {?s}", .{effective_cwd});
 }
@@ -1771,10 +1789,25 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
         },
 
-        .collab_join => {
-            // OSC 1343 - Join collab session
-            log.info("joining collab session via OSC 1343", .{});
-            // TODO: parse host:port from OSC params
+        .collab_join => |*v| {
+            // OSC 1343 - Join collab session with host:port
+            const host_port = std.mem.sliceTo(@as([*:0]const u8, @ptrCast(v)), 0);
+            log.info("joining collab session via OSC 1343: {s}", .{host_port});
+
+            // Parse "host:port"
+            if (std.mem.lastIndexOfScalar(u8, host_port, ':')) |colon| {
+                const host = host_port[0..colon];
+                const port_str = host_port[colon + 1 ..];
+                const port = std.fmt.parseInt(u16, port_str, 10) catch {
+                    log.err("invalid port in collab join: {s}", .{port_str});
+                    return;
+                };
+                self.joinCollabSession(host, port) catch |err| {
+                    log.err("failed to join collab session: {}", .{err});
+                };
+            } else {
+                log.err("invalid collab join format, expected host:port, got: {s}", .{host_port});
+            }
         },
     }
 }

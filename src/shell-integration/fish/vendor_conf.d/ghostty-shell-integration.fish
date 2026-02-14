@@ -231,6 +231,12 @@ end
 # Collab session commands
 function ghostty-share
     printf '\e]1342\a'
+    sleep 0.2
+    if test -f /tmp/ghostty-collab-info
+        set -l addr (cat /tmp/ghostty-collab-info)
+        echo "Collab session started!"
+        echo "Others can join with: ghostty-join $addr"
+    end
 end
 
 function ghostty-join

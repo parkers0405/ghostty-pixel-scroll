@@ -182,7 +182,7 @@ pub const CollabState = struct {
     // can't capture `self`. We use a thread-local or global for the instance.
     // For now, we use a simple global since there's one CollabState per app.
 
-    var global_instance: ?*Self = null;
+    pub var global_instance: ?*Self = null;
 
     pub fn setGlobalInstance(self: *Self) void {
         global_instance = self;

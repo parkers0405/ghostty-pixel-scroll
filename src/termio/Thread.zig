@@ -347,9 +347,9 @@ fn drainMailbox(
                 log.info("termio: collab_share message - forwarding to surface", .{});
                 _ = io.surface_mailbox.push(.collab_share, .{ .forever = {} });
             },
-            .collab_join => {
+            .collab_join => |buf| {
                 log.info("termio: collab_join message - forwarding to surface", .{});
-                _ = io.surface_mailbox.push(.collab_join, .{ .forever = {} });
+                _ = io.surface_mailbox.push(.{ .collab_join = buf }, .{ .forever = {} });
             },
             .write_small => |v| try io.queueWrite(
                 data,

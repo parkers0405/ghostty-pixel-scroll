@@ -117,8 +117,8 @@ pub const Message = union(enum) {
     /// Start collab session (triggered by OSC 1342)
     collab_share: void,
 
-    /// Join collab session (triggered by OSC 1343)
-    collab_join: void,
+    /// Join collab session (triggered by OSC 1343;host:port)
+    collab_join: [256]u8,
 
     pub const ReportTitleStyle = enum {
         csi_21_t,

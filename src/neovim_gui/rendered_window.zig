@@ -313,6 +313,9 @@ pub const RenderedWindow = struct {
     /// Used to disable smooth scroll for windows like nvim-tree that don't really scroll
     has_scrolled: bool = false,
 
+    /// Top visible buffer line (0-based), from win_viewport. Used for collab cursor mapping.
+    topline: u64 = 0,
+
     /// Fixed rows/cols at edges (winbar, borders, etc.)
     viewport_margins: ViewportMargins = .{},
 
@@ -373,13 +376,13 @@ pub const RenderedWindow = struct {
     pub fn resize(self: *Self, width: u32, height: u32) !void {
         if (width == self.grid_width and height == self.grid_height) return;
 
-        log.debug("Window {} resize: {}x{} -> {}x{}", .{
-            self.id,
-            self.grid_width,
-            self.grid_height,
-            width,
-            height,
-        });
+        // log.debug("Window {} resize: {}x{} -> {}x{}", .{
+        //     self.id,
+        //     self.grid_width,
+        //     self.grid_height,
+        //     width,
+        //     height,
+        // });
 
         // Preserve old content during resize to prevent black flashes.
         // Grid 1 is special: on height change, row semantics shift (e.g., old interior
@@ -651,8 +654,8 @@ pub const RenderedWindow = struct {
     /// If we blindly accept 0, it overwrites the real delta before flush() processes it.
     /// This matches Neovide's behavior of using Option<i64> and only acting on Some values.
     pub fn setViewport(self: *Self, topline: u64, botline: u64, scroll_delta: i64) void {
-        _ = topline;
         _ = botline;
+        self.topline = topline;
         // Only set scroll_delta when non-zero - ignore the "confirmation" events with delta=0
         if (scroll_delta != 0) {
             self.scroll_delta = @intCast(scroll_delta);
@@ -811,11 +814,14 @@ pub const RenderedWindow = struct {
         var scrollback = &self.scrollback_lines.?;
         const actual = &self.actual_lines.?;
 
-        log.debug("flush: scroll_delta={}, scrollback_idx={}, actual_idx={}", .{
-            self.scroll_delta,
-            scrollback.current_index,
-            actual.current_index,
-        });
+        // Only log non-zero scroll events to reduce noise
+        if (self.scroll_delta != 0) {
+            log.debug("flush: scroll_delta={}, scrollback_idx={}, actual_idx={}", .{
+                self.scroll_delta,
+                scrollback.current_index,
+                actual.current_index,
+            });
+        }
 
         // Get inner (scrollable) region bounds (exactly like Neovide)
         const inner_top: isize = @intCast(self.viewport_margins.top);

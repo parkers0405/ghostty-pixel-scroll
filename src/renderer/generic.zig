@@ -1939,7 +1939,9 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            const needs_rebuild = content_dirty or scroll_dirty or preview_changed;
+            // Also check if collab peers have updated (triggers ghost cursor rendering)
+            const collab_dirty = if (self.collab_state) |cs| cs.peer_count > 0 else false;
+            const needs_rebuild = content_dirty or scroll_dirty or preview_changed or collab_dirty;
 
             if (needs_rebuild) {
                 // Build generic GuiState via the adapter, then render.
@@ -1976,31 +1978,28 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         _ = cs.getPeers(&raw_peers);
                         self.peer_cursor_count = 0;
 
-                        // Get our current file for same-buffer detection
-                        const our_file = if (self.nvim_gui) |ng| ng.current_file else "";
-
                         for (raw_peers[0..collab_main.MAX_PEERS]) |maybe_peer| {
                             if (maybe_peer) |peer| {
                                 if (self.peer_cursor_count >= 8) break;
+
+                                // Simple passthrough: peer sends screen coords, we render at those coords
                                 var pc = gui_protocol.PeerCursor{
                                     .color = peer.color,
                                     .grid_row = peer.cursor_row,
                                     .grid_col = peer.cursor_col,
                                     .mode = @enumFromInt(@intFromEnum(peer.mode)),
                                     .name_len = peer.name_len,
+                                    .same_buffer = true,
                                 };
                                 @memcpy(&pc.name, &peer.name);
-
-                                // Same-buffer detection
-                                const peer_file = peer.getFileName();
-                                pc.same_buffer = (our_file.len > 0 and peer_file.len > 0 and
-                                    std.mem.eql(u8, our_file, peer_file));
 
                                 self.peer_cursor_buf[self.peer_cursor_count] = pc;
                                 self.peer_cursor_count += 1;
                             }
                         }
                         gui_state_with_peers.peer_cursors = self.peer_cursor_buf[0..self.peer_cursor_count];
+                    } else {
+                        if (collab_dirty) log.warn("COLLAB RENDER: collab_dirty but no collab_state!", .{});
                     }
                     try self.rebuildCellsFromGui(gui_state_with_peers);
                 }
@@ -2611,10 +2610,15 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// and at reduced opacity. Appends directly to fg_rows.lists[0] so it
         /// draws in the same pass as the main cursor.
         fn renderPeerCursor(self: *Self, peer: gui_protocol.PeerCursor) void {
-            if (!peer.same_buffer) return;
+            // TODO: re-enable same_buffer check once file path matching is verified
+            // if (!peer.same_buffer) return;
 
             const col: u16 = @intCast(@min(peer.grid_col, if (self.cells.size.columns > 0) self.cells.size.columns - 1 else 0));
             const row: u16 = @intCast(@min(peer.grid_row, if (self.cells.size.rows > 0) self.cells.size.rows - 1 else 0));
+
+            // log.info("GHOST CURSOR: peer={s} row={d} col={d} color=0x{x} grid={d}x{d}", .{
+            //     peer.getName(), row, col, peer.color, self.cells.size.columns, self.cells.size.rows,
+            // });
 
             if (row >= self.cells.size.rows or col >= self.cells.size.columns) return;
 
@@ -2637,10 +2641,12 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const g: u8 = @intCast((color >> 8) & 0xFF);
             const b: u8 = @intCast(color & 0xFF);
 
-            // Ghost cursor at 60% opacity
+            // Ghost cursor: NOT is_cursor_glyph (that flag causes the shader to
+            // reposition it to the main cursor's animated corner positions).
+            // Instead, draw as a regular foreground cell at the peer's grid position.
             const ghost_cell: shaderpkg.CellText = .{
                 .atlas = .grayscale,
-                .bools = .{ .is_cursor_glyph = true },
+                .bools = .{},
                 .grid_pos = .{ col, row },
                 .color = .{ r, g, b, 153 }, // 60% of 255
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
@@ -2649,11 +2655,14 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .pixel_offset_y = 0,
             };
 
-            // Append to cursor list (lists[0]) without clearing -- main cursor already there
-            self.cells.fg_rows.lists[0].appendAssumeCapacity(ghost_cell);
+            // Append to the row's fg list so it draws at the correct grid position
+            const list_idx = row + 1; // fg_rows index 0 is cursor, rows start at 1
+            if (list_idx < self.cells.fg_rows.lists.len) {
+                self.cells.fg_rows.lists[list_idx].append(self.alloc, ghost_cell) catch return;
+            }
 
-            // Render the peer's name label above the cursor
-            self.renderPeerNameLabel(peer, col, row);
+            // TODO: Render name label (needs proper text glyph rendering, not sprite)
+            // self.renderPeerNameLabel(peer, col, row);
         }
 
         /// Render a floating name label above a peer's ghost cursor.
@@ -2693,7 +2702,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     .pixel_offset_y = 0,
                 };
 
-                self.cells.fg_rows.lists[0].appendAssumeCapacity(label_cell);
+                self.cells.fg_rows.lists[0].append(self.alloc, label_cell) catch break;
                 x += 1;
             }
         }

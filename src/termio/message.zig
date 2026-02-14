@@ -91,8 +91,8 @@ pub const Message = union(enum) {
     /// Start collab session (triggered by OSC 1342)
     collab_share: void,
 
-    /// Join collab session (triggered by OSC 1343)
-    collab_join: void,
+    /// Join collab session (triggered by OSC 1343;host:port)
+    collab_join: [256]u8,
 
     /// Return a write request for the given data. This will use
     /// write_small if it fits or write_alloc otherwise. This should NOT

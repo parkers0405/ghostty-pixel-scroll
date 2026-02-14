@@ -2093,11 +2093,14 @@ pub fn Stream(comptime Handler: type) type {
                     }
                 },
 
-                .collab_join => {
-                    // OSC 1343 - Join collab session
+                .collab_join => |v| {
+                    // OSC 1343 - Join collab session with host:port
                     if (@hasField(@TypeOf(self.handler), "surface_mailbox")) {
-                        log.info("OSC 1343 received - joining collab session", .{});
-                        _ = self.handler.surface_mailbox.push(.collab_join, .{ .instant = {} });
+                        log.info("OSC 1343 received - joining collab session: {s}", .{v.value});
+                        var buf: [256]u8 = .{0} ** 256;
+                        const len = @min(v.value.len, 255);
+                        @memcpy(buf[0..len], v.value[0..len]);
+                        _ = self.handler.surface_mailbox.push(.{ .collab_join = buf }, .{ .instant = {} });
                     }
                 },
 

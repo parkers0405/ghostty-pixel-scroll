@@ -161,8 +161,8 @@ pub const Command = union(Key) {
     /// Ghostty: Start collab session / share (OSC 1342)
     collab_share: void,
 
-    /// Ghostty: Join collab session (OSC 1343)
-    collab_join: void,
+    /// Ghostty: Join collab session (OSC 1343;host:port)
+    collab_join: struct { value: [:0]const u8 },
 
     pub const SemanticPrompt = parsers.semantic_prompt.Command;
 
@@ -425,8 +425,8 @@ pub const Parser = struct {
             .enter_neovim_gui,
             .toggle_panel_gui,
             .collab_share,
-            .collab_join,
             => {},
+            .collab_join => {},
         }
 
         self.state = .start;
@@ -732,6 +732,8 @@ pub const Parser = struct {
 
             .@"777" => parsers.rxvt_extension.parse(self, terminator_ch),
 
+            .@"134" => null, // incomplete: needs digit 2 or 3
+
             .@"1337" => parsers.iterm2.parse(self, terminator_ch),
 
             .@"1338" => {
@@ -758,7 +760,13 @@ pub const Parser = struct {
             .@"1343" => {
                 // OSC 1343 - Join collab session
                 // Usage: printf '\e]1343;host:port\a'
-                self.command = .collab_join;
+                const writer = self.writer orelse return null;
+                writer.writeByte(0) catch return null;
+                const data = writer.buffered();
+                if (data.len <= 1) return null;
+                self.command = .{ .collab_join = .{
+                    .value = data[0 .. data.len - 1 :0],
+                } };
                 return &self.command;
             },
         };

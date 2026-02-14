@@ -314,30 +314,148 @@ pub const NeovimGui = struct {
 
     /// Install collab presence autocmds - sends cursor position and buffer name
     /// to Ghostty on every CursorMoved event via rpcnotify. This is what makes
+    /// Update NvimTree collab peer badges by pushing peer file info to Lua.
+    fn updateCollabPeerBadges(self: *Self) void {
+        const io = self.io orelse return;
+        const collab_main = @import("../collab/main.zig");
+        const cs = collab_main.CollabState.global_instance orelse return;
+
+        var raw_peers: [collab_main.MAX_PEERS]?collab_main.CollabState.PeerCursor = undefined;
+        _ = cs.getPeers(&raw_peers);
+
+        // Build Lua table string: {["file"] = "name", ...}
+        var buf: [2048]u8 = undefined;
+        var pos: usize = 0;
+        const prefix = "lua vim.g.ghostty_collab_peers = {";
+        @memcpy(buf[pos .. pos + prefix.len], prefix);
+        pos += prefix.len;
+
+        for (raw_peers[0..collab_main.MAX_PEERS]) |maybe_peer| {
+            if (maybe_peer) |peer| {
+                const file = peer.getFileName();
+                const name = peer.getName();
+                if (file.len == 0 or name.len == 0) continue;
+                // Skip NvimTree buffers
+                if (std.mem.startsWith(u8, file, "NvimTree")) continue;
+
+                // ["file"] = "name",
+                const entry_start = pos;
+                if (pos + 6 + file.len + name.len >= buf.len - 10) break;
+                buf[pos] = '[';
+                buf[pos + 1] = '"';
+                pos += 2;
+                @memcpy(buf[pos .. pos + file.len], file);
+                pos += file.len;
+                buf[pos] = '"';
+                buf[pos + 1] = ']';
+                buf[pos + 2] = '=';
+                buf[pos + 3] = '"';
+                pos += 4;
+                @memcpy(buf[pos .. pos + name.len], name);
+                pos += name.len;
+                buf[pos] = '"';
+                buf[pos + 1] = ',';
+                pos += 2;
+                _ = entry_start;
+            }
+        }
+
+        buf[pos] = '}';
+        pos += 1;
+
+        io.sendCommand(buf[0..pos]) catch {};
+    }
+
     /// peer ghost cursors work. Injected at runtime, no Neovim plugin needed.
     fn installCollabPresenceAutocmd(self: *Self) !void {
         if (self.io == null) return;
+        log.info("installing collab presence autocmd", .{});
         const cmd =
             "lua if vim.g.ghostty_collab ~= 1 then " ++
             "vim.g.ghostty_collab = 1 " ++
-            "local chan = vim.g.ghostty_channel " ++
-            "if type(chan) ~= 'number' then " ++
-            "local uis = vim.api.nvim_list_uis() " ++
-            "if uis and uis[1] and type(uis[1].chan) == 'number' then chan = uis[1].chan end " ++
-            "end " ++
-            "if type(chan) ~= 'number' then return end " ++
-            "local function ghostty_presence() " ++
+            "local function get_chan() " ++
             "local c = vim.g.ghostty_channel " ++
-            "if type(c) ~= 'number' then return end " ++
-            "local pos = vim.api.nvim_win_get_cursor(0) " ++
+            "if type(c) == 'number' then return c end " ++
+            "local uis = vim.api.nvim_list_uis() " ++
+            "if uis and uis[1] and type(uis[1].chan) == 'number' then " ++
+            "vim.g.ghostty_channel = uis[1].chan " ++
+            "return uis[1].chan end " ++
+            "return nil end " ++
+            "local function ghostty_presence() " ++
+            "local c = get_chan() " ++
+            "if not c then return end " ++
+            "local ok, pos = pcall(vim.api.nvim_win_get_cursor, 0) " ++
+            "if not ok then return end " ++
+            "local sp = vim.fn.screenpos(0, pos[1], pos[2] + 1) " ++
+            "if sp.row == 0 then return end " ++
             "local name = vim.api.nvim_buf_get_name(0) or '' " ++
             "if name ~= '' then name = vim.fn.fnamemodify(name, ':~:.') end " ++
             "local m = vim.fn.mode() " ++
-            "vim.rpcnotify(c, 'ghostty_presence', pos[1], pos[2], name, m) " ++
+            "vim.rpcnotify(c, 'ghostty_presence', sp.row - 1, sp.col - 1, name, m) " ++
             "end " ++
             "vim.api.nvim_create_autocmd({" ++
             "'CursorMoved','CursorMovedI','ModeChanged','BufEnter','WinEnter'" ++
             "}, {callback = ghostty_presence}) " ++
+            "ghostty_presence() " ++
+            // -- Live file sync: auto-save on edit, auto-reload on change --
+            "vim.o.autoread = true " ++
+            "vim.o.updatetime = 200 " ++
+            // Auto-save: write buffer after each text change (normal + insert)
+            "vim.api.nvim_create_autocmd({'TextChanged','TextChangedI'}, {" ++
+            "callback = function() " ++
+            "local buf = vim.api.nvim_get_current_buf() " ++
+            "if vim.bo[buf].modified and vim.bo[buf].modifiable " ++
+            "and vim.bo[buf].buftype == '' " ++
+            "and vim.api.nvim_buf_get_name(buf) ~= '' then " ++
+            "pcall(vim.api.nvim_buf_call, buf, function() vim.cmd('silent! noautocmd write') end) " ++
+            "end " ++
+            "end}) " ++
+            // File watcher: use inotify for instant reload on external changes
+            "local watchers = {} " ++
+            "local function watch_buf(buf) " ++
+            "local name = vim.api.nvim_buf_get_name(buf) " ++
+            "if name == '' or watchers[name] then return end " ++
+            "local w = vim.uv.new_fs_event() " ++
+            "if not w then return end " ++
+            "local ok = pcall(w.start, w, name, {}, vim.schedule_wrap(function() " ++
+            "pcall(vim.cmd, 'silent! checktime') " ++
+            "end)) " ++
+            "if ok then watchers[name] = w end " ++
+            "end " ++
+            "vim.api.nvim_create_autocmd({'BufEnter','BufReadPost'}, {" ++
+            "callback = function() watch_buf(vim.api.nvim_get_current_buf()) end}) " ++
+            // Also keep a slow fallback timer for edge cases
+            "local timer = vim.uv.new_timer() " ++
+            "timer:start(500, 500, vim.schedule_wrap(function() " ++
+            "pcall(vim.cmd, 'silent! checktime') " ++
+            "end)) " ++
+            // -- NvimTree collab badges --
+            "vim.g.ghostty_collab_peers = {} " ++
+            // Define highlight group for collab badge
+            "vim.api.nvim_set_hl(0, 'GhosttyCollabPeer', {fg = '#7aa2f7', bold = true}) " ++
+            // Try to hook into nvim-tree renderer for badges
+            "pcall(function() " ++
+            "local api = require('nvim-tree.api') " ++
+            "local Event = api.events.Event " ++
+            "api.events.subscribe(Event.TreeRendered, function() " ++
+            "local peers = vim.g.ghostty_collab_peers or {} " ++
+            "if vim.tbl_isempty(peers) then return end " ++
+            "local tree_buf = vim.api.nvim_get_current_buf() " ++
+            "if vim.bo[tree_buf].filetype ~= 'NvimTree' then return end " ++
+            "local ns = vim.api.nvim_create_namespace('ghostty_collab') " ++
+            "vim.api.nvim_buf_clear_namespace(tree_buf, ns, 0, -1) " ++
+            "local lines = vim.api.nvim_buf_get_lines(tree_buf, 0, -1, false) " ++
+            "for i, line in ipairs(lines) do " ++
+            "for pfile, pname in pairs(peers) do " ++
+            "local basename = vim.fn.fnamemodify(pfile, ':t') " ++
+            "if line:find(basename, 1, true) then " ++
+            "pcall(vim.api.nvim_buf_set_extmark, tree_buf, ns, i-1, 0, " ++
+            "{virt_text = {{' ● ' .. pname, 'GhosttyCollabPeer'}}, virt_text_pos = 'eol'}) " ++
+            "end " ++
+            "end " ++
+            "end " ++
+            "end) " ++
+            "end) " ++
             "end";
         try self.io.?.sendCommand(cmd);
     }
@@ -488,16 +606,19 @@ pub const NeovimGui = struct {
                 self.dirty = true;
             },
             .collab_presence => |data| {
-                // Store our current file for same-buffer detection
                 if (self.current_file.len > 0) {
                     self.alloc.free(self.current_file);
                 }
                 self.current_file = self.alloc.dupe(u8, data.file_name) catch "";
 
-                // Forward to CollabState via callback (Surface sets this up)
                 if (self.collab_presence_callback) |cb| {
                     cb(data.row, data.col, data.file_name, data.mode);
+                } else {
+                    log.warn("no collab_presence_callback set", .{});
                 }
+
+                // Update NvimTree badges with peer file info
+                self.updateCollabPeerBadges();
             },
             .win_viewport_margins => |data| {
                 self.handleWinViewportMargins(data);
@@ -664,9 +785,6 @@ pub const NeovimGui = struct {
     }
 
     fn handleGridResize(self: *Self, grid: u64, width: u64, height: u64) !void {
-        const is_new = self.windows.get(grid) == null;
-        log.debug("grid_resize: grid={} {}x{} is_new={}", .{ grid, width, height, is_new });
-
         const window = try self.getOrCreateWindow(grid);
         try window.resize(@intCast(width), @intCast(height));
 

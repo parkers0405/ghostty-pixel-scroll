@@ -1512,8 +1512,6 @@ pub const IoThread = struct {
             }
         } else if (std.mem.eql(u8, name, "win_viewport_margins")) {
             // win_viewport_margins: [grid, win, top, bottom, left, right]
-            // DEBUG: Log what we actually receive
-            log.debug("win_viewport_margins RAW: args.len={}", .{args.len});
             if (args.len >= 6) {
                 const grid = extractU64(args[0]) orelse return;
                 const win = extractU64(args[1]) orelse 0;
@@ -1521,7 +1519,6 @@ pub const IoThread = struct {
                 const bottom = extractU64(args[3]) orelse 0;
                 const left = extractU64(args[4]) orelse 0;
                 const right = extractU64(args[5]) orelse 0;
-                log.debug("win_viewport_margins PARSED: grid={} win={} top={} bottom={} left={} right={}", .{ grid, win, top, bottom, left, right });
                 try self.pushRedrawEvent(.{ .win_viewport_margins = .{
                     .grid = grid,
                     .win = win,
@@ -1571,7 +1568,7 @@ pub const IoThread = struct {
                 const duped_name = try self.alloc.dupe(u8, opt_name);
                 errdefer self.alloc.free(duped_name);
 
-                log.debug("option_set: {s} = {}", .{ duped_name, value });
+                // log.debug("option_set: {s} = {}", .{ duped_name, value });
                 try self.pushRedrawEvent(.{ .option_set = .{
                     .name = duped_name,
                     .value = value,

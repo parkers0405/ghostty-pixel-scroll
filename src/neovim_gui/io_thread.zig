@@ -143,6 +143,10 @@ pub const Event = union(enum) {
     // Collab presence from injected Lua autocmd (ghostty_presence RPC)
     collab_presence: CollabPresence,
 
+    // Resolved peer screen positions from receiver-side screenpos() (ghostty_peer_screen RPC)
+    // Flat array: [row0, col0, row1, col1, ...]. Row=0 means off-screen.
+    collab_peer_screen: CollabPeerScreen,
+
     // Message events (ext_messages)
     msg_show: MsgShow,
     msg_clear,
@@ -175,14 +179,21 @@ pub const Event = union(enum) {
     tabline_update: TablineUpdate,
 
     pub const CollabPresence = struct {
-        row: u32,
-        col: u32,
+        row: u32, // pos[1] — 1-based buffer line
+        col: u32, // virtcol('.') — 1-based virtual column
         file_name: []const u8,
         mode: u8, // 'n'=normal, 'i'=insert, 'v'=visual, 'c'=command, 'R'=replace
 
         pub fn deinit(self: *CollabPresence, alloc: Allocator) void {
             if (self.file_name.len > 0) alloc.free(self.file_name);
         }
+    };
+
+    /// Resolved peer screen positions from receiver-side screenpos().
+    /// Flat array: [row0, col0, row1, col1, ...]. Row=0 means off-screen.
+    pub const CollabPeerScreen = struct {
+        positions: [16]u32 = .{0} ** 16,
+        count: u8 = 0, // number of peers (array has count*2 entries)
     };
 
     pub const GridResize = struct {
@@ -1112,7 +1123,7 @@ pub const IoThread = struct {
                         log.debug("Redraw processing error: {}", .{err});
                     };
                 } else if (std.mem.eql(u8, notif.method, "ghostty_presence")) {
-                    // Collab presence: ghostty_presence(row, col, filename, mode)
+                    // Collab presence: ghostty_presence(winline, wincol, filename, mode, buf_line)
                     const params = notif.params;
                     const arr = switch (params) {
                         .arr => |a| a,
@@ -1148,6 +1159,37 @@ pub const IoThread = struct {
                             self.alloc.free(duped_file);
                             return {};
                         };
+                    }
+                } else if (std.mem.eql(u8, notif.method, "ghostty_peer_screen")) {
+                    // Resolved peer screen positions: flat array [row0,col0,row1,col1,...]
+                    const params = notif.params;
+                    const arr = switch (params) {
+                        .arr => |a| a,
+                        else => return {},
+                    };
+                    if (arr.len >= 1) {
+                        const inner = switch (arr[0]) {
+                            .arr => |a| a,
+                            else => return {},
+                        };
+                        var screen_data = Event.CollabPeerScreen{};
+                        var i: usize = 0;
+                        while (i + 1 < inner.len and screen_data.count < 8) : (i += 2) {
+                            const r: u32 = switch (inner[i]) {
+                                .uint => |v| @intCast(v),
+                                .int => |v| @intCast(@max(0, v)),
+                                else => 0,
+                            };
+                            const c: u32 = switch (inner[i + 1]) {
+                                .uint => |v| @intCast(v),
+                                .int => |v| @intCast(@max(0, v)),
+                                else => 0,
+                            };
+                            screen_data.positions[screen_data.count * 2] = r;
+                            screen_data.positions[screen_data.count * 2 + 1] = c;
+                            screen_data.count += 1;
+                        }
+                        self.event_queue.push(.{ .collab_peer_screen = screen_data }) catch {};
                     }
                 } else if (std.mem.eql(u8, notif.method, "ghostty_image")) {
                     const params = notif.params;

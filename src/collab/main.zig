@@ -60,7 +60,7 @@ pub const CollabState = struct {
         name_len: u8 = 0,
         color: u32 = 0x7aa2f7,
 
-        /// Grid position (row/col in the Neovim grid)
+        /// Buffer position: 1-based line (pos[1]) and virtual column (virtcol)
         cursor_row: u32 = 0,
         cursor_col: u32 = 0,
 

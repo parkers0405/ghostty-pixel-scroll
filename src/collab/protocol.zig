@@ -27,8 +27,8 @@ pub const MessageType = enum(u8) {
 /// A presence update: where is this peer's cursor right now?
 pub const Presence = struct {
     peer_id: u8 = 0,
-    cursor_row: u32 = 0,
-    cursor_col: u32 = 0,
+    cursor_row: u32 = 0, // pos[1] — 1-based buffer line number
+    cursor_col: u32 = 0, // virtcol('.') — 1-based virtual column
     mode: Mode = .normal,
     /// Buffer/file name (relative path, variable length)
     file_name: [256]u8 = .{0} ** 256,

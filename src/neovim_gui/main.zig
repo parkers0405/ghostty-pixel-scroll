@@ -130,6 +130,12 @@ pub const NeovimGui = struct {
     /// Current buffer file name (from collab presence, for same-buffer detection)
     current_file: []const u8 = "",
 
+    /// Resolved peer screen positions from receiver-side screenpos() calls.
+    /// Flat array: [row0, col0, row1, col1, ...]. Row=0 means off-screen.
+    /// Set by ghostty_peer_screen RPC notification.
+    peer_screen_positions: [16]u32 = .{0} ** 16,
+    peer_screen_count: u8 = 0, // number of peers (positions = count * 2)
+
     /// Neovim options received via option_set event
     /// Key is the option name (owned), value is the option value
     options: std.StringHashMap(OptionValue),
@@ -366,6 +372,45 @@ pub const NeovimGui = struct {
         io.sendCommand(buf[0..pos]) catch {};
     }
 
+    /// Push peer buffer positions to Neovim as vim.g._ghostty_peer_buf.
+    /// The Lua autocmd will call screenpos() for each and send back resolved
+    /// screen positions via ghostty_peer_screen RPC. This handles wraps,
+    /// different gutter widths, and different window sizes correctly.
+    fn pushPeerBufferPositions(self: *Self) void {
+        const io = self.io orelse return;
+        const collab_main = @import("../collab/main.zig");
+        const cs = collab_main.CollabState.global_instance orelse return;
+
+        var raw_peers: [collab_main.MAX_PEERS]?collab_main.CollabState.PeerCursor = undefined;
+        _ = cs.getPeers(&raw_peers);
+
+        // Build: lua vim.g._ghostty_peer_buf = {{line,col},{line,col}}
+        var buf: [512]u8 = undefined;
+        var pos: usize = 0;
+        const prefix = "lua vim.g._ghostty_peer_buf = {";
+        @memcpy(buf[pos .. pos + prefix.len], prefix);
+        pos += prefix.len;
+
+        const my_file = self.current_file;
+        for (raw_peers[0..collab_main.MAX_PEERS]) |maybe_peer| {
+            if (maybe_peer) |peer| {
+                const peer_file = peer.getFileName();
+                // Only include peers in the same file
+                if (my_file.len == 0 or peer_file.len == 0) continue;
+                if (!std.mem.eql(u8, my_file, peer_file)) continue;
+
+                // {line,col},
+                const entry = std.fmt.bufPrint(buf[pos..], "{{{d},{d}}},", .{ peer.cursor_row, peer.cursor_col }) catch break;
+                pos += entry.len;
+            }
+        }
+
+        buf[pos] = '}';
+        pos += 1;
+
+        io.sendCommand(buf[0..pos]) catch {};
+    }
+
     /// peer ghost cursors work. Injected at runtime, no Neovim plugin needed.
     fn installCollabPresenceAutocmd(self: *Self) !void {
         if (self.io == null) return;
@@ -386,12 +431,29 @@ pub const NeovimGui = struct {
             "if not c then return end " ++
             "local ok, pos = pcall(vim.api.nvim_win_get_cursor, 0) " ++
             "if not ok then return end " ++
-            "local wc = vim.fn.wincol() " ++
+            "local vcol = vim.fn.virtcol('.') " ++
             "local name = vim.api.nvim_buf_get_name(0) or '' " ++
             "if name ~= '' then name = vim.fn.fnamemodify(name, ':~:.') end " ++
             "local m = vim.fn.mode() " ++
-            "vim.rpcnotify(c, 'ghostty_presence', pos[1], wc, name, m) " ++
+            "vim.rpcnotify(c, 'ghostty_presence', pos[1], vcol, name, m) " ++
             "end " ++
+            // Resolve peer buffer positions → screen positions on a fast timer.
+            // Runs independently of our cursor so ghost cursors update live.
+            "local function resolve_peers() " ++
+            "local c = get_chan() " ++
+            "if not c then return end " ++
+            "local pbufs = vim.g._ghostty_peer_buf " ++
+            "if not pbufs or #pbufs == 0 then return end " ++
+            "local res = {} " ++
+            "for _, p in ipairs(pbufs) do " ++
+            "local sp = vim.fn.screenpos(0, p[1], p[2]) " ++
+            "res[#res+1] = sp.row " ++
+            "res[#res+1] = sp.col " ++
+            "end " ++
+            "vim.rpcnotify(c, 'ghostty_peer_screen', res) " ++
+            "end " ++
+            "local peer_timer = vim.uv.new_timer() " ++
+            "peer_timer:start(6, 6, vim.schedule_wrap(resolve_peers)) " ++
             "vim.api.nvim_create_autocmd({" ++
             "'CursorMoved','CursorMovedI','ModeChanged','BufEnter','WinEnter'" ++
             "}, {callback = ghostty_presence}) " ++
@@ -484,6 +546,11 @@ pub const NeovimGui = struct {
             event.deinit(self.alloc);
         }
         self.local_events.clearRetainingCapacity();
+
+        // Push peer buffer positions to Neovim every frame so the Lua timer
+        // can resolve them via screenpos(). This ensures the ghost cursor
+        // updates live when PEERS move, not just when WE move.
+        self.pushPeerBufferPositions();
     }
 
     fn handleEvent(self: *Self, event: Event) !void {
@@ -618,6 +685,11 @@ pub const NeovimGui = struct {
 
                 // Update NvimTree badges with peer file info
                 self.updateCollabPeerBadges();
+            },
+            .collab_peer_screen => |data| {
+                self.peer_screen_positions = data.positions;
+                self.peer_screen_count = data.count;
+                self.dirty = true;
             },
             .win_viewport_margins => |data| {
                 self.handleWinViewportMargins(data);

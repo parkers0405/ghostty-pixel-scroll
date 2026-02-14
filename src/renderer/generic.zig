@@ -315,6 +315,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         peer_cursor_buf: [8]gui_protocol.PeerCursor = undefined,
         peer_cursor_count: u8 = 0,
 
+        /// Per-peer spring animations for smooth ghost cursor movement.
+        peer_animations: [8]animation.CursorAnimation = [_]animation.CursorAnimation{.{}} ** 8,
+        peer_last_grid_pos: [8][2]u32 = .{.{ std.math.maxInt(u32), std.math.maxInt(u32) }} ** 8,
+        peer_animating: bool = false,
+
         /// Scratch buffers for the neovim→gui adapter. Reused across frames.
         nvim_adapter_state: nvim_adapter.AdapterState = .{},
 
@@ -1213,6 +1218,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 self.scroll_animating or
                 self.sonicboom_active or
                 self.cursor_blink_animating or
+                self.peer_animating or
                 // In Neovim GUI mode we also need to keep running while
                 // events are pending (dirty flag means content changed)
                 (self.nvim_gui != null and self.nvim_gui.?.dirty) or
@@ -1230,6 +1236,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             return self.cursor_animating or
                 self.scroll_animating or
                 self.sonicboom_active or
+                self.peer_animating or
                 (self.nvim_gui != null and self.nvim_gui.?.dirty) or
                 (self.panel != null and (self.panel.?.isDirty() or self.panel.?.isVisible()));
         }
@@ -1895,12 +1902,21 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                     const corner_animating = self.corner_cursor.update(dt, cell_width, cell_height, cursor_len);
 
                     self.cursor_animating = floaty_animating or corner_animating;
+
+                    // Update peer ghost cursor spring animations
+                    var any_peer_animating = false;
+                    for (0..self.peer_cursor_count) |i| {
+                        if (self.peer_animations[i].update(dt, cursor_len, cursor_zeta)) {
+                            any_peer_animating = true;
+                        }
+                    }
+                    self.peer_animating = any_peer_animating;
                 }
             }
 
             // If nothing is animating any more, reset the animation clock
             // so the next animation start doesn't see stale accumulated time.
-            if (!self.cursor_animating and !self.scroll_animating and !self.sonicboom_active) {
+            if (!self.cursor_animating and !self.scroll_animating and !self.sonicboom_active and !self.peer_animating) {
                 self.animation_start = null;
                 self.animation_time = 0;
             }
@@ -1926,7 +1942,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             // Scroll-dirty:  a window's scroll offset changed (sub-pixel or integer boundary)
             // If neither, we can skip the expensive rebuild entirely.
             const content_dirty = nvim.dirty;
-            var scroll_dirty = self.scroll_animating or self.cursor_animating or self.sonicboom_active;
+            var scroll_dirty = self.scroll_animating or self.cursor_animating or self.sonicboom_active or self.peer_animating;
 
             // Also check individual window dirty flags
             if (!content_dirty and !scroll_dirty) {
@@ -1978,10 +1994,13 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                         _ = cs.getPeers(&raw_peers);
                         self.peer_cursor_count = 0;
 
-                        // Find the receiver's cursor window to get topline + position
-                        const cursor_win: ?*@import("../neovim_gui/rendered_window.zig").RenderedWindow =
-                            nvim.windows.get(nvim.cursor_grid);
                         const my_file = nvim.current_file;
+
+                        // Use receiver-side resolved screen positions from screenpos().
+                        // nvim.peer_screen_positions is a flat [row0,col0,row1,col1,...] array
+                        // set by the ghostty_peer_screen Lua callback. Row=0 means off-screen.
+                        // The order matches the same-file peers we pushed to vim.g._ghostty_peer_buf.
+                        var resolved_idx: u8 = 0;
 
                         for (raw_peers[0..collab_main.MAX_PEERS]) |maybe_peer| {
                             if (maybe_peer) |peer| {
@@ -1994,37 +2013,45 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                                     !std.mem.eql(u8, my_file, peer_file))
                                     continue;
 
-                                // Convert peer's buffer coords to receiver's screen coords.
-                                // peer.cursor_row = 1-based buffer line (from nvim_win_get_cursor pos[1])
-                                // peer.cursor_col = 1-based window column (from wincol() — includes gutter)
-                                // cursor_win.topline = 0-based top visible buffer line (from win_viewport)
-                                const win = cursor_win orelse continue;
-                                const topline: u32 = @intCast(@min(win.topline, std.math.maxInt(u32)));
-                                const peer_line_0: u32 = if (peer.cursor_row > 0) peer.cursor_row - 1 else 0;
+                                // Get resolved screen position from Neovim's screenpos().
+                                // Row=0 means the cursor is off-screen (not visible).
+                                var screen_row: u32 = 0;
+                                var screen_col: u32 = 0;
+                                if (resolved_idx < nvim.peer_screen_count) {
+                                    screen_row = nvim.peer_screen_positions[resolved_idx * 2];
+                                    screen_col = nvim.peer_screen_positions[resolved_idx * 2 + 1];
+                                    resolved_idx += 1;
+                                }
 
-                                // Off-screen check: peer line before topline
-                                if (peer_line_0 < topline) continue;
+                                // screenpos() returns row=0 for off-screen positions
+                                if (screen_row == 0) continue;
 
-                                const lines_from_top: u32 = peer_line_0 - topline;
-                                const margin_top: u32 = @intCast(win.viewport_margins.top);
-                                const margin_bot: u32 = @intCast(win.viewport_margins.bottom);
-                                const content_height: u32 = if (win.grid_height > margin_top + margin_bot)
-                                    win.grid_height - margin_top - margin_bot
-                                else
-                                    win.grid_height;
+                                // screenpos() returns 1-based coords → convert to 0-based
+                                screen_row -= 1;
+                                if (screen_col > 0) screen_col -= 1;
 
-                                // Off-screen check: peer line below visible area
-                                if (lines_from_top >= content_height) continue;
+                                // Update spring animation for this peer
+                                const pidx = self.peer_cursor_count;
+                                const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
+                                const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
+                                const target_px: f32 = @as(f32, @floatFromInt(screen_col)) * cell_width;
+                                const target_py: f32 = @as(f32, @floatFromInt(screen_row)) * cell_height;
 
-                                // Screen position:
-                                // Row: grid_position[1] + margin_top (winbar rows) + lines from topline
-                                // Col: grid_position[0] + (wincol - 1). wincol() already includes
-                                //      the gutter (signcolumn + line numbers) so no margin_left needed.
-                                const win_row: u32 = @intFromFloat(@max(0, win.grid_position[1]));
-                                const win_col: u32 = @intFromFloat(@max(0, win.grid_position[0]));
-                                const screen_row = win_row + margin_top + lines_from_top;
-                                const peer_wincol_0: u32 = if (peer.cursor_col > 0) peer.cursor_col - 1 else 0;
-                                const screen_col = win_col + peer_wincol_0;
+                                const last = self.peer_last_grid_pos[pidx];
+                                if (screen_col != last[0] or screen_row != last[1]) {
+                                    if (last[0] == std.math.maxInt(u32)) {
+                                        // First time seeing this peer — snap, don't animate
+                                        self.peer_animations[pidx].current_x = target_px;
+                                        self.peer_animations[pidx].current_y = target_py;
+                                        self.peer_animations[pidx].target_x = target_px;
+                                        self.peer_animations[pidx].target_y = target_py;
+                                        self.peer_animations[pidx].spring.reset();
+                                    } else {
+                                        self.peer_animations[pidx].setTarget(target_px, target_py, cell_width);
+                                        self.peer_animating = true;
+                                    }
+                                    self.peer_last_grid_pos[pidx] = .{ screen_col, screen_row };
+                                }
 
                                 var pc = gui_protocol.PeerCursor{
                                     .color = peer.color,
@@ -2540,8 +2567,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             self.renderGuiCursor(state.cursor);
 
             // Peer cursors (collab ghost cursors with color + name label)
-            for (state.peer_cursors) |peer| {
-                self.renderPeerCursor(peer);
+            for (state.peer_cursors, 0..) |peer, pidx| {
+                self.renderPeerCursor(peer, pidx);
             }
         }
 
@@ -2652,15 +2679,11 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         /// Uses the same sprite as the main cursor but tinted to the peer's color
         /// and at reduced opacity. Appends directly to fg_rows.lists[0] so it
         /// draws in the same pass as the main cursor.
-        fn renderPeerCursor(self: *Self, peer: gui_protocol.PeerCursor) void {
+        fn renderPeerCursor(self: *Self, peer: gui_protocol.PeerCursor, peer_idx: usize) void {
             if (!peer.same_buffer) return;
 
             const col: u16 = @intCast(@min(peer.grid_col, if (self.cells.size.columns > 0) self.cells.size.columns - 1 else 0));
             const row: u16 = @intCast(@min(peer.grid_row, if (self.cells.size.rows > 0) self.cells.size.rows - 1 else 0));
-
-            // log.info("GHOST CURSOR: peer={s} row={d} col={d} color=0x{x} grid={d}x{d}", .{
-            //     peer.getName(), row, col, peer.color, self.cells.size.columns, self.cells.size.rows,
-            // });
 
             if (row >= self.cells.size.rows or col >= self.cells.size.columns) return;
 
@@ -2683,28 +2706,60 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
             const g: u8 = @intCast((color >> 8) & 0xFF);
             const b: u8 = @intCast(color & 0xFF);
 
-            // Ghost cursor: NOT is_cursor_glyph (that flag causes the shader to
-            // reposition it to the main cursor's animated corner positions).
-            // Instead, draw as a regular foreground cell at the peer's grid position.
+            // Compute animated pixel offset from spring animation.
+            // The animation target is the grid cell position in pixels.
+            // The spring offset gives us sub-cell displacement during animation.
+            const cell_width: f32 = @floatFromInt(self.grid_metrics.cell_width);
+            const cell_height: f32 = @floatFromInt(self.grid_metrics.cell_height);
+            const anim_pos = blk: {
+                if (peer_idx < 8) {
+                    break :blk self.peer_animations[peer_idx].getPosition();
+                } else {
+                    const fallback_x = @as(f32, @floatFromInt(col)) * cell_width;
+                    const fallback_y = @as(f32, @floatFromInt(row)) * cell_height;
+                    var a: animation.CursorAnimation = .{};
+                    a.current_x = fallback_x;
+                    a.current_y = fallback_y;
+                    break :blk a.getPosition();
+                }
+            };
+
+            // Convert animated pixel position to grid cell + sub-cell offset.
+            // Grid cell = floor(pixel / cell_size), bearing offset = remainder.
+            const anim_col_f = anim_pos.x / cell_width;
+            const anim_row_f = anim_pos.y / cell_height;
+            const anim_col: u16 = @intFromFloat(@max(0, @min(anim_col_f, @as(f32, @floatFromInt(if (self.cells.size.columns > 0) self.cells.size.columns - 1 else 0)))));
+            const anim_row: u16 = @intFromFloat(@max(0, @min(anim_row_f, @as(f32, @floatFromInt(if (self.cells.size.rows > 0) self.cells.size.rows - 1 else 0)))));
+
+            // Sub-cell pixel offset (fractional part)
+            const frac_x = anim_pos.x - @as(f32, @floatFromInt(anim_col)) * cell_width;
+            const frac_y = anim_pos.y - @as(f32, @floatFromInt(anim_row)) * cell_height;
+
+            // Combine glyph bearing with animation offset
+            const bearing_x: i16 = @intCast(render.glyph.offset_x);
+            const bearing_y: i16 = @intCast(render.glyph.offset_y);
+            const anim_bearing_x: i16 = bearing_x + @as(i16, @intFromFloat(frac_x));
+            const anim_bearing_y: i16 = bearing_y - @as(i16, @intFromFloat(frac_y));
+
+            if (anim_row >= self.cells.size.rows or anim_col >= self.cells.size.columns) return;
+
+            // Ghost cursor: NOT is_cursor_glyph. Uses bearing offsets for animation.
             const ghost_cell: shaderpkg.CellText = .{
                 .atlas = .grayscale,
                 .bools = .{},
-                .grid_pos = .{ col, row },
+                .grid_pos = .{ anim_col, anim_row },
                 .color = .{ r, g, b, 153 }, // 60% of 255
                 .glyph_pos = .{ render.glyph.atlas_x, render.glyph.atlas_y },
                 .glyph_size = .{ render.glyph.width, render.glyph.height },
-                .bearings = .{ @intCast(render.glyph.offset_x), @intCast(render.glyph.offset_y) },
+                .bearings = .{ anim_bearing_x, anim_bearing_y },
                 .pixel_offset_y = 0,
             };
 
-            // Append to the row's fg list so it draws at the correct grid position
-            const list_idx = row + 1; // fg_rows index 0 is cursor, rows start at 1
+            // Append to the animated row's fg list
+            const list_idx = anim_row + 1; // fg_rows index 0 is cursor, rows start at 1
             if (list_idx < self.cells.fg_rows.lists.len) {
                 self.cells.fg_rows.lists[list_idx].append(self.alloc, ghost_cell) catch return;
             }
-
-            // TODO: Render name label (needs proper text glyph rendering, not sprite)
-            // self.renderPeerNameLabel(peer, col, row);
         }
 
         /// Render a floating name label above a peer's ghost cursor.
@@ -3274,7 +3329,7 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 }
             }
 
-            const any_anim = self.cursor_animating or self.scroll_animating or self.sonicboom_active or self.cursor_blink_animating;
+            const any_anim = self.cursor_animating or self.scroll_animating or self.sonicboom_active or self.cursor_blink_animating or self.peer_animating;
 
             // Use display refresh period as fallback dt (first frame / time went backwards)
             const fallback_dt_ns: f32 = @floatFromInt(self.display_refresh_ns);

@@ -619,6 +619,7 @@ pub const Event = union(enum) {
 pub const ConnectionMode = enum {
     socket,
     embedded,
+    tcp,
 };
 
 /// Neovim I/O Thread
@@ -630,9 +631,13 @@ pub const IoThread = struct {
     // Connection mode
     mode: ConnectionMode,
 
-    // Socket connection (for socket mode)
+    // Socket connection (for socket and tcp modes)
     socket: ?std.net.Stream = null,
     socket_path: ?[]const u8 = null,
+
+    // TCP connection info (for tcp mode)
+    tcp_host: ?[]const u8 = null,
+    tcp_port: u16 = 0,
 
     // Embedded Neovim process (for embedded mode)
     child: ?std.process.Child = null,
@@ -697,6 +702,19 @@ pub const IoThread = struct {
         return self;
     }
 
+    /// Initialize for TCP connection to a remote Neovim
+    pub fn initTcp(alloc: Allocator, host: []const u8, port: u16, event_queue: *EventQueue) !*Self {
+        const self = try alloc.create(Self);
+        self.* = .{
+            .alloc = alloc,
+            .mode = .tcp,
+            .tcp_host = try alloc.dupe(u8, host),
+            .tcp_port = port,
+            .event_queue = event_queue,
+        };
+        return self;
+    }
+
     /// Set the parent NeovimGui pointer for render wakeup
     pub fn setRenderWakeup(self: *Self, nvim_gui: *anyopaque) void {
         self.nvim_gui = nvim_gui;
@@ -712,6 +730,14 @@ pub const IoThread = struct {
                 }
                 if (self.socket_path) |path| {
                     self.alloc.free(path);
+                }
+            },
+            .tcp => {
+                if (self.socket) |socket| {
+                    socket.close();
+                }
+                if (self.tcp_host) |h| {
+                    self.alloc.free(h);
                 }
             },
             .embedded => {
@@ -762,6 +788,23 @@ pub const IoThread = struct {
                     ) catch {};
                 } else |_| {}
                 log.info("Connected to Neovim (non-blocking)", .{});
+            },
+            .tcp => {
+                const host = self.tcp_host orelse return error.NoTcpHost;
+                log.info("Connecting to remote Neovim at {s}:{d}", .{ host, self.tcp_port });
+                const addr = try std.net.Address.parseIp4(host, self.tcp_port);
+                self.socket = try std.net.tcpConnectToAddress(addr);
+
+                // Set socket to non-blocking mode
+                const socket = self.socket.?;
+                if (posix.fcntl(socket.handle, posix.F.GETFL, 0)) |flags| {
+                    _ = posix.fcntl(
+                        socket.handle,
+                        posix.F.SETFL,
+                        flags | @as(u32, @bitCast(posix.O{ .NONBLOCK = true })),
+                    ) catch {};
+                } else |_| {}
+                log.info("Connected to remote Neovim (non-blocking)", .{});
             },
             .embedded => {
                 log.info("Spawning embedded Neovim with user config (cwd: {?s})", .{self.cwd});
@@ -977,7 +1020,7 @@ pub const IoThread = struct {
     /// Get the file descriptor used for reading from Neovim.
     fn getReadFd(self: *const Self) ?std.posix.fd_t {
         return switch (self.mode) {
-            .socket => if (self.socket) |s| s.handle else null,
+            .socket, .tcp => if (self.socket) |s| s.handle else null,
             .embedded => if (self.stdout_file) |f| f.handle else null,
         };
     }
@@ -1067,7 +1110,7 @@ pub const IoThread = struct {
     /// Write data to Neovim (socket or pipe)
     fn writeData(self: *Self, data: []const u8) !void {
         switch (self.mode) {
-            .socket => {
+            .socket, .tcp => {
                 const socket = self.socket orelse return error.NotConnected;
                 try socket.writeAll(data);
             },
@@ -1081,7 +1124,7 @@ pub const IoThread = struct {
     /// Read data from Neovim (socket or pipe)
     fn readData(self: *Self, buffer: []u8) !usize {
         switch (self.mode) {
-            .socket => {
+            .socket, .tcp => {
                 const socket = self.socket orelse return error.NotConnected;
                 return socket.read(buffer);
             },

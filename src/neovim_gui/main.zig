@@ -136,6 +136,9 @@ pub const NeovimGui = struct {
     peer_screen_positions: [16]u32 = .{0} ** 16,
     peer_screen_count: u8 = 0, // number of peers (positions = count * 2)
 
+    /// Frame counter for throttling periodic updates (badges etc.)
+    frame_counter: u32 = 0,
+
     /// Neovim options received via option_set event
     /// Key is the option name (owned), value is the option value
     options: std.StringHashMap(OptionValue),
@@ -209,6 +212,18 @@ pub const NeovimGui = struct {
     pub fn connect(self: *Self, socket_path: []const u8) !void {
         log.info("connecting to Neovim at: {s}", .{socket_path});
         self.io = try IoThread.init(self.alloc, socket_path, &self.event_queue);
+        errdefer {
+            self.io.?.deinit();
+            self.io = null;
+        }
+        try self.io.?.connect();
+        try self.finishConnection();
+    }
+
+    /// Connect to a remote Neovim via TCP (for collab sessions)
+    pub fn connectTcp(self: *Self, host: []const u8, port: u16) !void {
+        log.info("connecting to remote Neovim at {s}:{d}", .{ host, port });
+        self.io = try IoThread.initTcp(self.alloc, host, port, &self.event_queue);
         errdefer {
             self.io.?.deinit();
             self.io = null;
@@ -454,8 +469,12 @@ pub const NeovimGui = struct {
             "end " ++
             "local peer_timer = vim.uv.new_timer() " ++
             "peer_timer:start(6, 6, vim.schedule_wrap(resolve_peers)) " ++
+            // Send our own presence on a fast timer too, so the peer sees us
+            // moving continuously during held-key repeats (not just on CursorMoved).
+            "local send_timer = vim.uv.new_timer() " ++
+            "send_timer:start(6, 6, vim.schedule_wrap(ghostty_presence)) " ++
             "vim.api.nvim_create_autocmd({" ++
-            "'CursorMoved','CursorMovedI','ModeChanged','BufEnter','WinEnter'" ++
+            "'ModeChanged','BufEnter','WinEnter'" ++
             "}, {callback = ghostty_presence}) " ++
             "ghostty_presence() " ++
             // -- Live file sync: auto-save on edit, auto-reload on change --
@@ -690,6 +709,7 @@ pub const NeovimGui = struct {
                 self.peer_screen_positions = data.positions;
                 self.peer_screen_count = data.count;
                 self.dirty = true;
+                self.updateCollabPeerBadges();
             },
             .win_viewport_margins => |data| {
                 self.handleWinViewportMargins(data);

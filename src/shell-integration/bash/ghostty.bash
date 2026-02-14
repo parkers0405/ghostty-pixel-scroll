@@ -262,12 +262,18 @@ fi
 # Collab session commands: ghostty-share starts hosting, ghostty-join connects.
 ghostty-share() {
     builtin printf '\e]1342\a'
-    sleep 0.2
+    sleep 0.3
     if [[ -f /tmp/ghostty-collab-info ]]; then
-        local addr
+        local addr port local_ip
         addr=$(< /tmp/ghostty-collab-info)
+        port="${addr##*:}"
+        # Get local network IP for sharing
+        local_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+        [[ -z "$local_ip" ]] && local_ip=$(ipconfig getifaddr en0 2>/dev/null)
+        [[ -z "$local_ip" ]] && local_ip="<your-ip>"
         builtin echo "Collab session started!"
-        builtin echo "Others can join with: ghostty-join $addr"
+        builtin echo "Local:  ghostty-join $addr"
+        builtin echo "Remote: ghostty-join ${local_ip}:${port}"
     fi
 }
 ghostty-join() {

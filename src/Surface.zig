@@ -969,10 +969,34 @@ pub fn startCollabHost(self: *Surface) !void {
         };
         defer file.close();
         var buf: [128]u8 = undefined;
-        const info_str = std.fmt.bufPrint(&buf, "127.0.0.1:{d}", .{port}) catch return;
+        const info_str = std.fmt.bufPrint(&buf, "0.0.0.0:{d}", .{port}) catch return;
         file.writeAll(info_str) catch {};
     }
     log.info("collab session started on port {d}", .{port});
+
+    // Start Neovim TCP listener so remote guests can connect their NeovimGui.
+    // Uses port = collab_port + 1 for the Neovim RPC connection.
+    const nvim_port = port + 1;
+    if (self.nvim_gui) |nvim| {
+        if (nvim.io) |io| {
+            var cmd_buf: [256]u8 = undefined;
+            const cmd = std.fmt.bufPrint(&cmd_buf, "lua vim.fn.serverstart('0.0.0.0:{d}')", .{nvim_port}) catch return;
+            io.sendCommand(cmd) catch {};
+
+            var msg_buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "lua vim.notify('Collab session started! Share: ghostty-join <your-ip>:{d}', vim.log.levels.INFO)", .{port}) catch return;
+            io.sendCommand(msg) catch {};
+        }
+    }
+
+    // Write join info (include nvim port)
+    {
+        const file2 = std.fs.createFileAbsolute("/tmp/ghostty-collab-nvim-port", .{}) catch return;
+        defer file2.close();
+        var buf2: [16]u8 = undefined;
+        const nvim_port_str = std.fmt.bufPrint(&buf2, "{d}", .{nvim_port}) catch return;
+        file2.writeAll(nvim_port_str) catch {};
+    }
 }
 
 /// Standalone callback for forwarding Neovim presence to CollabState.
@@ -1017,6 +1041,83 @@ pub fn joinCollabSession(self: *Surface, host: []const u8, port: u16) !void {
     self.collab_state = state;
     self.renderer_state.collab_state = state;
     log.info("joined collab session at {s}:{d}", .{ host, port });
+
+    // Connect to the host's Neovim via TCP (port = collab_port + 1).
+    // This replaces our local Neovim with a remote one editing the host's files.
+    const nvim_port = port + 1;
+    log.info("connecting to host's Neovim at {s}:{d}", .{ host, nvim_port });
+
+    // If we already have a NeovimGui, shut it down first.
+    // deinit() frees the struct itself, so don't call destroy() after.
+    if (self.nvim_gui) |old_nvim| {
+        self.nvim_gui = null;
+        self.renderer_state.nvim_gui = null;
+        old_nvim.deinit();
+    }
+
+    // Wait for the host's Neovim TCP listener to be ready.
+    // The serverstart() command is async, so give it time.
+    var tcp_ready = false;
+    var wait_attempts: u32 = 0;
+    while (wait_attempts < 50) : (wait_attempts += 1) {
+        // Try a raw TCP connect to see if the port is open
+        const addr = std.net.Address.parseIp4(host, nvim_port) catch break;
+        if (std.net.tcpConnectToAddress(addr)) |stream| {
+            stream.close();
+            tcp_ready = true;
+            break;
+        } else |_| {}
+        std.Thread.sleep(100 * std.time.ns_per_ms);
+    }
+    if (!tcp_ready) {
+        log.err("timed out waiting for host's Neovim at {s}:{d}", .{ host, nvim_port });
+        return error.NvimConnectFailed;
+    }
+
+    // Create a new NeovimGui that connects to the host's Neovim
+    const nvim = try neovim_gui.NeovimGui.init(self.alloc);
+    errdefer {
+        // deinit frees the struct, so no separate destroy needed
+        nvim.deinit();
+    }
+
+    // Set grid size (same calculation as initNeovimGui)
+    const content_scale = self.rt_surface.getContentScale() catch .{ .x = 1, .y = 1 };
+    const x_dpi = content_scale.x * font.face.default_dpi;
+    const y_dpi = content_scale.y * font.face.default_dpi;
+    const explicit_padding = self.config.scaledPadding(x_dpi, y_dpi);
+    const screen_without_balanced = self.size.screen.subPadding(explicit_padding);
+    const grid_size = rendererpkg.GridSize.init(screen_without_balanced, self.size.cell);
+    nvim.grid_width = grid_size.columns;
+    nvim.grid_height = grid_size.rows;
+
+    // Connect to host's Neovim via TCP
+    try nvim.connectTcp(host, nvim_port);
+
+    self.nvim_gui = nvim;
+    self.renderer_state.nvim_gui = nvim;
+
+    // Wire up render wakeup
+    const WakeupType = @TypeOf(self.renderer_thread.wakeup);
+    nvim.setRenderWakeup(
+        @ptrCast(&self.renderer_thread.wakeup),
+        struct {
+            fn notify(ptr: *anyopaque) void {
+                const wakeup: *WakeupType = @ptrCast(@alignCast(ptr));
+                wakeup.notify() catch {};
+            }
+        }.notify,
+    );
+
+    // Wire collab presence callback
+    nvim.collab_presence_callback = &collabPresenceForward;
+
+    log.info("connected to host's Neovim at {s}:{d}", .{ host, nvim_port });
+
+    // Notify user
+    if (nvim.io) |io| {
+        io.sendCommand("lua vim.notify('Connected to remote collab session!', vim.log.levels.INFO)") catch {};
+    }
 }
 
 /// Initialize Neovim GUI mode for this surface

@@ -231,11 +231,20 @@ end
 # Collab session commands
 function ghostty-share
     printf '\e]1342\a'
-    sleep 0.2
+    sleep 0.3
     if test -f /tmp/ghostty-collab-info
         set -l addr (cat /tmp/ghostty-collab-info)
+        set -l port (string split ':' $addr)[-1]
+        set -l local_ip (hostname -I 2>/dev/null | awk '{print $1}')
+        if test -z "$local_ip"
+            set local_ip (ipconfig getifaddr en0 2>/dev/null)
+        end
+        if test -z "$local_ip"
+            set local_ip "<your-ip>"
+        end
         echo "Collab session started!"
-        echo "Others can join with: ghostty-join $addr"
+        echo "Local:  ghostty-join $addr"
+        echo "Remote: ghostty-join $local_ip:$port"
     end
 end
 
